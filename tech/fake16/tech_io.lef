@@ -1,0 +1,237 @@
+VERSION 5.8 ;
+NAMESCASESENSITIVE ON ;
+BUSBITCHARS "[]" ;
+DIVIDERCHAR "/" ;
+UNITS
+  DATABASE MICRONS 1000 ;
+END UNITS
+
+---
+--- Layer Definitions (Adjust to match your PDK)
+---
+LAYER METAL1
+  TYPE ROUTING ;
+  DIRECTION HORIZONTAL ;
+  PITCH 0.064 ;
+  WIDTH 0.032 ;
+  SPACING 0.032 ;
+  OFFSET 0.032 ;
+END METAL1
+
+LAYER METAL2
+  TYPE ROUTING ;
+  DIRECTION VERTICAL ;
+  PITCH 0.064 ;
+  WIDTH 0.032 ;
+  SPACING 0.032 ;
+  OFFSET 0.032 ;
+END METAL2
+
+LAYER METAL3
+  TYPE ROUTING ;
+  DIRECTION HORIZONTAL ;
+  PITCH 0.128 ;
+  WIDTH 0.064 ;
+  SPACING 0.064 ;
+  OFFSET 0.064 ;
+END METAL3
+
+LAYER METAL4
+  TYPE ROUTING ;
+  DIRECTION VERTICAL ;
+  PITCH 0.128 ;
+  WIDTH 0.064 ;
+  SPACING 0.064 ;
+  OFFSET 0.064 ;
+END METAL4
+
+LAYER VIA1
+  TYPE CUT ;
+  PITCH 0.064 0.064 ;
+  WIDTH 0.032 ;
+  SPACING 0.032 ;
+END VIA1
+
+LAYER VIA2
+  TYPE CUT ;
+  PITCH 0.128 0.128 ;
+  WIDTH 0.064 ;
+  SPACING 0.064 ;
+END VIA2
+
+LAYER VIA3
+  TYPE CUT ;
+  PITCH 0.128 0.128 ;
+  WIDTH 0.064 ;
+  SPACING 0.064 ;
+END VIA3
+
+---
+--- Bidirectional Pad (Horizontal)
+---
+MACRO bidir_pad_h
+  CLASS PAD ;
+  ORIGIN 0.0 0.0 ;
+  SIZE 10.0 BY 50.0 ;  -- Placeholder: Replace with actual dimensions
+  SYMMETRY Y ;
+
+  -- Power Rails (VDD and VSS)
+  PIN VDD
+    DIRECTION INOUT ;
+    USE POWER ;
+    PORT
+      LAYER METAL4 ;
+        RECT 0.0 49.5 10.0 50.0 ;  -- Top rail (VDD)
+    END
+  END VDD
+
+  PIN VSS
+    DIRECTION INOUT ;
+    USE GROUND ;
+    PORT
+      LAYER METAL4 ;
+        RECT 0.0 0.0 10.0 0.5 ;  -- Bottom rail (VSS)
+    END
+  END VSS
+
+  -- Pad Pin (Bidirectional)
+  PIN pad
+    DIRECTION INOUT ;
+    USE SIGNAL ;
+    PORT
+      LAYER METAL4 ;
+        RECT 0.0 24.0 10.0 26.0 ;  -- Large pad area for bonding/wirebond
+    END
+    PORT
+      LAYER METAL3 ;
+        RECT 4.0 24.5 6.0 25.5 ;  -- Connection to internal logic
+    END
+  END pad
+
+  -- Enable Pin
+  PIN enable
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    PORT
+      LAYER METAL2 ;
+        RECT 2.0 10.0 2.5 10.5 ;
+    END
+  END enable
+
+  -- Core-side Input Pin
+  PIN core_in
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    PORT
+      LAYER METAL1 ;
+        RECT 2.0 15.0 2.5 15.5 ;
+    END
+  END core_in
+
+  -- Core-side Output Pin
+  PIN core_out
+    DIRECTION OUTPUT ;
+    USE SIGNAL ;
+    PORT
+      LAYER METAL1 ;
+        RECT 7.0 15.0 7.5 15.5 ;
+    END
+  END core_out
+
+  -- Obstruction (Active area)
+  OBS
+    LAYER METAL1 ;
+      RECT 0.0 0.5 10.0 49.5 ;
+    LAYER METAL2 ;
+      RECT 0.0 0.5 10.0 49.5 ;
+    LAYER METAL3 ;
+      RECT 0.0 0.5 10.0 24.0 ;
+      RECT 0.0 26.0 10.0 49.5 ;
+  END
+END bidir_pad_h
+
+---
+--- Bidirectional Pad (Vertical)
+---
+MACRO bidir_pad_v
+  CLASS PAD ;
+  ORIGIN 0.0 0.0 ;
+  SIZE 50.0 BY 10.0 ;  -- Placeholder: Replace with actual dimensions
+  SYMMETRY X ;
+
+  -- Power Rails (VDD and VSS)
+  PIN VDD
+    DIRECTION INOUT ;
+    USE POWER ;
+    PORT
+      LAYER METAL4 ;
+        RECT 49.5 0.0 50.0 10.0 ;  -- Right rail (VDD)
+    END
+  END VDD
+
+  PIN VSS
+    DIRECTION INOUT ;
+    USE GROUND ;
+    PORT
+      LAYER METAL4 ;
+        RECT 0.0 0.0 0.5 10.0 ;  -- Left rail (VSS)
+    END
+  END VSS
+
+  -- Pad Pin (Bidirectional)
+  PIN pad
+    DIRECTION INOUT ;
+    USE SIGNAL ;
+    PORT
+      LAYER METAL4 ;
+        RECT 24.0 0.0 26.0 10.0 ;  -- Large pad area for bonding/wirebond
+    END
+    PORT
+      LAYER METAL3 ;
+        RECT 24.5 4.0 25.5 6.0 ;  -- Connection to internal logic
+    END
+  END pad
+
+  -- Enable Pin
+  PIN enable
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    PORT
+      LAYER METAL2 ;
+        RECT 10.0 2.0 10.5 2.5 ;
+    END
+  END enable
+
+  -- Core-side Input Pin
+  PIN core_in
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    PORT
+      LAYER METAL1 ;
+        RECT 15.0 2.0 15.5 2.5 ;
+    END
+  END core_in
+
+  -- Core-side Output Pin
+  PIN core_out
+    DIRECTION OUTPUT ;
+    USE SIGNAL ;
+    PORT
+      LAYER METAL1 ;
+        RECT 15.0 7.0 15.5 7.5 ;
+    END
+  END core_out
+
+  -- Obstruction (Active area)
+  OBS
+    LAYER METAL1 ;
+      RECT 0.5 0.0 49.5 10.0 ;
+    LAYER METAL2 ;
+      RECT 0.5 0.0 49.5 10.0 ;
+    LAYER METAL3 ;
+      RECT 0.5 0.0 24.0 10.0 ;
+      RECT 26.0 0.0 49.5 10.0 ;
+  END
+END bidir_pad_v
+
+END LIBRARY

@@ -1,0 +1,17 @@
+read_verilog test1.v
+
+proc
+fsm
+opt
+memory
+opt
+
+techmap
+opt
+
+dfflibmap -liberty ../tech/fake16/tech_neutral.lib
+
+abc -liberty ../tech/fake16/tech_neutral.lib
+
+write_verilog test1.netlist.v
+
