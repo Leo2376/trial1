@@ -1,0 +1,51 @@
+# Build / simulation artifacts
+*.o
+*.a
+*.elf
+*.bin
+*.hex
+*.vcd
+*.fst
+*.lxt
+*.gkw
+*.out
+*.log
+*.dasm
+
+# Waveform and coverage
+work*/
+csrc/
+obj_dir/
+*.vpd
+*.fsdb
+*.cov
+*.ucdb
+dve_logs/
+verdiLog/
+novas.*
+*.rc
+
+# Synthesis outputs
+*.sdf
+*.ddc
+*.qpf
+*.qar
+*.qpflog
+*.pnr
+*.rpt
+reports/
+outputs/
+alib-*/
+
+# EDA tool scratch
+*.swp
+*.swo
+*~
+.DS_Store
+.vscode/
+.idea/
+
+# Vendor / generated files
+generated/
+__pycache__/
+*.pyc
