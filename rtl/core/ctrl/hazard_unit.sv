@@ -25,7 +25,11 @@ module hazard_unit #(
   assign stall = load_use_hazard | ex_mul_busy | ex_fpu_busy | mem_lsu_busy |
                  (is_csr_op & csr_hazard);
 
+  // A control-flow redirect (branch/jal/jalr) squashes only the younger
+  // wrong-path instruction in ID; the redirecting instruction in EX must
+  // continue to MEM/WB to retire (jal/jalr write a link register). A trap
+  // aborts the EX instruction itself, so it also bubbles EX.
   assign flush_id = branch_taken | trap;
-  assign flush_ex = branch_taken | trap;
+  assign flush_ex = trap;
 
 endmodule

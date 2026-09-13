@@ -27,6 +27,7 @@ module alu #(
 
   always_comb begin
     y = '0;
+    y32 = '0;
     div_q = '0; div_r = '0; div_by_zero = 1'b0;
     case (op)
       ALU_ADD:    y = a + b;
@@ -39,11 +40,11 @@ module alu #(
       ALU_SRA:    y = $signed(a) >>> b[5:0];
       ALU_OR:     y = a | b;
       ALU_AND:    y = a & b;
-      ALU_ADDW:   y = {{32{a32[31]}}, a32 + b32};
-      ALU_SUBW:   y = {{32{a32[31]}}, a32 - b32};
-      ALU_SLLW:   y = {{32{a32[31]}}, a32 << b[4:0]};
-      ALU_SRLW:   y = {{32{a32[31]}}, a32 >> b[4:0]};
-      ALU_SRAW:   y = {{32{a32[31]}}, $signed(a32) >>> b[4:0]};
+      ALU_ADDW:   begin y32 = a32 + b32; y = {{32{y32[31]}}, y32}; end
+      ALU_SUBW:   begin y32 = a32 - b32; y = {{32{y32[31]}}, y32}; end
+      ALU_SLLW:   begin y32 = a32 << b[4:0]; y = {{32{y32[31]}}, y32}; end
+      ALU_SRLW:   begin y32 = a32 >> b[4:0]; y = {{32{y32[31]}}, y32}; end
+      ALU_SRAW:   begin y32 = $signed(a32) >>> b[4:0]; y = {{32{y32[31]}}, y32}; end
       ALU_LUI:    y = b;
       ALU_COPYB:  y = b;
       ALU_MUL:    y = mull;
@@ -54,10 +55,10 @@ module alu #(
       ALU_DIVU:   y = a / b;
       ALU_REM:    y = $signed(a) % $signed(b);
       ALU_REMU:   y = a % b;
-      ALU_DIVW:   y = {{32{div_q[31]}}, $signed(a32) / $signed(b32)};
-      ALU_DIVUW:  y = {{32{div_q[31]}}, a32 / b32};
-      ALU_REMW:   y = {{32{div_r[31]}}, $signed(a32) % $signed(b32)};
-      ALU_REMUW:  y = {{32{div_r[31]}}, a32 % b32};
+      ALU_DIVW:   begin y32 = $signed(a32) / $signed(b32); y = {{32{y32[31]}}, y32}; end
+      ALU_DIVUW:  begin y32 = a32 / b32;                y = {{32{y32[31]}}, y32}; end
+      ALU_REMW:   begin y32 = $signed(a32) % $signed(b32); y = {{32{y32[31]}}, y32}; end
+      ALU_REMUW:  begin y32 = a32 % b32;                y = {{32{y32[31]}}, y32}; end
       default:    y = '0;
     endcase
   end

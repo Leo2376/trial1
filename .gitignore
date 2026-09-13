@@ -50,3 +50,4 @@ generated/
 __pycache__/
 *.pyc
 sim/verilator/prog.vh
+sim/riscv-tests/build/

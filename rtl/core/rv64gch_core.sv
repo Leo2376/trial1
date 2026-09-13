@@ -126,32 +126,79 @@ module rv64gch_core #(
   logic [31:0] instr_expanded;
   logic        fetch_is_c;
   logic [31:0] fetch_instr;
-  assign fetch_instr = pc_f[2] ? fetch_rdata[63:32] : fetch_rdata[31:0];
+  logic [63:0] fetch_word_q;   // latched fetch word, held across stalls
+  logic [63:0] fetch_pc_q;     // pc the latched word was fetched for
+  logic        fetch_complete;  // fetch read returned, awaiting consumption
+  logic        fetch_done;
+  logic        fetch_busy;
+  // A latched fetch result is only usable if it corresponds to the
+  // current pc_f. Redirects/flushes change pc_f; a stale result from the
+  // previous pc must not be consumed. Comparing the latched pc against
+  // pc_f (using the word-aligned address) makes the skid buffer safe
+  // across flushes without relying solely on flush_all clearing it.
+  logic fetch_res_valid;
+  assign fetch_res_valid = fetch_complete & (fetch_pc_q[47:3] == pc_f[47:3]);
+  // Assemble the 32-bit instruction window from the latched fetched
+  // 64-bit word based on pc_f[2:1]. A 32-bit (non-compressed) instruction
+  // can straddle the 32-bit boundary inside the 64-bit fetch word when it
+  // is located at byte offset 2 (pc_f[2:1] == 2'b01), so the lower and
+  // upper halves must be stitched together. Compressed (16-bit)
+  // instructions never straddle a 16-bit boundary, so the half-word
+  // selected by pc_f[1] is always valid.
+  always_comb begin
+    unique case (pc_f[2:1])
+      2'b00: fetch_instr = fetch_word_q[31:0];
+      2'b01: fetch_instr = {fetch_word_q[47:32], fetch_word_q[31:16]};
+      2'b10: fetch_instr = fetch_word_q[63:32];
+      2'b11: fetch_instr = {16'b0, fetch_word_q[63:48]};
+    endcase
+  end
+  // The decompressor inspects the lowest 16 bits of the assembled window.
   decompressor u_decomp (.cin(fetch_instr[15:0]), .iout(instr_expanded), .is_c(fetch_is_c));
 
   logic [31:0] instr_d_use;
   assign instr_d_use = fetch_is_c ? instr_expanded : fetch_instr;
 
-  logic fetch_done;
-  logic fetch_busy;
-  assign fetch_done = fetch_ack & fetch_busy;
-  assign fetch_req  = valid_f & fetch_ready & ~stall & ~fetch_busy;
-  assign fetch_we   = 1'b0;
-  assign fetch_addr = pc_f;
-  assign fetch_be   = 8'hFF;
-  assign fetch_wdata = '0;
+  // fetch_done is a latched (level) signal gated by the result being valid
+  // for the current pc and the pipeline being able to consume it. This
+  // prevents a fetch completion pulse from being lost while the pipeline is
+  // stalled (e.g. a load-use hazard or multi-cycle LSU access), which would
+  // otherwise deadlock the core, while a stale result from a flushed pc is
+  // ignored.
+  assign fetch_done    = fetch_res_valid & ~stall;
+  assign fetch_req     = valid_f & fetch_ready & ~stall & ~fetch_busy & ~fetch_res_valid;
+  assign fetch_we      = 1'b0;
+  assign fetch_addr    = pc_f;
+  assign fetch_be      = 8'hFF;
+  assign fetch_wdata   = '0;
 
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-      valid_f    <= 1'b1;
-      fetch_busy <= 1'b0;
+      valid_f        <= 1'b1;
+      fetch_busy     <= 1'b0;
+      fetch_complete <= 1'b0;
+      fetch_word_q   <= '0;
+      fetch_pc_q     <= '0;
     end else if (flush_all) begin
-      fetch_busy <= 1'b0;
-    end else if (!stall) begin
+      fetch_busy     <= 1'b0;
+      fetch_complete <= 1'b0;
+      valid_f        <= 1'b1;
+    end else begin
+      // Latch the returned word on completion so it survives a stall.
+      if (fetch_ack & fetch_busy) begin
+        fetch_word_q   <= fetch_rdata;
+        fetch_pc_q     <= fetch_addr;
+        fetch_complete <= 1'b1;
+      end
+      // A new fetch is issued only when the master is idle and the fetch
+      // wins arbitration. Busy stays set until the read returns; complete
+      // then holds the result until the unstalled pipeline consumes it.
       if (fetch_req & fetch_ready)
         fetch_busy <= 1'b1;
-      else if (fetch_done)
-        fetch_busy <= 1'b0;
+      if (fetch_done) begin
+        fetch_busy     <= 1'b0;
+        fetch_complete <= 1'b0;
+      end
     end
   end
 
@@ -249,7 +296,7 @@ module rv64gch_core #(
                   endcase end
       OP_OP32:   begin c.wb_sel = WB_INT; c.a_src = SRC_REG;
                   case (f3)
-                    3'b000: c.alu_op = (f7[0]) ? ALU_SUBW : ALU_ADDW;
+                    3'b000: c.alu_op = (f7[5]) ? ALU_SUBW : ALU_ADDW;
                     3'b001: c.alu_op = ALU_SLLW;
                     3'b101: c.alu_op = (f7[5]) ? ALU_SRAW : ALU_SRLW;
                     default: c.alu_op = ALU_ADDW;
@@ -294,14 +341,29 @@ module rv64gch_core #(
 
   function automatic logic [63:0] gen_imm(logic [31:0] i);
     opcode_t op = i[6:0];
+    logic [2:0] f3 = i[14:12];
     logic [63:0] r;
     case (op)
-      OP_LUI, OP_AUIPC: r = {i[31:12], 12'b0};
+      OP_LUI, OP_AUIPC: r = {{32{i[31]}}, i[31:12], 12'b0};
       OP_JAL:  r = {{44{i[31]}}, i[19:12], i[20], i[30:21], 1'b0};
       OP_JALR: r = {{52{i[31]}}, i[31:20]};
       OP_BRANCH:r = {{51{i[31]}}, i[7], i[30:25], i[11:8], 1'b0};
-      OP_LOAD, OP_OPIMM, OP_OPIMM32, OP_FENCE, OP_SYSTEM, OP_FPLOAD:
+      OP_LOAD, OP_SYSTEM, OP_FPLOAD, OP_FENCE:
                r = {{52{i[31]}}, i[31:20]};
+      OP_OPIMM:
+               // Shift-immediate (SLLI/SRLI/SRAI) uses a 6-bit shamt in
+               // i[25:20]; other OP-IMM use the sign-extended I-type imm.
+               if (f3 == 3'b001 || f3 == 3'b101)
+                 r = {58'b0, i[25:20]};
+               else
+                 r = {{52{i[31]}}, i[31:20]};
+      OP_OPIMM32:
+               // Shift-immediate-32 (SLLIW/SRLIW/SRAIW) uses a 5-bit shamt
+               // in i[24:20]; other OP-IMM-32 use the sign-extended I-type imm.
+               if (f3 == 3'b001 || f3 == 3'b101)
+                 r = {59'b0, i[24:20]};
+               else
+                 r = {{52{i[31]}}, i[31:20]};
       OP_STORE, OP_FPSTORE:
                r = {{52{i[31]}}, i[31:25], i[11:7]};
       default: r = '0;
@@ -328,6 +390,18 @@ module rv64gch_core #(
     .rdata1(rdata1_d), .rdata2(rdata2_d)
   );
 
+  // WB->ID bypass: the regfile is written at the WB posedge while the ID-stage
+  // read is combinational, so an instruction in ID reading a register written
+  // by the instruction currently in WB would otherwise capture the stale
+  // (pre-write) value. This is the load-use path for the multi-cycle memory:
+  // a load retires into WB one cycle before its consumer leaves ID, so the
+  // consumer must see the WB write data directly here.
+  logic [63:0] rf_rdata1, rf_rdata2;
+  logic        wb_int_we;
+  assign wb_int_we = reg_we_w & (rd_w != 5'd0);
+  assign rf_rdata1 = (wb_int_we & (rd_w == rs1_d)) ? wb_data_w : rdata1_d;
+  assign rf_rdata2 = (wb_int_we & (rd_w == rs2_d)) ? wb_data_w : rdata2_d;
+
   regfile_fp u_rffp (
     .clk(clk), .rst_n(rst_n),
     .waddr(rd_w_fp), .we(fp_we_w), .wdata(wb_data_w),
@@ -337,7 +411,7 @@ module rv64gch_core #(
 
   forwarding_unit u_fwd (
     .id_rs1(rs1_d), .id_rs2(rs2_d),
-    .ex_rs1(rs1_x), .ex_rs2(rs2_x),
+    .ex_rs1(ex_pkt.ctrl.rs1), .ex_rs2(ex_pkt.ctrl.rs2),
     .mem_rd(rd_m), .mem_reg_we(reg_we_m), .mem_is_load(1'b0),
     .wb_rd(rd_w), .wb_reg_we(reg_we_w),
     .wb_rd_fp(rd_w_fp), .wb_fp_we(fp_we_w),
@@ -358,21 +432,27 @@ module rv64gch_core #(
     .stall(stall), .flush_id(flush_id), .flush_ex(flush_ex)
   );
 
+  logic flush_redirect;
+  assign flush_redirect = redirect | trap;
   assign flush_all = flush_id | flush_ex;
 
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       ex_pkt <= '0;
-    end else if (flush_all) begin
+    end else if (trap) begin
       ex_pkt <= '0;
     end else if (!stall) begin
-      ex_pkt.valid <= valid_d & ~dc.illegal;
-      ex_pkt.pc    <= pc_d;
-      ex_pkt.instr <= instr_d;
-      ex_pkt.ctrl  <= dc;
-      ex_pkt.rs1   <= rdata1_d;
-      ex_pkt.rs2   <= rdata2_d;
-      ex_pkt.imm   <= imm;
+      if (flush_redirect) begin
+        ex_pkt <= '0;
+      end else begin
+        ex_pkt.valid <= valid_d & ~dc.illegal;
+        ex_pkt.pc    <= pc_d;
+        ex_pkt.instr <= instr_d;
+        ex_pkt.ctrl  <= dc;
+        ex_pkt.rs1   <= rf_rdata1;
+        ex_pkt.rs2   <= rf_rdata2;
+        ex_pkt.imm   <= imm;
+      end
     end
   end
 
@@ -380,15 +460,21 @@ module rv64gch_core #(
   assign rs2_x = ex_pkt.rs2;
   assign rd_x = ex_pkt.ctrl.rd;
 
+  // Forwarding source from the MEM stage: a load's result is its read data
+  // (latched in load_data_q once the AXI read completes), not its ALU address;
+  // any other instruction forwards its ALU/MDU/FPU result.
+  logic [63:0] mem_fwd_data;
+  assign mem_fwd_data = mem_pkt.is_load ? mem_rdata_aligned : mem_alu_y;
+
   always_comb begin
     case (fwd_a)
-      2'd1: rs1_fwd = wb_data_w;
-      2'd2: rs1_fwd = mem_alu_y;
+      2'd1: rs1_fwd = mem_fwd_data;
+      2'd2: rs1_fwd = wb_data_w;
       default: rs1_fwd = ex_pkt.rs1;
     endcase
     case (fwd_b)
-      2'd1: rs2_fwd = wb_data_w;
-      2'd2: rs2_fwd = mem_alu_y;
+      2'd1: rs2_fwd = mem_fwd_data;
+      2'd2: rs2_fwd = wb_data_w;
       default: rs2_fwd = ex_pkt.rs2;
     endcase
   end
@@ -493,7 +579,7 @@ module rv64gch_core #(
     mem_pkt_n.mem_addr = rs1_fwd + ex_pkt.imm;
     mem_pkt_n.is_store = mem_is_store_x;
     mem_pkt_n.is_load  = mem_is_load_x;
-    mem_pkt_n.store_data = rs2_fwd;
+    mem_pkt_n.store_data = rs2_fwd << (mem_pkt_n.mem_addr[2:0]*8);
     mem_pkt_n.be = 8'hFF;
     mem_pkt_n.lock = (ex_pkt.ctrl.lsu_op == LSU_LR) | (ex_pkt.ctrl.lsu_op == LSU_SC) |
                      (ex_pkt.ctrl.lsu_op == LSU_AMO);
@@ -508,28 +594,69 @@ module rv64gch_core #(
     endcase
   end
 
+  // axi_pending marks the in-flight transaction of the current mem_pkt so
+  // that only its own completion (mem_ack) is interpreted as this load's/
+  // store's response. axi_issued suppresses a re-issue of the same
+  // transaction: once the AXI master has accepted a load/store request it
+  // stays asserted until the load/store leaves the MEM stage (the pipeline
+  // advances mem_pkt), so a completed transaction cannot be re-driven. lsu_busy
+  // is raised when a load/store enters MEM and drops when that transaction's
+  // own ack returns, unstalling the pipeline so the load/store drains to WB.
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-      mem_pkt  <= '0;
-      lsu_busy <= 1'b0;
-    end else if (lsu_busy) begin
-      if (mem_ack) begin
-        lsu_busy <= 1'b0;
-        mem_pkt  <= '0;
-      end
+      mem_pkt     <= '0;
+      lsu_busy    <= 1'b0;
+      axi_issued  <= 1'b0;
+      axi_pending <= 1'b0;
+    end else if (trap) begin
+      mem_pkt     <= '0;
+      lsu_busy    <= 1'b0;
+      axi_issued  <= 1'b0;
+      axi_pending <= 1'b0;
     end else if (!stall) begin
-      mem_pkt <= mem_pkt_n;
-      if (mem_pkt_n.valid & (mem_pkt_n.is_store | mem_pkt_n.is_load))
-        lsu_busy <= 1'b1;
+      if (ex_pkt.valid)
+        mem_pkt <= mem_pkt_n;
+      else
+        mem_pkt <= '0;
+      if (mem_pkt_n.valid & (mem_pkt_n.is_store | mem_pkt_n.is_load)) begin
+        lsu_busy    <= 1'b1;
+        axi_issued  <= 1'b0;
+        axi_pending <= 1'b0;
+      end else begin
+        lsu_busy    <= 1'b0;
+        axi_issued  <= 1'b0;
+        axi_pending <= 1'b0;
+      end
+    end else begin
+      // Pipeline stalled (lsu_busy holds it). Issue the AXI request once and
+      // keep it issued until the load/store leaves MEM; clear lsu_busy only on
+      // this transaction's own completion so the pipeline can then drain.
+      if (mem_req & mem_ready) begin
+        axi_issued  <= 1'b1;
+        axi_pending <= 1'b1;
+      end
+      if (axi_pending & mem_ack) begin
+        lsu_busy    <= 1'b0;
+        axi_pending <= 1'b0;
+      end
     end
   end
 
   assign rd_m = mem_pkt.ctrl.rd;
-  assign reg_we_m = mem_pkt.valid & (mem_pkt.ctrl.wb_sel == WB_INT) & (mem_pkt.ctrl.rd != 5'd0);
+  assign reg_we_m = mem_pkt.valid &
+                   ((mem_pkt.ctrl.wb_sel == WB_INT) | (mem_pkt.ctrl.wb_sel == WB_MEM)) &
+                   (mem_pkt.ctrl.rd != 5'd0);
   assign fp_we_m = mem_pkt.valid & (mem_pkt.ctrl.wb_sel == WB_FP) & (mem_pkt.ctrl.rd != 5'd0);
   assign mem_alu_y = mem_pkt.alu_res;
 
-  assign mem_req   = mem_pkt.valid & (mem_pkt.is_store | mem_pkt.is_load);
+  // mem_req is asserted only until the AXI master accepts the load/store
+  // request (axi_issued). Staying asserted past acceptance would let the
+  // shared master re-issue the same transaction after it completes (e.g. a
+  // duplicate store write whose B response later arrives as a stale ack and
+  // corrupts a following load's lsu_busy). axi_issued clears when the
+  // transaction's ack returns, readying for the next load/store.
+  logic axi_issued;
+  assign mem_req   = mem_pkt.valid & (mem_pkt.is_store | mem_pkt.is_load) & ~axi_issued;
   assign mem_we    = mem_pkt.is_store;
   assign mem_addr  = mem_pkt.mem_addr;
   assign mem_be    = mem_pkt.be;
@@ -552,9 +679,21 @@ module rv64gch_core #(
     return r;
   endfunction
 
+  // The load read data is latched when THIS load's own AXI transaction
+  // completes (axi_pending drop), not on any dmem ack. The shared AXI port
+  // can deliver a stale ack (e.g. a prior store's B response) while a load is
+  // in MEM with the bus read data still holding a fetch word; latching on a
+  // bare mem_ack would capture the wrong value. axi_pending is asserted for
+  // the current mem_pkt's transaction and cleared only by its own ack.
+  logic [63:0] load_data_q;
+  logic        axi_pending;
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) load_data_q <= '0;
+    else if (axi_pending & mem_ack & mem_pkt.valid & mem_pkt.is_load)
+      load_data_q <= align_load(mem_rdata, mem_pkt.mem_addr[2:0], mem_pkt.ctrl.lsu_op);
+  end
   always_comb begin
-    mem_rdata_aligned = mem_rdata;
-    if (mem_ack) mem_rdata_aligned = align_load(mem_rdata, mem_pkt.mem_addr[2:0], mem_pkt.ctrl.lsu_op);
+    mem_rdata_aligned = load_data_q;
   end
 
   always_comb begin

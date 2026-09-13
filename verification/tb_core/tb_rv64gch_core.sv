@@ -41,7 +41,7 @@ module tb_rv64gch_core;
 
   axi4_dram_model #(
     .ADDR_W(ADDR_W), .DATA_W(DATA_W), .ID_W(ID_W),
-    .MEM_WORDS(64*1024), .HEX_FILE(HEX_FILE)
+    .MEM_WORDS(64*1024), .HEX_FILE(HEX_FILE), .BASE(DRAM_BASE)
   ) u_dram (
     .clk(clk), .rst_n(rst_n), .bus(dram_if)
   );

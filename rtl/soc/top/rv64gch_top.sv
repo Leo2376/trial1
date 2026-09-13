@@ -58,7 +58,14 @@ module rv64gch_top #(
   logic [7:0]  axi_be;
   logic [63:0] axi_wdata, axi_rdata;
   logic        sel_dmem;
+  logic        axi_owner_dmem;  // latched: 1 = in-flight AXI transaction owned by dmem
 
+  // Data memory has priority over instruction fetch for the shared AXI port.
+  // A request is forwarded to the master only when the master is idle
+  // (axi_ready). The owner of the in-flight transaction is latched so the
+  // completion ack is routed correctly even if the request selectors change
+  // while the transaction is in progress (e.g. a pipeline flush dropping a
+  // fetch request).
   assign sel_dmem = dmem_req;
 
   assign axi_req   = sel_dmem ? dmem_req   : (fetch_req & fetch_ready);
@@ -70,26 +77,28 @@ module rv64gch_top #(
   assign dmem_rdata  = axi_rdata;
   assign fetch_rdata = axi_rdata;
 
-  logic dmem_pending, fetch_pending;
+  // The owner is latched at the moment the AXI master accepts a new
+  // request (st==A_IDLE && req), i.e. the cycle it leaves idle. When a
+  // transaction completes (axi_ack) the master returns to idle in the same
+  // cycle, so a new request can be accepted simultaneously; the new owner
+  // must take precedence over clearing the previous one.
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-      dmem_pending  <= 1'b0;
-      fetch_pending <= 1'b0;
-    end else begin
-      if (axi_ack) begin
-        dmem_pending  <= 1'b0;
-        fetch_pending <= 1'b0;
-      end else if (sel_dmem && dmem_req && axi_req && !axi_ack)
-        dmem_pending <= 1'b1;
-      else if (!sel_dmem && fetch_req && axi_req && !axi_ack)
-        fetch_pending <= 1'b1;
+      axi_owner_dmem <= 1'b0;
+    end else if (axi_ready && axi_req) begin
+      axi_owner_dmem <= sel_dmem;
+    end else if (axi_ack) begin
+      axi_owner_dmem <= 1'b0;
     end
   end
 
-  assign dmem_ack   = axi_ack & (dmem_pending | (sel_dmem & dmem_req));
-  assign fetch_ack  = axi_ack & (fetch_pending | (~sel_dmem & fetch_req));
-  assign dmem_ready = ~sel_dmem | axi_ready;
-  assign fetch_ready = sel_dmem | axi_ready;
+  assign dmem_ack   = axi_ack &  axi_owner_dmem;
+  assign fetch_ack  = axi_ack & ~axi_owner_dmem;
+
+  // Fetch can issue when the master is idle and no data request is pending.
+  // Data memory can issue when the master is idle.
+  assign fetch_ready = axi_ready & ~sel_dmem;
+  assign dmem_ready  = axi_ready;
 
   axi4_master #(.ADDR_W(ADDR_W), .DATA_W(DATA_W), .ID_W(ID_W)) u_axi (
     .clk(clk), .rst_n(rst_n),

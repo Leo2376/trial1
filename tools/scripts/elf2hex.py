@@ -5,11 +5,11 @@ def die(msg):
     sys.stderr.write("error: " + msg + "\n")
     sys.exit(1)
 
-if len(sys.argv) != 3:
-    die("usage: elf2hex.py <input.elf> <output.vh>")
+if len(sys.argv) < 3 or len(sys.argv) > 4:
+    die("usage: elf2hex.py <input.elf> <output.vh> [base_addr]")
 
 infile, outfile = sys.argv[1], sys.argv[2]
-base = 0x000080000000
+base = int(sys.argv[3], 0) if len(sys.argv) > 3 else 0x80000000
 
 with open(infile, "rb") as f:
     blob = f.read()
