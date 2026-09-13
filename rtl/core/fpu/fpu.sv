@@ -10,7 +10,8 @@ module fpu #(
   input  logic [XLEN-1:0]   b,
   output logic [XLEN-1:0]   result,
   output logic [4:0]        fflags,
-  output logic              done
+  output logic              done,
+  output logic              busy
 );
   import rtl_core_pkg::*;
 
@@ -23,6 +24,7 @@ module fpu #(
   assign result = res_r;
   assign fflags = fflags_r;
   assign done   = (st == F_DONE);
+  assign busy   = (st == F_BUSY);
 
   logic is_dbl_a, is_dbl_b;
   logic [31:0] as_single, bs_single;

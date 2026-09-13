@@ -33,7 +33,7 @@ package rtl_core_pkg;
     ALU_ADDW, ALU_SUBW, ALU_SLLW, ALU_SRLW, ALU_SRAW,
     ALU_LUI, ALU_COPYB, ALU_MUL, ALU_MULH, ALU_MULHSU, ALU_MULHU,
     ALU_DIV, ALU_DIVU, ALU_REM, ALU_REMU,
-    ALU_DIVW, ALU_DIVUW, ALU_REMW, ALU_REMUW
+    ALU_DIVW, ALU_DIVUW, ALU_REMW, ALU_REMUW, ALU_MULW
   } alu_op_e;
 
   typedef enum logic [4:0] {
@@ -47,7 +47,7 @@ package rtl_core_pkg;
   typedef enum logic [3:0] {
     MUL_NONE=0, MUL_MUL, MUL_MULH, MUL_MULHSU, MUL_MULHU,
     MUL_DIV, MUL_DIVU, MUL_REM, MUL_REMU,
-    MUL_DIVW, MUL_DIVUW, MUL_REMW, MUL_REMUW
+    MUL_DIVW, MUL_DIVUW, MUL_REMW, MUL_REMUW, MUL_MULW
   } mul_op_e;
 
   typedef enum logic [3:0] {
@@ -123,5 +123,33 @@ package rtl_core_pkg;
     CSR_SEPC=12'h141, CSR_SCAUSE=12'h142, CSR_STVAL=12'h143, CSR_SIP=12'h144,
     CSR_UTVEC=12'h005, CSR_USCRATCH=12'h040, CSR_UEPC=12'h041, CSR_UCAUSE=12'h042,
     CSR_UTVAL=12'h043;
+
+  function automatic logic is_mdu_op(alu_op_e op);
+    case (op)
+      ALU_MUL, ALU_MULH, ALU_MULHSU, ALU_MULHU,
+      ALU_DIV, ALU_DIVU, ALU_REM, ALU_REMU,
+      ALU_DIVW, ALU_DIVUW, ALU_REMW, ALU_REMUW, ALU_MULW: return 1'b1;
+      default: return 1'b0;
+    endcase
+  endfunction
+
+  function automatic mul_op_e alu_to_mul_op(alu_op_e op);
+    case (op)
+      ALU_MUL:    return MUL_MUL;
+      ALU_MULH:   return MUL_MULH;
+      ALU_MULHSU: return MUL_MULHSU;
+      ALU_MULHU:  return MUL_MULHU;
+      ALU_DIV:    return MUL_DIV;
+      ALU_DIVU:   return MUL_DIVU;
+      ALU_REM:    return MUL_REM;
+      ALU_REMU:   return MUL_REMU;
+      ALU_DIVW:   return MUL_DIVW;
+      ALU_DIVUW:  return MUL_DIVUW;
+      ALU_REMW:   return MUL_REMW;
+      ALU_REMUW:  return MUL_REMUW;
+      ALU_MULW:   return MUL_MULW;
+      default:    return MUL_NONE;
+    endcase
+  endfunction
 
 endpackage

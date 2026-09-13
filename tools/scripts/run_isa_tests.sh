@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
-# Compile and run a subset of riscv-tests rv64ui under the Verilator testbench.
+# Compile and run a subset of riscv-tests under the Verilator testbench.
 # Usage: run_isa_tests.sh [test1 test2 ...]
+#
+# Selects the test family (rv64ui / rv64um) via the EXT environment variable
+# (default: rv64ui). When EXT=rv64um the default test list is the M-extension
+# subset; otherwise the base integer subset.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 RISCV_SRC="${RISCV_SRC:-/tmp/riscv-tests/isa}"
+EXT="${EXT:-rv64ui}"
 ENVDIR="$ROOT/software/riscv-tests-env/rv64gch"
 SIM="$ROOT/sim/verilator/obj_dir/Vtb_rv64gch_core"
 MARCH="rv64imafd_zicsr_zifencei"
@@ -12,16 +17,21 @@ MABI="lp64d"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-DEFAULT_TESTS="add addi addw addiw and andi auipc beq bge bgeu blt bltu bne \
+if [ "$EXT" = "rv64um" ]; then
+  DEFAULT_TESTS="mul mulh mulhsu mulhu div divu rem remu \
+mulw divw divuw remw remuw"
+else
+  DEFAULT_TESTS="add addi addw addiw and andi auipc beq bge bgeu blt bltu bne \
 jal jalr lui or ori simple slli slliw sll sllw slt slti sltiu sltu \
 srai sraiw sra sraw srli srliw srl srlw sub subw xor xori \
 lb lbu lh lhu lw lwu ld sb sh sw sd"
+fi
 
 TESTS="${*:-$DEFAULT_TESTS}"
 
 pass=0; fail=0; failed_list=""
 for t in $TESTS; do
-  src="$RISCV_SRC/rv64ui/$t.S"
+  src="$RISCV_SRC/$EXT/$t.S"
   if [ ! -f "$src" ]; then echo "SKIP $t (no source)"; continue; fi
   elf="$WORK/$t.elf"; hex="$WORK/$t.hex"
   if ! riscv64-unknown-elf-gcc -march=$MARCH -mabi=$MABI -nostdlib -nostartfiles -static \
@@ -40,5 +50,6 @@ for t in $TESTS; do
   fi
 done
 echo "============================="
-echo "PASS=$pass FAIL=$fail"
+echo "[$EXT] PASS=$pass FAIL=$fail"
 [ -n "$failed_list" ] && echo "FAILED:$failed_list"
+[ "$fail" -ne 0 ] && exit 1

@@ -50,6 +50,7 @@ module rv64gch_core #(
   logic            fp_we_w, fp_we_m;
   logic [63:0]     mdu_res, fpu_res;
   logic            mdu_done, fpu_done, mdu_start, fpu_start, mdu_busy, fpu_busy;
+  logic            mdu_busy_q, fpu_busy_q;
   logic [63:0]     mem_rdata_aligned;
   logic            mem_is_load_x, mem_is_store_x;
   logic            branch_taken, branch_resolved;
@@ -303,7 +304,7 @@ module rv64gch_core #(
                   endcase
                   if (f7 == 7'b0000001) begin
                     case (f3)
-                      3'b000: c.alu_op = ALU_MUL;
+                      3'b000: c.alu_op = ALU_MULW;
                       3'b100: c.alu_op = ALU_DIVW;
                       3'b101: c.alu_op = ALU_DIVUW;
                       3'b110: c.alu_op = ALU_REMW;
@@ -529,40 +530,40 @@ module rv64gch_core #(
   assign mem_is_load_x = (ex_pkt.ctrl.lsu_op >= LSU_LB) & (ex_pkt.ctrl.lsu_op <= LSU_LWU);
   assign mem_is_store_x = (ex_pkt.ctrl.lsu_op >= LSU_SB) & (ex_pkt.ctrl.lsu_op <= LSU_SD);
 
+  logic mdu_in_ex;
+  assign mdu_in_ex = ex_pkt.valid & is_mdu_op(ex_pkt.ctrl.alu_op);
+
   always_comb begin
     mdu_start = 1'b0; fpu_start = 1'b0;
-    if (ex_pkt.valid) begin
-      case (ex_pkt.ctrl.alu_op)
-        ALU_MUL, ALU_MULH, ALU_MULHSU, ALU_MULHU,
-        ALU_DIV, ALU_DIVU, ALU_REM, ALU_REMU,
-        ALU_DIVW, ALU_DIVUW, ALU_REMW, ALU_REMUW:
-          mdu_start = 1'b1;
-      endcase
-      if (ex_pkt.ctrl.fpu_op != FPU_NONE) fpu_start = 1'b1;
-    end
+    if (mdu_in_ex & ~mdu_busy_q & ~mdu_done)
+      mdu_start = 1'b1;
+    if (fpu_in_ex & ~fpu_busy_q & ~fpu_done)
+      fpu_start = 1'b1;
   end
 
   mdu u_mdu (
     .clk(clk), .rst_n(rst_n),
-    .start(mdu_start), .op(rtl_core_pkg::mul_op_e'(ex_pkt.ctrl.alu_op)),
+    .start(mdu_start), .op(alu_to_mul_op(ex_pkt.ctrl.alu_op)),
     .a(rs1_fwd), .b(rs2_fwd),
-    .result(mdu_res), .done(mdu_done)
+    .result(mdu_res), .done(mdu_done), .busy(mdu_busy_q)
   );
-  assign mdu_busy = (mdu_start | ~mdu_done) & (ex_pkt.ctrl.alu_op == ALU_MUL);
+  assign mdu_busy = mdu_in_ex & ~mdu_done;
+
+  logic fpu_in_ex;
+  assign fpu_in_ex = ex_pkt.valid & (ex_pkt.ctrl.fpu_op != FPU_NONE);
 
   fpu u_fpu (
     .clk(clk), .rst_n(rst_n),
     .start(fpu_start), .op(ex_pkt.ctrl.fpu_op), .rm(ex_pkt.ctrl.fp_rm),
     .a(fp_rdata1), .b(fp_rdata2),
-    .result(fpu_res), .fflags(), .done(fpu_done)
+    .result(fpu_res), .fflags(), .done(fpu_done), .busy(fpu_busy_q)
   );
-  assign fpu_busy = (fpu_start | ~fpu_done) & (ex_pkt.ctrl.fpu_op != FPU_NONE);
+  assign fpu_busy = fpu_in_ex & ~fpu_done;
 
   logic [63:0] ex_result;
   always_comb begin
     ex_result = alu_y;
-    if (ex_pkt.ctrl.alu_op == ALU_MUL | ex_pkt.ctrl.alu_op == ALU_MULH |
-        ex_pkt.ctrl.alu_op == ALU_DIV | ex_pkt.ctrl.alu_op == ALU_REM)
+    if (is_mdu_op(ex_pkt.ctrl.alu_op))
       ex_result = mdu_res;
     if (ex_pkt.ctrl.fpu_op != FPU_NONE) ex_result = fpu_res;
     if (ex_pkt.ctrl.is_jal | ex_pkt.ctrl.is_jalr)
