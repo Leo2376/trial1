@@ -17,11 +17,18 @@ module tb_rv64gch_core;
 
   logic        test_done, test_pass;
   logic [63:0] tohost_val;
+  logic        core_active;
 
-  axi4_master_stub #(
-    .ADDR_W(ADDR_W), .DATA_W(DATA_W), .ID_W(ID_W)
-  ) u_master (
-    .clk(clk), .rst_n(rst_n), .bus(cpu_if)
+  rv64gch_top #(
+    .ADDR_W(ADDR_W), .DATA_W(DATA_W), .ID_W(ID_W), .XLEN(64)
+  ) u_cpu (
+    .clk(clk), .rst_n(rst_n),
+    .hartid_i(64'd0),
+    .msi_n_i(1'b1),
+    .dbg_req_i(2'b00),
+    .dbg_halt_req_i(1'b0),
+    .core_active_o(core_active),
+    .mem(cpu_if)
   );
 
   axi4_decoder #(
@@ -58,7 +65,7 @@ module tb_rv64gch_core;
     rst_n     = 1'b0;
     repeat (20) @(posedge clk);
     rst_n = 1'b1;
-    $display("[tb] reset de-asserted, stub master driving AXI");
+    $display("[tb] reset de-asserted, rv64gch_top booting from 0x%012h", RESET_PC);
 
     while (!test_done && cycle_cnt < MAX_CYCLES) begin
       @(negedge clk);
