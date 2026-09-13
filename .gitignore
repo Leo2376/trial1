@@ -51,3 +51,8 @@ __pycache__/
 *.pyc
 sim/verilator/prog.vh
 sim/riscv-tests/build/
+# Synthesis (Yosys + ASAP7) - fetched PDK + generated netlists
+syn/lib/
+syn/output/
+syn/third_party/
+syn/*.synth.v
