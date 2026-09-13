@@ -27,6 +27,9 @@ module fpu #(
   logic is_dbl_a, is_dbl_b;
   logic [31:0] as_single, bs_single;
   logic [63:0] as_dbl, bs_dbl;
+  logic [31:0] a_single_res;
+
+  assign a_single_res = dbl2single(a);
 
   function automatic logic [31:0] dbl2single(input logic [63:0] d);
     logic [1:0]  sgn; logic [10:0] exp; logic [51:0] man;
@@ -63,7 +66,7 @@ module fpu #(
           res_r <= '0;
           case (op)
             FPU_F2D:   res_r <= single2dbl(a[31:0]);
-            FPU_D2F:   res_r <= {{32{dbl2single(a)[31]}}, dbl2single(a)};
+            FPU_D2F:   res_r <= {{32{a_single_res[31]}}, a_single_res};
             FPU_I2F:   res_r <= single2dbl({1'b0, a[31], 8'd0, a[30:0]});
             FPU_F2I:   res_r <= {a[63], a[62:0]};
             FPU_MV_X2F:res_r <= a;
