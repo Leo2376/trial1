@@ -7,7 +7,7 @@ module rv64gch_top #(
   input  logic                clk,
   input  logic                rst_n,
 
-  input  logic [XLEN-1:0]     hartid_i,
+  input  logic [XLEN-1:0]    hartid_i,
   input  logic                msi_n_i,
   input  logic [1:0]          dbg_req_i,
   input  logic                dbg_halt_req_i,
@@ -16,186 +16,91 @@ module rv64gch_top #(
 
   axi4_if.m                  mem
 );
-
   import rv64gch_memmap_pkg::*;
 
-  localparam logic [47:0] CHAROUT_ADDR = HOSTIF_BASE + CHAROUT_OFF[47:0];
-  localparam logic [47:0] TOHOST_ADDR  = HOSTIF_BASE + TOHOST_OFF[47:0];
+  logic        fetch_req, fetch_we, fetch_ack, fetch_ready, fetch_err;
+  logic [47:0] fetch_addr;
+  logic [7:0]  fetch_be;
+  logic [63:0] fetch_wdata, fetch_rdata;
 
-  typedef enum logic [3:0] {
-    ST_RESET,
-    ST_FETCH_AW,
-    ST_FETCH_W,
-    ST_FETCH_B,
-    ST_FETCH_AR,
-    ST_FETCH_R0,
-    ST_FETCH_R1,
-    ST_EXEC,
-    ST_CHAROUT_AW,
-    ST_CHAROUT_W,
-    ST_CHAROUT_B,
-    ST_TOHOST_AW,
-    ST_TOHOST_W,
-    ST_TOHOST_B,
-    ST_DONE
-  } cpu_st_e;
+  logic        dmem_req, dmem_we, dmem_ack, dmem_ready, dmem_err, dmem_lock;
+  logic [47:0] dmem_addr;
+  logic [7:0]  dmem_be;
+  logic [63:0] dmem_wdata, dmem_rdata;
 
-  cpu_st_e st;
+  logic [31:0] dbg_pc;
+  logic        timer_irq, soft_irq, ext_irq;
 
-  logic [ADDR_W-1:0] pc;
-  logic [DATA_W-1:0] fetch_word;
-  logic [DATA_W-1:0] insn_lo, insn_hi;
-  logic [47:0]       cur_addr;
-  logic [DATA_W-1:0] cur_wdata;
+  assign timer_irq = 1'b0;
+  assign soft_irq  = 1'b0;
+  assign ext_irq   = 1'b0;
 
-  localparam string MSG = "RV64GCH stub: hello from CPU top\n";
-  int msg_idx;
+  rv64gch_core #(.XLEN(XLEN)) u_core (
+    .clk(clk), .rst_n(rst_n),
+    .hartid_i(hartid_i),
+    .timer_irq(timer_irq), .soft_irq(soft_irq), .ext_irq(ext_irq),
+    .fetch_req(fetch_req), .fetch_we(fetch_we),
+    .fetch_addr(fetch_addr), .fetch_be(fetch_be),
+    .fetch_wdata(fetch_wdata), .fetch_rdata(fetch_rdata),
+    .fetch_ack(fetch_ack), .fetch_ready(fetch_ready), .fetch_err(fetch_err),
+    .mem_req(dmem_req), .mem_we(dmem_we),
+    .mem_addr(dmem_addr), .mem_be(dmem_be),
+    .mem_wdata(dmem_wdata), .mem_lock(dmem_lock),
+    .mem_rdata(dmem_rdata), .mem_ack(dmem_ack),
+    .mem_ready(dmem_ready), .mem_err(dmem_err),
+    .dbg_pc(dbg_pc)
+  );
 
-  assign core_active_o = (st != ST_DONE) && (st != ST_RESET);
+  assign core_active_o = (dbg_pc != 32'd0);
 
+  logic        axi_req, axi_we, axi_ack, axi_ready, axi_err;
+  logic [47:0] axi_addr;
+  logic [7:0]  axi_be;
+  logic [63:0] axi_wdata, axi_rdata;
+  logic        sel_dmem;
+
+  assign sel_dmem = dmem_req;
+
+  assign axi_req   = sel_dmem ? dmem_req   : (fetch_req & fetch_ready);
+  assign axi_we    = sel_dmem ? dmem_we    : 1'b0;
+  assign axi_addr  = sel_dmem ? dmem_addr  : fetch_addr;
+  assign axi_be    = sel_dmem ? dmem_be    : fetch_be;
+  assign axi_wdata = sel_dmem ? dmem_wdata : fetch_wdata;
+
+  assign dmem_rdata  = axi_rdata;
+  assign fetch_rdata = axi_rdata;
+
+  logic dmem_pending, fetch_pending;
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-      st          <= ST_RESET;
-      pc          <= RESET_PC;
-      msg_idx     <= 0;
-      mem.awvalid <= 1'b0;
-      mem.wvalid  <= 1'b0;
-      mem.bready  <= 1'b0;
-      mem.arvalid <= 1'b0;
-      mem.rready  <= 1'b0;
-      mem.awaddr  <= '0;
-      mem.wdata   <= '0;
+      dmem_pending  <= 1'b0;
+      fetch_pending <= 1'b0;
     end else begin
-      mem.awvalid <= 1'b0;
-      mem.wvalid  <= 1'b0;
-      mem.bready  <= 1'b0;
-      mem.arvalid <= 1'b0;
-      mem.rready  <= 1'b0;
-      case (st)
-        ST_RESET: begin
-          pc      <= RESET_PC;
-          msg_idx <= 0;
-          st      <= ST_FETCH_AR;
-        end
-
-        ST_FETCH_AR: begin
-          mem.araddr  <= pc;
-          mem.arvalid <= 1'b1;
-          if (mem.arvalid && mem.arready) begin
-            mem.arvalid <= 1'b0;
-            mem.rready  <= 1'b1;
-            st <= ST_FETCH_R0;
-          end
-        end
-
-        ST_FETCH_R0: begin
-          mem.rready <= 1'b1;
-          if (mem.rvalid && mem.rready) begin
-            insn_lo <= mem.rdata;
-            mem.rready <= 1'b0;
-            st <= ST_FETCH_R1;
-          end
-        end
-        ST_FETCH_R1: begin
-          mem.rready <= 1'b1;
-          if (mem.rvalid && mem.rready) begin
-            insn_hi <= mem.rdata;
-            mem.rready <= 1'b0;
-            st <= ST_EXEC;
-          end
-        end
-
-        ST_EXEC: begin
-          if (msg_idx < MSG.len()) begin
-            cur_addr  <= CHAROUT_ADDR;
-            cur_wdata <= {56'd0, MSG[msg_idx]};
-            mem.awaddr  <= CHAROUT_ADDR;
-            mem.wdata   <= {56'd0, MSG[msg_idx]};
-            mem.awvalid <= 1'b1;
-            st <= ST_CHAROUT_AW;
-          end else begin
-            cur_addr  <= TOHOST_ADDR;
-            cur_wdata <= TOHOST_PASS;
-            mem.awaddr  <= TOHOST_ADDR;
-            mem.wdata   <= TOHOST_PASS;
-            mem.awvalid <= 1'b1;
-            st <= ST_TOHOST_AW;
-          end
-        end
-
-        ST_CHAROUT_AW: begin
-          mem.awaddr  <= cur_addr;
-          mem.wdata   <= cur_wdata;
-          mem.awvalid <= 1'b1;
-          if (mem.awready) begin
-            mem.awvalid <= 1'b0;
-            mem.wvalid  <= 1'b1;
-            st <= ST_CHAROUT_W;
-          end
-        end
-        ST_CHAROUT_W: begin
-          mem.awaddr <= cur_addr;
-          mem.wdata  <= cur_wdata;
-          mem.wvalid <= 1'b1;
-          if (mem.wready) begin
-            mem.wvalid <= 1'b0;
-            mem.bready <= 1'b1;
-            st <= ST_CHAROUT_B;
-          end
-        end
-        ST_CHAROUT_B: begin
-          mem.bready <= 1'b1;
-          if (mem.bvalid) begin
-            mem.bready <= 1'b0;
-            msg_idx <= msg_idx + 1;
-            st <= ST_EXEC;
-          end
-        end
-
-        ST_TOHOST_AW: begin
-          mem.awaddr  <= cur_addr;
-          mem.wdata   <= cur_wdata;
-          mem.awvalid <= 1'b1;
-          if (mem.awready) begin
-            mem.awvalid <= 1'b0;
-            mem.wvalid  <= 1'b1;
-            st <= ST_TOHOST_W;
-          end
-        end
-        ST_TOHOST_W: begin
-          mem.awaddr <= cur_addr;
-          mem.wdata  <= cur_wdata;
-          mem.wvalid <= 1'b1;
-          if (mem.wready) begin
-            mem.wvalid <= 1'b0;
-            mem.bready <= 1'b1;
-            st <= ST_TOHOST_B;
-          end
-        end
-        ST_TOHOST_B: begin
-          mem.bready <= 1'b1;
-          if (mem.bvalid) begin
-            mem.bready <= 1'b0;
-            st <= ST_DONE;
-          end
-        end
-
-        ST_DONE: st <= ST_DONE;
-      endcase
+      if (axi_ack) begin
+        dmem_pending  <= 1'b0;
+        fetch_pending <= 1'b0;
+      end else if (sel_dmem && dmem_req && axi_req && !axi_ack)
+        dmem_pending <= 1'b1;
+      else if (!sel_dmem && fetch_req && axi_req && !axi_ack)
+        fetch_pending <= 1'b1;
     end
   end
 
-  always_comb begin
-    mem.awid    = '0;
-    mem.awlen   = 8'd0;
-    mem.awsize  = 3'd3;
-    mem.awburst = 2'b01;
-    mem.wstrb   = '1;
-    mem.wlast   = 1'b1;
-    mem.arid    = '0;
-    mem.arlen   = 8'd1;
-    mem.arsize  = 3'd3;
-    mem.arburst = 2'b01;
-  end
+  assign dmem_ack   = axi_ack & (dmem_pending | (sel_dmem & dmem_req));
+  assign fetch_ack  = axi_ack & (fetch_pending | (~sel_dmem & fetch_req));
+  assign dmem_ready = ~sel_dmem | axi_ready;
+  assign fetch_ready = sel_dmem | axi_ready;
+
+  axi4_master #(.ADDR_W(ADDR_W), .DATA_W(DATA_W), .ID_W(ID_W)) u_axi (
+    .clk(clk), .rst_n(rst_n),
+    .req(axi_req), .we(axi_we),
+    .addr(axi_addr), .be(axi_be), .wdata(axi_wdata),
+    .size(4'd3), .lock(dmem_lock & sel_dmem),
+    .rdata(axi_rdata), .ack(axi_ack), .ready(axi_ready), .err(axi_err),
+    .bus(mem)
+  );
+
+  assign dmem_err  = axi_err;
+  assign fetch_err = axi_err;
 
 endmodule

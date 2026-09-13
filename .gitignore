@@ -49,3 +49,4 @@ alib-*/
 generated/
 __pycache__/
 *.pyc
+sim/verilator/prog.vh

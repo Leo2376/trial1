@@ -1,5 +1,17 @@
+../../rtl/core/rtl_core_pkg.sv
 ../../rtl/soc/top/rv64gch_memmap_pkg.sv
 ../../rtl/soc/fabric/axi4_if.sv
+../../rtl/core/frontend/decompressor.sv
+../../rtl/core/regfile/regfile_int.sv
+../../rtl/core/regfile/regfile_fp.sv
+../../rtl/core/int_alu/alu.sv
+../../rtl/core/mul_div/mdu.sv
+../../rtl/core/fpu/fpu.sv
+../../rtl/core/csr/csr_unit.sv
+../../rtl/core/ctrl/forwarding_unit.sv
+../../rtl/core/ctrl/hazard_unit.sv
+../../rtl/soc/fabric/axi4_master.sv
+../../rtl/core/rv64gch_core.sv
 ../../rtl/soc/fabric/axi4_decoder.sv
 ../../rtl/soc/top/rv64gch_top.sv
 ../../verification/tb_core/axi4_dram_model.sv
