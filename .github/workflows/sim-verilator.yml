@@ -1,0 +1,30 @@
+name: sim (verilator)
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verilator:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Verilator
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y verilator
+          verilator --version
+
+      - name: Elaborate and simulate
+        run: |
+          cd sim/verilator
+          make
+
+      - name: Check simulation passed
+        run: |
+          cd sim/verilator
+          make clean >/dev/null
+          out="$(make 2>&1)"
+          echo "$out"
+          echo "$out" | grep -q "TEST PASSED" || { echo "::error::simulation did not report TEST PASSED"; exit 1; }
