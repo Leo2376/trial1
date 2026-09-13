@@ -16,8 +16,9 @@ dual-issue in-order with an integrated FPU, MMU, RVV 1.0 vector engine
   - Shared L2/last-level cache: 1 MiB, shared between the CPU, the vector
     engine, and the matrix engine.
 - **MMU**: Sv48 (and hypervisor two-stage) virtual memory.
-- **Vector engine**: RVV 1.0 compliant, VLEN = 256 bits.
-- **Matrix engine**: IME 1.0 compliant.
+- **Vector/Matrix engine**: unified processing unit implementing RVV 1.0
+  (VLEN = 256 bits) and IME 1.0; the two extensions share the register file
+  and most of the execution hardware.
 - **Target**: ASIC (standard-cell synthesis, not FPGA).
 
 ## Directory Layout
@@ -53,17 +54,15 @@ dual-issue in-order with an integrated FPU, MMU, RVV 1.0 vector engine
 │   │   ├── l2/               # 256 KiB unified private L2.
 │   │   ├── llc/              # 1 MiB shared L2/LLC.
 │   │   └── coherence/        # coherence / snoop / directory logic.
-│   ├── vector/               # RVV 1.0 vector engine (VLEN = 256).
-│   │   ├── vregfile/          # vector register file.
-│   │   ├── vlane/             # vector execution lanes.
-│   │   ├── vsew_lmul/         # SEW/LMU configuration logic.
-│   │   ├── vldst/             # vector load/store unit.
-│   │   └── vctrl/             # vector issue/control.
-│   ├── matrix/                # IME 1.0 matrix extension.
-│   │   ├── mregfile/          # matrix/tile register file.
-│   │   ├── munit/             # matrix execution units.
-│   │   ├── mldst/             # matrix load/store unit.
-│   │   └── mctrl/             # matrix issue/control.
+│   ├── vpu/                  # unified vector/matrix processing unit.
+│   │   │                        # RVV 1.0 (VLEN = 256) and IME 1.0 share the
+│   │   │                        # register file and most execution hardware.
+│   │   ├── regfile/          # shared vector/matrix register file.
+│   │   ├── vlane/            # vector execution lanes (RVV).
+│   │   ├── vsew_lmul/        # RVV SEW/LMUL configuration logic.
+│   │   ├── munit/            # matrix execution units (IME).
+│   │   ├── ldst/             # shared vector/matrix load/store unit.
+│   │   └── ctrl/             # shared vector/matrix issue & control.
 │   ├── soc/                   # top-level integration.
 │   │   ├── top/               # chip/core top.
 │   │   ├── fabric/            # interconnect (AXI/CHI) for L2/LLC sharing.
@@ -75,8 +74,7 @@ dual-issue in-order with an integrated FPU, MMU, RVV 1.0 vector engine
 │   ├── tb_core/              # scalar core testbenches.
 │   ├── tb_cache/             # cache hierarchy testbenches.
 │   ├── tb_mmu/               # MMU / page-walker testbenches.
-│   ├── tb_vector/            # vector engine testbenches.
-│   ├── tb_matrix/            # matrix engine testbenches.
+│   ├── tb_vpu/               # unified vector/matrix (VPU) testbenches.
 │   ├── tb_soc/               # full-chip / integration testbenches.
 │   ├── uvm/                  # UVM components and environments.
 │   ├── formal/               # formal property checks (SymbiYosys / Jasper).
