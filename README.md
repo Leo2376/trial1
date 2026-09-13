@@ -108,6 +108,19 @@ Tooling is intentionally tool-agnostic. Drivers live under `sim/`:
 - ASIC synthesis: `syn/scripts` with `syn/constr` SDC constraints.
 - Technology data: `tech/stdcells`, `tech/io`.
 
+### Continuous Integration
+
+CI builds the Verilator testbench, runs the smoke test, then compiles and
+runs the `riscv-tests` `rv64ui` subset under it.
+
+- GitHub Actions: `.github/workflows/sim-verilator.yml` (smoke) and
+  `.github/workflows/isa-tests.yml` (rv64ui regression).
+- GitLab CI: `.gitlab-ci.yml` defines two stages — `sim` (build + smoke)
+  and `isa-tests` (rv64ui regression, gated on `sim`). Both use the
+  `debian:bookworm` image and install `verilator` and
+  `gcc-riscv64-unknown-elf` via apt; on a self-hosted runner that already
+  has them, set `VERILATOR_SKIP_INSTALL=1` for the `sim` job.
+
 ## Status
 
 This repository has been reset from its previous EDA-tool content to host the
