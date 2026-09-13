@@ -113,6 +113,15 @@ package rtl_core_pkg;
     logic [2:0]  fp_rm;
   } ctrl_t;
 
+  // IEEE 754 rounding modes (rm field): RNE=round to nearest even, RTZ=round
+  // toward zero, RDN=round down, RUP=round up, RMM=round to nearest max mag.
+  // DYN=dynamic (use fcsr.rm). fflags bits: NV inexact-invalid, DZ div-by-zero,
+  // OF overflow, UF underflow, NX inexact.
+  localparam logic [2:0] RM_RNE = 3'd0, RM_RTZ = 3'd1, RM_RDN = 3'd2,
+                        RM_RUP = 3'd3, RM_RMM = 3'd4, RM_DYN = 3'd7;
+  localparam logic [4:0] FF_NV = 5'b10000, FF_DZ = 5'b01000, FF_OF = 5'b00100,
+                        FF_UF = 5'b00010, FF_NX = 5'b00001;
+
   localparam logic [11:0] CSR_MSTATUS=12'h300, CSR_MISA=12'h301, CSR_MIE=12'h304,
     CSR_MTVEC=12'h305, CSR_MSCRATCH=12'h340, CSR_MEPC=12'h341, CSR_MCAUSE=12'h342,
     CSR_MTVAL=12'h343, CSR_MIP=12'h344, CSR_MCYCLE=12'hB00, CSR_CYCLE=12'hC00,

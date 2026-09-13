@@ -17,15 +17,20 @@ MABI="lp64d"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-if [ "$EXT" = "rv64um" ]; then
-  DEFAULT_TESTS="mul mulh mulhsu mulhu div divu rem remu \
-mulw divw divuw remw remuw"
-else
-  DEFAULT_TESTS="add addi addw addiw and andi auipc beq bge bgeu blt bltu bne \
+case "$EXT" in
+  rv64um)
+    DEFAULT_TESTS="mul mulh mulhsu mulhu div divu rem remu \
+mulw divw divuw remw remuw";;
+  rv64uf)
+    DEFAULT_TESTS="fadd fdiv fmin fclass fcmp fcvt fcvt_w move ldst fmadd recoding";;
+  rv64ud)
+    DEFAULT_TESTS="fadd fdiv fmin fclass fcmp fcvt fcvt_w move ldst fmadd recoding structural";;
+  *)
+    DEFAULT_TESTS="add addi addw addiw and andi auipc beq bge bgeu blt bltu bne \
 jal jalr lui or ori simple slli slliw sll sllw slt slti sltiu sltu \
 srai sraiw sra sraw srli srliw srl srlw sub subw xor xori \
-lb lbu lh lhu lw lwu ld sb sh sw sd"
-fi
+lb lbu lh lhu lw lwu ld sb sh sw sd";;
+esac
 
 TESTS="${*:-$DEFAULT_TESTS}"
 

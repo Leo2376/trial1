@@ -10,6 +10,7 @@ module csr_unit #(
   input  logic [11:0]       csr_addr,
   input  logic [XLEN-1:0]   csr_wdata,
   input  logic [1:0]        csr_op,
+  input  logic [4:0]        csr_rs1,
   output logic [XLEN-1:0]   csr_rdata,
   input  logic [XLEN-1:0]   pc,
   input  logic [4:0]        cause,
@@ -38,6 +39,35 @@ module csr_unit #(
   logic [XLEN-1:0] fcsr;
   logic [XLEN-1:0] csr_rdata_q;
 
+  // CSR write semantics: CSRRW writes the operand; CSRRS sets (OR) the bits,
+  // CSRRC clears (AND-NOT) the bits. CSRRS/CSRRC with rs1==0 perform no write
+  // (read-only access). The effective write value is computed from the old
+  // register value and the operand according to the op.
+  logic        csr_op_we;
+  logic [XLEN-1:0] csr_wval;
+  always_comb begin
+    csr_op_we = csr_we;
+    csr_wval  = csr_wdata;
+    case (csr_op)
+      2'b01: begin // CSRRW
+        csr_op_we = csr_we;
+        csr_wval  = csr_wdata;
+      end
+      2'b10: begin // CSRRS
+        csr_op_we = csr_we & (csr_rs1 != 5'd0);
+        csr_wval  = csr_rdata_q | csr_wdata;
+      end
+      2'b11: begin // CSRRC
+        csr_op_we = csr_we & (csr_rs1 != 5'd0);
+        csr_wval  = csr_rdata_q & ~csr_wdata;
+      end
+      default: begin
+        csr_op_we = csr_we;
+        csr_wval  = csr_wdata;
+      end
+    endcase
+  end
+
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       mstatus  <= {64'h0000000A00000000};
@@ -64,27 +94,27 @@ module csr_unit #(
         new_priv <= mstatus[7:4];
       end else if (sret) begin
         new_priv <= PRIV_S;
-      end else if (csr_we) begin
+      end else if (csr_op_we) begin
         case (csr_addr)
-          CSR_MSTATUS:  mstatus  <= csr_wdata;
-          CSR_MIE:      mie      <= csr_wdata;
-          CSR_MTVEC:    mtvec    <= csr_wdata;
-          CSR_MEPC:     mepc     <= csr_wdata;
-          CSR_MCAUSE:  mcause   <= csr_wdata;
-          CSR_MTVAL:    mtval    <= csr_wdata;
-          CSR_MIP:      mip      <= csr_wdata;
-          CSR_MSCRATCH: mscratch <= csr_wdata;
-          CSR_SSTATUS:  sstatus  <= csr_wdata;
-          CSR_SIE:      sie      <= csr_wdata;
-          CSR_STVEC:    stvec    <= csr_wdata;
-          CSR_SEPC:     sepc     <= csr_wdata;
-          CSR_SCAUSE:   scause   <= csr_wdata;
-          CSR_STVAL:    stval    <= csr_wdata;
-          CSR_SIP:      sip      <= csr_wdata;
-          CSR_SSCRATCH: sscratch <= csr_wdata;
-          CSR_FCSR:     fcsr     <= csr_wdata;
-          CSR_FFLAGS:   fcsr[4:0]<= csr_wdata[4:0];
-          CSR_FRM:      fcsr[7:5] <= csr_wdata[2:0];
+          CSR_MSTATUS:  mstatus  <= csr_wval;
+          CSR_MIE:      mie      <= csr_wval;
+          CSR_MTVEC:    mtvec    <= csr_wval;
+          CSR_MEPC:     mepc     <= csr_wval;
+          CSR_MCAUSE:  mcause   <= csr_wval;
+          CSR_MTVAL:    mtval    <= csr_wval;
+          CSR_MIP:      mip      <= csr_wval;
+          CSR_MSCRATCH: mscratch <= csr_wval;
+          CSR_SSTATUS:  sstatus  <= csr_wval;
+          CSR_SIE:      sie      <= csr_wval;
+          CSR_STVEC:    stvec    <= csr_wval;
+          CSR_SEPC:     sepc     <= csr_wval;
+          CSR_SCAUSE:   scause   <= csr_wval;
+          CSR_STVAL:    stval    <= csr_wval;
+          CSR_SIP:      sip      <= csr_wval;
+          CSR_SSCRATCH: sscratch <= csr_wval;
+          CSR_FCSR:     fcsr     <= {csr_wval[7:0], 56'd0};
+          CSR_FFLAGS:   fcsr[4:0]<= csr_wval[4:0];
+          CSR_FRM:      fcsr[7:5] <= csr_wval[2:0];
           default: ;
         endcase
       end

@@ -77,6 +77,8 @@ module rv64gch_core #(
     ctrl_t       ctrl;
     logic [63:0] rs1;
     logic [63:0] rs2;
+    logic [63:0] fa;
+    logic [63:0] fb;
     logic [63:0] imm;
   } ex_pkt_t;
   ex_pkt_t ex_pkt, ex_pkt_n;
@@ -87,6 +89,7 @@ module rv64gch_core #(
     ctrl_t       ctrl;
     logic [63:0] alu_res;
     logic [63:0] rs2;
+    logic [63:0] csr_wdata;
     logic [63:0] mem_addr;
     logic        is_store;
     logic        is_load;
@@ -101,6 +104,7 @@ module rv64gch_core #(
     logic [63:0] pc;
     ctrl_t       ctrl;
     logic [63:0] data;
+    logic [63:0] csr_wdata;
     logic [4:0]  rd;
     logic        we;
     logic        fp_we;
@@ -321,7 +325,12 @@ module rv64gch_core #(
                       else if (i[31:20] == 12'h105) c.is_wfi = 1'b1;
                     end
                     default: begin
-                      c.reads_csr = 1'b1; c.writes_csr = (f3 != 3'b010);
+                      // All CSR ops read; all may write. CSRRS/CSRRC only
+                      // write when rs1!=0, enforced in the CSR unit. funct3[2]
+                      // is the immediate bit (1 => rs1 field is a 5-bit zimm);
+                      // the operand value is the same either way. csr_op encodes
+                      // CSRRW=001/CSRRS=010/CSRRC=011 via funct3[1:0].
+                      c.reads_csr = 1'b1; c.writes_csr = 1'b1;
                       c.csr_addr = i[31:20]; c.csr_op = f3[1:0];
                     end
                   endcase end
@@ -331,13 +340,91 @@ module rv64gch_core #(
       OP_AMO:    begin c.wb_sel = WB_MEM; c.lsu_op = LSU_AMO;
                   c.amo_op = amo_op_e'(i[31:27]);
                   c.a_src = SRC_REG; end
-      OP_FPLOAD: begin c.wb_sel = WB_FP; c.lsu_op = LSU_LD; c.is_fp = 1'b1; end
-      OP_FPSTORE:begin c.wb_sel = WB_NONE; c.lsu_op = LSU_SD; c.is_fp = 1'b1; end
-      OP_FPOP:   begin c.wb_sel = WB_FP; c.is_fp = 1'b1;
-                  c.fpu_op = fpu_op_e'(i[31:25]); end
+      OP_FPLOAD: begin c.is_fp = 1'b1; c.wb_sel = WB_FP;
+                  // FLW (funct3=2, 32-bit) / FLD (funct3=3, 64-bit).
+                  c.lsu_op = (f3 == 3'b010) ? LSU_LW : LSU_LD; end
+      OP_FPSTORE:begin c.is_fp = 1'b1; c.wb_sel = WB_NONE;
+                  // FSW (funct3=2, 32-bit) / FSD (funct3=3, 64-bit).
+                  c.lsu_op = (f3 == 3'b010) ? LSU_SW : LSU_SD; end
+      OP_FPOP:   begin c.is_fp = 1'b1; {c.fp_fmt, c.fpu_op, c.wb_sel} = decode_fpu_op(i); end
       default:   c.illegal = 1'b1;
     endcase
     return c;
+  endfunction
+
+  // Decode the OP-FP (opcode 1010011) space. RISC-V encodes the operation in
+  // funct7[6:1] and the precision (single/double) in funct7[0] for the
+  // arithmetic/sign-injection/min-max/compare ops. Conversion and move ops
+  // use the rs2 field to select the source/destination width. Returns a packed
+  // triple {fp_fmt[2:0], fpu_op[4:0], wb_sel[1:0]}; fp_fmt[0] is the double-
+  // precision flag used by the FPU, fp_fmt[1] flags integer-destination ops
+  // (compare/class/f2i/mv.x) that write the integer regfile.
+  function automatic logic [9:0] decode_fpu_op(logic [31:0] i);
+    logic [2:0] f3; logic [6:0] f7; logic [4:0] rs2;
+    logic [2:0] fmt;  fpu_op_e fop;  wb_sel_e wbs;
+    fmt = '0; fop = FPU_NONE; wbs = WB_FP;
+    f3 = i[14:12]; f7 = i[31:25]; rs2 = i[24:20];
+    fmt[0] = f7[0]; // single/double precision for arithmetic ops
+    case (f7[6:1])
+      // FADD/FSUB/FMUL/FDIV: funct7[6:1] = 000000/000010/000100/000110.
+      6'b000000: fop = FPU_FADD;
+      6'b000010: fop = FPU_FSUB;
+      6'b000100: fop = FPU_FMUL;
+      6'b000110: fop = FPU_FDIV;
+      6'b010110: begin fop = FPU_FSQRT; fmt[0] = f7[0]; end // rs2 must be 0
+      6'b001000: begin // FSGNJ/N/X, selected by funct3
+                  case (f3)
+                    3'b000: fop = FPU_FSGNJ;
+                    3'b001: fop = FPU_FSGNJN;
+                    3'b010: fop = FPU_FSGNJX;
+                    default: fop = FPU_NONE;
+                  endcase end
+      6'b001010: begin // FMIN/FMAX, selected by funct3
+                  case (f3)
+                    3'b000: fop = FPU_FMIN;
+                    3'b001: fop = FPU_FMAX;
+                    default: fop = FPU_NONE;
+                  endcase end
+      6'b101000: begin // FLE/FLT/FEQ -> integer destination
+                  fmt[1] = 1'b1; wbs = WB_INT;
+                  case (f3)
+                    3'b000: fop = FPU_FLE;
+                    3'b001: fop = FPU_FLT;
+                    3'b010: fop = FPU_FEQ;
+                    default: fop = FPU_NONE;
+                  endcase end
+      6'b111000: begin
+                  if (rs2 == 5'd0) begin // FCLASS -> integer destination
+                    fmt[1] = 1'b1; wbs = WB_INT; fop = FPU_CLASS; fmt[0] = f7[0];
+                  end else if (f3 == 3'b000) begin // FMV.X.W/D -> int dest
+                    fmt[1] = 1'b1; wbs = WB_INT; fop = FPU_MV_F2X; fmt[0] = f7[0];
+                  end else begin
+                    fop = FPU_NONE;
+                  end end
+      6'b111100: begin // FMV.W.X/D.X -> fp destination, int source
+                  if (f3 == 3'b000) begin fop = FPU_MV_X2F; fmt[0] = f7[0]; end
+                  else fop = FPU_NONE; end
+      6'b110000: begin // FCVT.*.X (int->fp): rs2 selects int width; fp dest
+                  fmt[0] = f7[0]; // 0=>fcvt.s.w, 1=>fcvt.d.w (double dest)
+                  case (rs2)
+                    5'd0, 5'd2: fop = FPU_I2F; // w / l (signed)
+                    5'd1, 5'd3: fop = FPU_I2F; // wu / lu (unsigned)
+                    default: fop = FPU_NONE;
+                  endcase end
+      6'b110100: begin // FCVT.X.* (fp->int): rs2 selects int width; int dest
+                  fmt[0] = f7[0]; fmt[1] = 1'b1; wbs = WB_INT;
+                  case (rs2)
+                    5'd0, 5'd2: fop = FPU_F2I; // w / l (signed)
+                    5'd1, 5'd3: fop = FPU_F2I; // wu / lu (unsigned)
+                    default: fop = FPU_NONE;
+                  endcase end
+      6'b010000: begin // FCVT.S.D (f7=0100000) single dest from double src
+                  fmt[0] = 1'b0; fop = FPU_D2F; end
+      6'b010001: begin // FCVT.D.S (f7=0100001) double dest from single src
+                  fmt[0] = 1'b1; fop = FPU_F2D; end
+      default: fop = FPU_NONE;
+    endcase
+    return {fmt, fop, wbs};
   endfunction
 
   function automatic logic [63:0] gen_imm(logic [31:0] i);
@@ -410,6 +497,15 @@ module rv64gch_core #(
     .rdata1(fp_rdata1), .rdata2(fp_rdata2), .rdata3(fp_rdata3)
   );
 
+  // FP WB->ID bypass: same race as the integer regfile (write at the WB
+  // posedge vs combinational read in ID). A load or FP op retiring into WB
+  // one cycle before its FP consumer leaves ID must forward its WB value.
+  logic [63:0] fp_rf1, fp_rf2;
+  logic        wb_fp_we_byp;
+  assign wb_fp_we_byp = fp_we_w & (rd_w_fp != 5'd0);
+  assign fp_rf1 = (wb_fp_we_byp & (rd_w_fp == rs1_d)) ? wb_data_w : fp_rdata1;
+  assign fp_rf2 = (wb_fp_we_byp & (rd_w_fp == rs2_d)) ? wb_data_w : fp_rdata2;
+
   forwarding_unit u_fwd (
     .id_rs1(rs1_d), .id_rs2(rs2_d),
     .ex_rs1(ex_pkt.ctrl.rs1), .ex_rs2(ex_pkt.ctrl.rs2),
@@ -452,6 +548,10 @@ module rv64gch_core #(
         ex_pkt.ctrl  <= dc;
         ex_pkt.rs1   <= rf_rdata1;
         ex_pkt.rs2   <= rf_rdata2;
+        // FP operands are latched here (with WB->ID bypass already applied)
+        // so the multi-cycle FPU holds stable inputs for its whole run.
+        ex_pkt.fa    <= fp_rf1;
+        ex_pkt.fb    <= fp_rf2;
         ex_pkt.imm   <= imm;
       end
     end
@@ -466,6 +566,26 @@ module rv64gch_core #(
   // any other instruction forwards its ALU/MDU/FPU result.
   logic [63:0] mem_fwd_data;
   assign mem_fwd_data = mem_pkt.is_load ? mem_rdata_aligned : mem_alu_y;
+
+  // FP forwarding: an FP-producing instruction in MEM or WB supplies its
+  // result to an FP op reading the same FP register in EX. FP loads forward
+  // their read data; FP computes forward their alu_res (the FPU result). The
+  // integer fwd_a/fwd_b cannot be reused because they key on the integer
+  // write-enable (reg_we), not fp_we.
+  logic [63:0] fp_fwd_a, fp_fwd_b;
+  logic        fp_fwd_a_mem, fp_fwd_a_wb, fp_fwd_b_mem, fp_fwd_b_wb;
+  assign fp_fwd_a_mem = mem_pkt.valid & fp_we_m & (rd_m != 5'd0) &
+                        (rd_m == ex_pkt.ctrl.rs1);
+  assign fp_fwd_a_wb  = fp_we_w & (rd_w_fp != 5'd0) &
+                        (rd_w_fp == ex_pkt.ctrl.rs1);
+  assign fp_fwd_b_mem = mem_pkt.valid & fp_we_m & (rd_m != 5'd0) &
+                        (rd_m == ex_pkt.ctrl.rs2);
+  assign fp_fwd_b_wb  = fp_we_w & (rd_w_fp != 5'd0) &
+                        (rd_w_fp == ex_pkt.ctrl.rs2);
+  assign fp_fwd_a = fp_fwd_a_mem ? mem_fwd_data :
+                    fp_fwd_a_wb  ? wb_data_w : ex_pkt.fa;
+  assign fp_fwd_b = fp_fwd_b_mem ? mem_fwd_data :
+                    fp_fwd_b_wb  ? wb_data_w : ex_pkt.fb;
 
   always_comb begin
     case (fwd_a)
@@ -577,6 +697,10 @@ module rv64gch_core #(
     mem_pkt_n.ctrl  = ex_pkt.ctrl;
     mem_pkt_n.alu_res = ex_result;
     mem_pkt_n.rs2   = rs2_fwd;
+    // CSR write operand is rs1 (forwarded), NOT the ALU result. The prior
+    // path set wb_pkt.data = csr_rdata (old value) and fed that back as the
+    // write data, making every CSR write a no-op.
+    mem_pkt_n.csr_wdata = rs1_fwd;
     mem_pkt_n.mem_addr = rs1_fwd + ex_pkt.imm;
     mem_pkt_n.is_store = mem_is_store_x;
     mem_pkt_n.is_load  = mem_is_load_x;
@@ -710,6 +834,10 @@ module rv64gch_core #(
       WB_MEM: wb_pkt_n.data = mem_rdata_aligned;
       default: wb_pkt_n.data = mem_pkt.alu_res;
     endcase
+    // CSR read value goes to the integer destination rd; the CSR write
+    // operand (rs1) travels separately in csr_wdata so the CSR unit writes
+    // the new value, not the old one.
+    wb_pkt_n.csr_wdata = mem_pkt.csr_wdata;
     if (mem_pkt.ctrl.reads_csr) wb_pkt_n.data = csr_rdata;
   end
 
@@ -730,8 +858,9 @@ module rv64gch_core #(
     .priv(priv), .hartid(hartid_i),
     .csr_we(wb_pkt.ctrl.writes_csr & wb_pkt.valid),
     .csr_addr(wb_pkt.ctrl.csr_addr),
-    .csr_wdata(wb_pkt.data),
+    .csr_wdata(wb_pkt.csr_wdata),
     .csr_op(wb_pkt.ctrl.csr_op),
+    .csr_rs1(wb_pkt.ctrl.rs1),
     .csr_rdata(csr_rdata),
     .pc(wb_pkt.pc),
     .cause(cause), .trap(trap),
