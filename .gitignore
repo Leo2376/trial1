@@ -49,6 +49,10 @@ alib-*/
 generated/
 __pycache__/
 *.pyc
+
+# FPU validation generated test vectors
+verification/fpu/vecs_*.txt
+verification/fpu/vecs.txt
 sim/verilator/prog.vh
 sim/riscv-tests/build/
 # Synthesis (Yosys + ASAP7) - fetched PDK + generated netlists
