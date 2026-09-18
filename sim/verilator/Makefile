@@ -14,6 +14,15 @@ VFLAGS += -Wno-INITIALDLY -top-module $(TOP)
 
 all: run
 
+# FPU unit testbench (make fpu)
+FPU_EXE := obj_dir/Vtb_fpu
+fpu:
+	verilator --binary --timing -Wno-WIDTH -Wno-UNUSED -Wno-UNOPTFLAT \
+	  -Wno-INITIALDLY -Wno-WIDTHTRUNC -Wno-WIDTHEXPAND -Wno-UNUSEDSIGNAL \
+	  -top-module tb_fpu \
+	  ../../rtl/core/rtl_core_pkg.sv ../../rtl/core/fpu/fpu.sv tb_fpu.sv
+	./$(FPU_EXE)
+
 # Generate hex from smoke test (default)
 prog_smoke.vh: $(GEN_HEX)
 	python3 $(GEN_HEX) prog_smoke.vh
@@ -32,9 +41,10 @@ run: $(HEX_FILE) $(EXE)
 	./$(EXE)
 
 # Run a specific FPU test: make TEST=fadd
+# Run FPU unit testbench: make fpu
 # Run smoke test: make TEST=smoke
 
 clean:
 	rm -rf obj_dir prog.vh prog_*.vh
 
-.PHONY: all run clean
+.PHONY: all run fpu clean

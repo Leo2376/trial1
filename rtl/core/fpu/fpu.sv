@@ -90,6 +90,7 @@ module fpu #(
   endfunction
 
   // Single-precision arithmetic dispatch
+  // Maps core's fpu_op_e to internal FPU operations
   function automatic logic [31:0] compute_result_s(
     input logic [31:0] a,
     input logic [31:0] b,
@@ -99,12 +100,13 @@ module fpu #(
   );
     ff = '0;
     unique case (op)
+      // Arithmetic ops - direct mapping
       rtl_core_pkg::FPU_FADD:  return faddsub_s(a, b, 1'b0, rm, ff);
       rtl_core_pkg::FPU_FSUB:  return faddsub_s(a, b, 1'b1, rm, ff);
       rtl_core_pkg::FPU_FMUL:  return fmul_s(a, b, rm, ff);
       rtl_core_pkg::FPU_FDIV:  return fdiv_s(a, b, rm, ff);
       rtl_core_pkg::FPU_FSQRT: return fsqrt_s(a, rm, ff);
-      // Non-arithmetic ops
+      // Non-arithmetic ops - direct mapping
       rtl_core_pkg::FPU_FMIN:  return fmin_s(a, b, ff);
       rtl_core_pkg::FPU_FMAX:  return fmax_s(a, b, ff);
       rtl_core_pkg::FPU_FSGNJ: return fsgnj_s(a, b, ff);
@@ -113,7 +115,21 @@ module fpu #(
       rtl_core_pkg::FPU_FEQ:   return feq_s(a, b);
       rtl_core_pkg::FPU_FLT:   return flt_s(a, b);
       rtl_core_pkg::FPU_FLE:   return fle_s(a, b);
-      // Conversion ops
+      // Conversion ops - core uses generic names, map to specific implementations
+      // FPU_I2F = FCVT.W.S or FCVT.L.S (int to float)
+      rtl_core_pkg::FPU_I2F:   return fcvt_int_s(a, 64'd0, rm, ff);
+      // FPU_F2I = FCVT.S.W or FCVT.S.L (float to int)
+      rtl_core_pkg::FPU_F2I:   return fcvt_s_int({32'h0, a}, 64'd0, rm, ff);
+      // FPU_F2D = FCVT.D.S (float to double)
+      rtl_core_pkg::FPU_F2D:   return fcvt_d_s({32'h0, a}, rm, ff)[31:0];
+      // FPU_D2F = FCVT.S.D (double to float)
+      rtl_core_pkg::FPU_D2F:   return fcvt_s_d({32'h0, a}, rm, ff);
+      // Move ops
+      rtl_core_pkg::FPU_MV_X2F: return fmv_x_w(a[31:0]);
+      rtl_core_pkg::FPU_MV_F2X: return fmv_w_x(a[31:0]);
+      // FCLASS - classify float
+      rtl_core_pkg::FPU_CLASS: return fclass_s(a, ff);
+      // FCVT ops (if used directly)
       rtl_core_pkg::FPU_FCVT_S_D: return fcvt_s_d(a, rm, ff);
       rtl_core_pkg::FPU_FCVT_D_S: return fcvt_d_s({32'h0, a}, rm, ff)[31:0];
       rtl_core_pkg::FPU_FCVT_W_S: return fcvt_int_s(a, 32'd0, rm, ff);
@@ -124,9 +140,6 @@ module fpu #(
       rtl_core_pkg::FPU_FCVT_S_WU: return fcvt_s_int(a[31:0], 32'd0, rm, ff);
       rtl_core_pkg::FPU_FCVT_S_L: return fcvt_s_int(a[31:0], 64'd0, rm, ff);
       rtl_core_pkg::FPU_FCVT_S_LU: return fcvt_s_int(a[31:0], 64'd0, rm, ff);
-      // Move ops
-      rtl_core_pkg::FPU_MV_X2F: return fmv_x_w(a[31:0]);
-      rtl_core_pkg::FPU_MV_F2X: return fmv_w_x(a[31:0]);
       default:   return a + b;
     endcase
   endfunction
@@ -691,6 +704,55 @@ module fpu #(
       ff = FF_NV; return CANON_S_NAN;
     end
     return {a[31] ^ b[31], b[30:0]};
+  endfunction
+
+  // FCLASS - classify float value
+  function automatic logic [31:0] fclass_s(input logic [31:0] a,
+                                           output logic [4:0] ff);
+    logic [9:0] cls;
+    ff = 5'd0;
+    cls = 10'd0;
+    
+    if (is_nan_s(a)) begin
+      // Signaling NaN: bit 0 (positive) or bit 9 (negative)
+      // Quiet NaN: bit 1 (positive) or bit 8 (negative)
+      if (a[31]) cls = is_snan_s(a) ? 10'b1000000000 : 10'b0100000000;
+      else       cls = is_snan_s(a) ? 10'b0000000001 : 10'b0000000010;
+    end else if (is_inf_s(a)) begin
+      // Infinity: bit 2 (positive) or bit 7 (negative)
+      cls = a[31] ? 10'b0010000000 : 10'b0000000100;
+    end else if (is_zero_s(a)) begin
+      // Zero: bit 3 (positive) or bit 6 (negative)
+      cls = a[31] ? 10'b0001000000 : 10'b0000001000;
+    end else if (a[30:23] == 8'd0) begin
+      // Subnormal: bit 4 (positive) or bit 5 (negative)
+      cls = a[31] ? 10'b0000100000 : 10'b0000010000;
+    end else begin
+      // Normal: bit 5 (positive) or bit 4 (negative)  <- same as subnormal?
+      // Per RISC-V FCLASS: bit 4 = negative normal, bit 5 = positive normal,
+      // bit 3 = negative subnormal, bit 2 = positive subnormal. Recheck:
+      // bit0=-NaN(?) Actually per spec:
+      //  bit0 = -NaN, bit1 = -inf ... no. The spec is:
+      //  bit0 = -inf? Let's use the canonical spec:
+      //  bit0 (1<<0) = -inf, bit1 = -normal, bit2 = -subnormal, bit3 = -0,
+      //  bit4 = +0, bit5 = +subnormal, bit6 = +normal, bit7 = +inf,
+      //  bit8 = signaling NaN (sNaN), bit9 = quiet NaN (qNaN).
+      if (a[31]) begin
+        // negative: normal (bit1), subnormal (bit2), zero (bit3), inf (bit0)
+        if (a[30:23] == 8'hFF) cls = 10'b0000000001;              // -inf
+        else if (a[30:23] != 8'd0) cls = 10'b0000000010;           // -normal
+        else if (a[22:0] != 23'd0) cls = 10'b0000000100;          // -subnormal
+        else cls = 10'b0000001000;                                 // -0
+      end else begin
+        // positive
+        if (a[30:23] == 8'hFF) cls = 10'b1000000000;              // +inf
+        else if (a[30:23] != 8'd0) cls = 10'b0100000000;          // +normal
+        else if (a[22:0] != 23'd0) cls = 10'b0010000000;           // +subnormal
+        else cls = 10'b0001000000;                                 // +0
+      end
+    end
+    
+    return cls;
   endfunction
 
   // =========================================================================

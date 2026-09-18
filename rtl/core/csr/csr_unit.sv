@@ -29,7 +29,9 @@ module csr_unit #(
   output logic             fi_we,
   output logic              fs_mstatus,
   output logic [4:0]        fcsr_fflags_we,
-  input  logic [4:0]        fcsr_fflags_in
+  input  logic [4:0]        fcsr_fflags_in,
+  output logic [4:0]        fflags,
+  output logic [2:0]        frm
 );
   import rtl_core_pkg::*;
 
@@ -164,5 +166,7 @@ module csr_unit #(
   assign irq_pending = (mip[7] & mie[7]) | (mip[3] & mie[3]) | (mip[11] & mie[11]);
   assign fi_we = 1'b0;
   assign fs_mstatus = mstatus[14:13];
+  assign fflags = fcsr[4:0];
+  assign frm = fcsr[7:5];
 
 endmodule

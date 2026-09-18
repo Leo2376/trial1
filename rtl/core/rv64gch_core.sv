@@ -346,7 +346,7 @@ module rv64gch_core #(
       OP_FPSTORE:begin c.is_fp = 1'b1; c.wb_sel = WB_NONE;
                   // FSW (funct3=2, 32-bit) / FSD (funct3=3, 64-bit).
                   c.lsu_op = (f3 == 3'b010) ? LSU_SW : LSU_SD; end
-      OP_FPOP:   begin c.is_fp = 1'b1; {c.fp_fmt, c.fpu_op, c.wb_sel} = decode_fpu_op(i); end
+      OP_FPOP:   begin c.is_fp = 1'b1; {c.fp_fmt, c.fpu_op, c.wb_sel, c.fp_rm} = decode_fpu_op(i); end
       default:   c.illegal = 1'b1;
     endcase
     return c;
@@ -359,10 +359,10 @@ module rv64gch_core #(
   // triple {fp_fmt[2:0], fpu_op[4:0], wb_sel[1:0]}; fp_fmt[0] is the double-
   // precision flag used by the FPU, fp_fmt[1] flags integer-destination ops
   // (compare/class/f2i/mv.x) that write the integer regfile.
-  function automatic logic [9:0] decode_fpu_op(logic [31:0] i);
+  function automatic logic [13:0] decode_fpu_op(logic [31:0] i);
     logic [2:0] f3; logic [6:0] f7; logic [4:0] rs2;
-    logic [3:0] fmt;  fpu_op_e fop;  wb_sel_e wbs;
-    fmt = '0; fop = FPU_NONE; wbs = WB_FP;
+    logic [3:0] fmt;  fpu_op_e fop;  wb_sel_e wbs; logic [2:0] rm;
+    fmt = '0; fop = FPU_NONE; wbs = WB_FP; rm = i[14:12];
     f3 = i[14:12]; f7 = i[31:25]; rs2 = i[24:20];
     fmt[0] = f7[0]; // single/double precision for arithmetic ops
     case (f7[6:1])
@@ -428,7 +428,7 @@ module rv64gch_core #(
                   fmt[0] = 1'b1; fop = FPU_F2D; end
       default: fop = FPU_NONE;
     endcase
-    return {fmt, fop, wbs};
+    return {fmt, fop, wbs, rm};
   endfunction
 
   function automatic logic [63:0] gen_imm(logic [31:0] i);
@@ -676,6 +676,7 @@ module rv64gch_core #(
   logic fpu_in_ex;
   assign fpu_in_ex = ex_pkt.valid & (ex_pkt.ctrl.fpu_op != FPU_NONE);
 
+  logic [4:0] fpu_fflags;
   fpu u_fpu (
     .clk(clk), .rst_n(rst_n),
     .start(fpu_start), .op(ex_pkt.ctrl.fpu_op), .rm(ex_pkt.ctrl.fp_rm),
@@ -683,7 +684,7 @@ module rv64gch_core #(
     .is_unsigned(ex_pkt.ctrl.fp_fmt[2]),
     .is_word(ex_pkt.ctrl.fp_fmt[3]),
     .a(fp_rdata1), .b(fp_rdata2),
-    .result(fpu_res), .fflags(), .done(fpu_done), .busy(fpu_busy_q)
+    .result(fpu_res), .fflags(fpu_fflags), .done(fpu_done), .busy(fpu_busy_q)
   );
   assign fpu_busy = fpu_in_ex & ~fpu_done;
 
@@ -859,7 +860,10 @@ module rv64gch_core #(
   assign fp_we_w = wb_pkt.fp_we;
   assign wb_data_w = wb_pkt.data;
 
-  logic [4:0] fcsr_fflags_we_dummy;
+  logic [4:0] fcsr_fflags_we;
+  logic [2:0] frm;
+  logic [4:0] fcsr_fflags;
+  assign fcsr_fflags_we = wb_pkt.valid & wb_pkt.ctrl.is_fp & (wb_pkt.ctrl.fpu_op != FPU_NONE);
   csr_unit u_csr (
     .clk(clk), .rst_n(rst_n), .flush(flush_all),
     .priv(priv), .hartid(hartid_i),
@@ -878,8 +882,10 @@ module rv64gch_core #(
     .timer_irq(timer_irq), .soft_irq(soft_irq), .ext_irq(ext_irq),
     .irq_pending(irq_pending),
     .fi_we(), .fs_mstatus(),
-    .fcsr_fflags_we(fcsr_fflags_we_dummy),
-    .fcsr_fflags_in('0)
+    .fcsr_fflags_we(fcsr_fflags_we),
+    .fcsr_fflags_in(fpu_fflags),
+    .fflags(fcsr_fflags),
+    .frm(frm)
   );
 
   always_comb begin
