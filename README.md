@@ -1,122 +1,142 @@
-# RV64GCH RISC-V Processor
+# RV64GCH RISC-V Processor Core
 
-A modular, ASIC-targeted RV64GCH (RV64IMAFDC + Hypervisor) RISC-V processor core,
-dual-issue in-order with an integrated FPU, MMU, RVV 1.0 vector engine
-(VLEN = 256), and IME 1.0 matrix extension.
+## Overview
+RV64GCH dual-issue in-order core with integrated FPU, Sv48 MMU, RVV 1.0 vector engine (VLEN=256), and IME 1.0 matrix extension. Target: ASIC (standard-cell synthesis).
 
-## Key Features
-
-- **ISA**: RV64GCH (I/M/A/F/D/C + Hypervisor extension).
-- **Microarchitecture**: Dual-issue, in-order pipeline.
-- **FPU**: Integrated floating-point unit (F/D extensions).
-- **Memory system**:
-  - L1 instruction cache: 32 KiB.
-  - L1 data cache: 32 KiB.
-  - Unified L2 cache: 256 KiB (CPU-private).
-  - Shared L2/last-level cache: 1 MiB, shared between the CPU, the vector
-    engine, and the matrix engine.
-- **MMU**: Sv48 (and hypervisor two-stage) virtual memory.
-- **Vector/Matrix engine**: unified processing unit implementing RVV 1.0
-  (VLEN = 256 bits) and IME 1.0; the two extensions share the register file
-  and most of the execution hardware.
-- **Target**: ASIC (standard-cell synthesis, not FPGA).
-
-## Directory Layout
+## RTL Directory Structure & Module Relationships
 
 ```
-.
-├── README.md                 # This file.
-├── LICENSE                   # Project license.
-├── .gitignore                # Ignored build/simulation artifacts.
-├── docs/                     # Architecture and microarchitecture specs.
-│   ├── architecture.md       # ISA profile, extensions, privilege model.
-│   ├── microarchitecture.md  # Pipeline, issue, execute, memory diagrams.
-│   ├── cache_hierarchy.md    # L1/L2/LLC sizing, coherence, sharing policy.
-│   ├── vector_engine.md      # RVV 1.0 microarchitecture, VLEN=256.
-│   ├── matrix_engine.md     # IME 1.0 microarchitecture.
-│   ├── soc_integration.md   # Top-level integration, AXI/CHI, interrupts.
-│   └── verification_plan.md  # Verification strategy, coverage goals.
-├── rtl/                      # synthesizable SystemVerilog / Verilog.
-│   ├── core/                 # scalar core pipeline.
-│   │   ├── frontend/         # fetch, branch prediction, decode.
-│   │   ├── issue/            # dual-issue in-order scheduling.
-│   │   ├── int_alu/          # integer ALU execution lanes.
-│   │   ├── fpu/              # floating-point unit (F/D).
-│   │   ├── mul_div/          # multiply / divide units.
-│   │   ├── lsu/              # load/store unit, address gen, ordering.
-│   │   ├── csr/              # CSR file and trap/interrupt logic.
-│   │   ├── regfile/          # integer and FP register files.
-│   │   └── ctrl/             # pipeline control, hazards, flush.
-│   ├── mmu/                  # MMU, TLB, page-table walker (Sv48 + 2-stage).
-│   ├── cache/
-│   │   ├── l1i/              # 32 KiB L1 instruction cache.
-│   │   ├── l1d/              # 32 KiB L1 data cache.
-│   │   ├── l2/               # 256 KiB unified private L2.
-│   │   ├── llc/              # 1 MiB shared L2/LLC.
-│   │   └── coherence/        # coherence / snoop / directory logic.
-│   ├── vpu/                  # unified vector/matrix processing unit.
-│   │   │                        # RVV 1.0 (VLEN = 256) and IME 1.0 share the
-│   │   │                        # register file and most execution hardware.
-│   │   ├── regfile/          # shared vector/matrix register file.
-│   │   ├── vlane/            # vector execution lanes (RVV).
-│   │   ├── vsew_lmul/        # RVV SEW/LMUL configuration logic.
-│   │   ├── munit/            # matrix execution units (IME).
-│   │   ├── ldst/             # shared vector/matrix load/store unit.
-│   │   └── ctrl/             # shared vector/matrix issue & control.
-│   ├── soc/                   # top-level integration.
-│   │   ├── top/               # chip/core top.
-│   │   ├── fabric/            # interconnect (AXI/CHI) for L2/LLC sharing.
-│   │   ├── clint/             # timer / software interrupts.
-│   │   ├── plic/              # external interrupt controller.
-│   │   └── debug/             # debug module, triggers, trace.
-│   └── lib/                   # reusable primitives (flops, muxes, FIFOs).
-├── verification/              # testbench and verification environment.
-│   ├── tb_core/              # scalar core testbenches.
-│   ├── tb_cache/             # cache hierarchy testbenches.
-│   ├── tb_mmu/               # MMU / page-walker testbenches.
-│   ├── tb_vpu/               # unified vector/matrix (VPU) testbenches.
-│   ├── tb_soc/               # full-chip / integration testbenches.
-│   ├── uvm/                  # UVM components and environments.
-│   ├── formal/               # formal property checks (SymbiYosys / Jasper).
-│   └── regressions/          # regression scripts and result logs.
-├── software/                 # bare-metal and OS test programs.
-│   ├── firmware/             # boot ROM and early boot code.
-│   ├── tests/                # isolated ISA test programs.
-│   ├── benchmarks/           # core/vector/matrix benchmarks.
-│   └── linker/               # linker scripts and build helpers.
-├── sim/                      # simulation flow scripts.
-│   ├── iverilog/             # Icarus Verilog scripts.
-│   ├── vcs/                  # Synopsys VCS scripts.
-│   ├── verilator/            # Verilator scripts.
-│   └── models/               # behavioral memory and IO models.
-├── syn/                      # synthesis flow.
-│   ├── constr/               # timing / area / power constraints (SDC).
-│   └── scripts/              # synthesis tool scripts (DC, Genus).
-├── tech/                     # technology / PDK data.
-│   ├── stdcells/             # standard-cell liberty/lef.
-│   └── io/                   # IO and corner models.
-└── tools/                    # helper scripts (lint, gen, packaging).
-    ├── lint/                 # linter config and wrappers.
-    └── scripts/              # code-gen and register-layout helpers.
+rtl/
+├── core/                          # RV64GCH Core
+│   ├── rv64gch_core.sv           # Top-level core module
+│   ├── rtl_core_pkg.sv           # Core package (types, constants)
+│   ├── frontend/
+│   │   └── decompressor.sv       # C-extension decompressor
+│   ├── ctrl/
+│   │   ├── hazard_unit.sv        # Pipeline hazard detection
+│   │   └── forwarding_unit.sv    # Data forwarding logic
+│   ├── issue/                    # Dual-issue logic (stubs)
+│   ├── regfile/
+│   │   ├── regfile_int.sv        # Integer register file (32x64)
+│   │   └── regfile_fp.sv         # FP register file (32x64)
+│   ├── int_alu/
+│   │   └── alu.sv                # Integer ALU
+│   ├── mul_div/
+│   │   └── mdu.sv                # Multiply/Divide unit
+│   ├── fpu/
+│   │   └── fpu.sv                # Floating-point unit (F/D)
+│   ├── lsu/                      # Load/Store unit (stubs)
+│   └── csr/
+│       └── csr_unit.sv           # Control/Status registers
+│
+├── vpu/                           # Vector/Matrix Processing Unit (VLEN=256)
+│   ├── ctrl/                     # VPU control logic
+│   ├── regfile/                  # Shared vector/matrix register file
+│   ├── vlane/                    # Vector lane execution units
+│   ├── munit/                    # Matrix execution units
+│   ├── vsew_lmul/                # VSEW/VLMUL configuration
+│   └── ldst/                     # Vector load/store unit
+│
+├── mmu/                           # Sv48 MMU (two-stage translation)
+│
+├── cache/
+│   ├── l1i/                      # 32KiB L1 Instruction Cache
+│   ├── l1d/                      # 32KiB L1 Data Cache
+│   ├── l2/                       # 256KiB Private L2 Cache
+│   ├── llc/                      # 1MiB Shared Last-Level Cache
+│   └── coherence/                # Cache coherence protocol
+│
+├── soc/                           # SoC Integration
+│   ├── top/
+│   │   ├── rv64gch_top.sv        # Top-level SoC module
+│   │   └── rv64gch_memmap_pkg.sv # Memory map package
+│   ├── fabric/
+│   │   ├── axi4_if.sv            # AXI4 interface definitions
+│   │   ├── axi4_decoder.sv       # AXI4 address decoder
+│   │   └── axi4_master.sv        # AXI4 master bridge
+│   ├── clint/                    # Core Local Interruptor (stubs)
+│   ├── plic/                     # Platform-Level Interrupt Controller (stubs)
+│   └── debug/                    # Debug module (stubs)
+│
+└── lib/                           # Common libraries/utilities
 ```
 
-## Build and Simulation
+## Key Module Dependencies
 
-Tooling is intentionally tool-agnostic. Drivers live under `sim/`:
+### Core Pipeline
+```
+rv64gch_core.sv
+├── frontend/decompressor.sv
+├── ctrl/hazard_unit.sv
+├── ctrl/forwarding_unit.sv
+├── regfile/regfile_int.sv
+├── regfile/regfile_fp.sv
+├── int_alu/alu.sv
+├── mul_div/mdu.sv
+├── fpu/fpu.sv
+├── lsu/ (load/store)
+└── csr/csr_unit.sv
+```
 
-- RTL simulation: `sim/verilator`, `sim/iverilog`, `sim/vcs`.
-- ASIC synthesis: `syn/scripts` with `syn/constr` SDC constraints.
-- Technology data: `tech/stdcells`, `tech/io`.
+### VPU (Vector/Matrix)
+```
+vpu/ (unified register file)
+├── ctrl/
+├── regfile/
+├── vlane/ (vector execution)
+├── munit/ (matrix execution)
+├── vsew_lmul/
+└── ldst/ (vector memory ops)
+```
 
-### Continuous Integration
+### Memory Hierarchy
+```
+L1I (32KiB) ↔ L2 (256KiB) ↔ LLC (1MiB) ↔ AXI4 Fabric
+L1D (32KiB) ↔ L2 (256KiB) ↔ LLC (1MiB) ↔ AXI4 Fabric
+VPU ldst    ↔ L2 (256KiB) ↔ LLC (1MiB) ↔ AXI4 Fabric
+```
 
-GitHub Actions CI builds the Verilator testbench, runs the smoke test,
-then compiles and runs the `riscv-tests` `rv64ui` subset under it.
+### SoC Integration
+```
+rv64gch_top.sv
+├── rv64gch_core.sv (core)
+├── vpu/ (vector/matrix)
+├── mmu/ (Sv48)
+├── cache/ (L1/L2/LLC)
+├── fabric/axi4_* (interconnect)
+├── clint/ (timer interrupts)
+├── plic/ (external interrupts)
+└── debug/ (JTAG/DTM)
+```
 
-- `.github/workflows/sim-verilator.yml` — build + smoke test.
-- `.github/workflows/isa-tests.yml` — rv64ui ISA regression.
+## ISA Support
+- **Base**: RV64I
+- **Extensions**: M, A, F, D, C, H (Hypervisor)
+- **Vector**: RVV 1.0 (VLEN=256, ELEN=64)
+- **Matrix**: IME 1.0 (shared VPU regfile)
 
-## Status
+## Memory System
+| Level | Size | Type |
+|-------|------|------|
+| L1I   | 32 KiB | Instruction cache |
+| L1D   | 32 KiB | Data cache |
+| L2    | 256 KiB | Private unified |
+| LLC   | 1 MiB | Shared (CPU + VPU) |
 
-This repository has been reset from its previous EDA-tool content to host the
-RV64GCH processor. RTL is scaffolded; implementation is in progress.
+## Build & Simulation
+```bash
+# Synthesis (ASIC flow)
+make synth
+
+# Simulation
+make sim
+
+# Lint
+make lint
+```
+
+## Directory Conventions
+- Each module has its own directory under the functional block
+- `.gitkeep` files preserve empty directories in git
+- Package files (`*_pkg.sv`) define shared types/constants
+- Interface files (`*_if.sv`) define bus/protocol interfaces

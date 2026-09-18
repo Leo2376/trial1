@@ -16,6 +16,8 @@ module axi4_hostif_model #(
   localparam logic [47:0] TOHOST_ADDR   = BASE + TOHOST_OFF[47:0];
   localparam logic [47:0] FROMHOST_ADDR = BASE + FROMHOST_OFF[47:0];
   localparam logic [47:0] CHAROUT_ADDR  = BASE + CHAROUT_OFF[47:0];
+  // Test tohost at 0x80001000 (riscv-tests default location)
+  localparam logic [47:0] TEST_TOHOST_ADDR = 48'h8000_1000;
 
   logic [63:0] tohost_r, fromhost_r;
 
@@ -64,7 +66,7 @@ module axi4_hostif_model #(
             w_data <= bus.wdata;
             bus.wready <= 1'b0;
             wst <= W_RESP;
-            if (w_addr == TOHOST_ADDR) begin
+            if (w_addr == TOHOST_ADDR || w_addr == TEST_TOHOST_ADDR) begin
               tohost_r <= bus.wdata;
               if (bus.wdata != 64'd0)
                 $display("[hostif] tohost <= 0x%016h @ %0t", bus.wdata, $time);
@@ -118,7 +120,7 @@ module axi4_hostif_model #(
           bus.rresp  <= 2'b00;
           bus.rid    <= r_id;
           bus.rlast  <= (r_cnt == r_len);
-          if (r_addr == TOHOST_ADDR)        bus.rdata <= tohost_r;
+          if (r_addr == TOHOST_ADDR || r_addr == TEST_TOHOST_ADDR) bus.rdata <= tohost_r;
           else if (r_addr == FROMHOST_ADDR) bus.rdata <= fromhost_r;
           else                              bus.rdata <= '0;
           if (bus.rvalid && bus.rready) begin

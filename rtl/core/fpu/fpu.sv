@@ -19,10 +19,11 @@ module fpu #(
 
   logic [63:0] res_r;
   logic [4:0]  fflags_r;
+  logic        done_r;
 
   assign result = res_r;
   assign fflags = fflags_r;
-  assign done   = (st == F_DONE);
+  assign done   = done_r;
 
   logic is_dbl_a, is_dbl_b;
   logic [31:0] as_single, bs_single;
@@ -52,38 +53,44 @@ module fpu #(
 
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-      st <= F_IDLE; res_r <= '0; fflags_r <= '0;
+      st      <= F_IDLE;
+      res_r   <= '0;
+      fflags_r <= '0;
+      done_r  <= 1'b0;
     end else begin
-      case (st)
-        F_IDLE: begin
-          if (start) begin
-            st <= F_BUSY;
-            fflags_r <= '0;
+      if (start) begin
+        st     <= F_BUSY;
+        fflags_r <= '0;
+        done_r <= 1'b0;
+      end else begin
+        case (st)
+          F_BUSY: begin
+            st     <= F_DONE;
+            res_r  <= '0;
+            case (op)
+              FPU_F2D:   res_r <= single2dbl(a[31:0]);
+              FPU_D2F:   res_r <= {{32{a_single_res[31]}}, a_single_res};
+              FPU_I2F:   res_r <= single2dbl({1'b0, a[31], 8'd0, a[30:0]});
+              FPU_F2I:   res_r <= {a[63], a[62:0]};
+              FPU_MV_X2F:res_r <= a;
+              FPU_MV_F2X:res_r <= a;
+              FPU_FSGNJ: res_r <= {b[63], a[62:0]};
+              FPU_FSGNJN:res_r <= {~b[63], a[62:0]};
+              FPU_FSGNJX:res_r <= {a[63]^b[63], a[62:0]};
+              FPU_FMIN:  res_r <= (a < b) ? a : b;
+              FPU_FMAX:  res_r <= (a > b) ? a : b;
+              FPU_FEQ:   res_r <= (a == b) ? 64'd1 : 64'd0;
+              FPU_FLT:   res_r <= (a <  b) ? 64'd1 : 64'd0;
+              FPU_FLE:   res_r <= (a <= b) ? 64'd1 : 64'd0;
+              default:   res_r <= a + b;
+            endcase
           end
-        end
-        F_BUSY: begin
-          st <= F_DONE;
-          res_r <= '0;
-          case (op)
-            FPU_F2D:   res_r <= single2dbl(a[31:0]);
-            FPU_D2F:   res_r <= {{32{a_single_res[31]}}, a_single_res};
-            FPU_I2F:   res_r <= single2dbl({1'b0, a[31], 8'd0, a[30:0]});
-            FPU_F2I:   res_r <= {a[63], a[62:0]};
-            FPU_MV_X2F:res_r <= a;
-            FPU_MV_F2X:res_r <= a;
-            FPU_FSGNJ: res_r <= {b[63], a[62:0]};
-            FPU_FSGNJN:res_r <= {~b[63], a[62:0]};
-            FPU_FSGNJX:res_r <= {a[63]^b[63], a[62:0]};
-            FPU_FMIN:  res_r <= (a < b) ? a : b;
-            FPU_FMAX:  res_r <= (a > b) ? a : b;
-            FPU_FEQ:   res_r <= (a == b) ? 64'd1 : 64'd0;
-            FPU_FLT:   res_r <= (a <  b) ? 64'd1 : 64'd0;
-            FPU_FLE:   res_r <= (a <= b) ? 64'd1 : 64'd0;
-            default:   res_r <= a + b;
-          endcase
-        end
-        F_DONE: st <= F_IDLE;
-      endcase
+          F_DONE: begin
+            st     <= F_IDLE;
+            done_r <= 1'b1;
+          end
+        endcase
+      end
     end
   end
 

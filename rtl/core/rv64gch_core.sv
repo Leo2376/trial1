@@ -332,11 +332,41 @@ module rv64gch_core #(
                   c.a_src = SRC_REG; end
       OP_FPLOAD: begin c.wb_sel = WB_FP; c.lsu_op = LSU_LD; c.is_fp = 1'b1; end
       OP_FPSTORE:begin c.wb_sel = WB_NONE; c.lsu_op = LSU_SD; c.is_fp = 1'b1; end
-      OP_FPOP:   begin c.wb_sel = WB_FP; c.is_fp = 1'b1;
-                  c.fpu_op = fpu_op_e'(i[31:25]); end
+OP_FPOP:   begin c.wb_sel = WB_FP; c.is_fp = 1'b1;
+                   c.fpu_op = decode_fpu_op(i[31:25], i[14:12]); end
       default:   c.illegal = 1'b1;
     endcase
     return c;
+  endfunction
+
+  function automatic fpu_op_e decode_fpu_op(logic [6:0] f7, logic [2:0] f3);
+    logic is_s = (f3[1:0] == 2'b00);
+    logic is_d = (f3[1:0] == 2'b01);
+    case (f7)
+      7'b0000000: return is_s ? FPU_FADD : (is_d ? FPU_FADD : FPU_NONE);
+      7'b0000100: return is_s ? FPU_FSUB : (is_d ? FPU_FSUB : FPU_NONE);
+      7'b0001000: return is_s ? FPU_FMUL : (is_d ? FPU_FMUL : FPU_NONE);
+      7'b0001100: return is_s ? FPU_FDIV : (is_d ? FPU_FDIV : FPU_NONE);
+      7'b0101100: return is_s ? FPU_FSQRT : (is_d ? FPU_FSQRT : FPU_NONE);
+      7'b0010000: return is_s ? FPU_FSGNJ : (is_d ? FPU_FSGNJ : FPU_NONE);
+      7'b0010100: return is_s ? FPU_FSGNJN : (is_d ? FPU_FSGNJN : FPU_NONE);
+      7'b0011000: return is_s ? FPU_FSGNJX : (is_d ? FPU_FSGNJX : FPU_NONE);
+      7'b0011100: return is_s ? FPU_FMIN : (is_d ? FPU_FMIN : FPU_NONE);
+      7'b0011101: return is_s ? FPU_FMAX : (is_d ? FPU_FMAX : FPU_NONE);
+      7'b1010000: return is_s ? FPU_FEQ : (is_d ? FPU_FEQ : FPU_NONE);
+      7'b1010001: return is_s ? FPU_FLT : (is_d ? FPU_FLT : FPU_NONE);
+      7'b1010010: return is_s ? FPU_FLE : (is_d ? FPU_FLE : FPU_NONE);
+      7'b1100000: return is_s ? FPU_F2I : (is_d ? FPU_F2I : FPU_NONE);
+      7'b1100001: return is_s ? FPU_F2I : (is_d ? FPU_F2I : FPU_NONE);
+      7'b1101000: return is_s ? FPU_I2F : (is_d ? FPU_I2F : FPU_NONE);
+      7'b1101001: return is_s ? FPU_I2F : (is_d ? FPU_I2F : FPU_NONE);
+      7'b1110000: return is_s ? FPU_MV_F2X : (is_d ? FPU_MV_F2X : FPU_NONE);
+      7'b1110001: return is_s ? FPU_CLASS : (is_d ? FPU_CLASS : FPU_NONE);
+      7'b1111000: return is_s ? FPU_MV_X2F : (is_d ? FPU_MV_X2F : FPU_NONE);
+      7'b0100001: return FPU_F2D;
+      7'b0100000: return FPU_D2F;
+      default:    return FPU_NONE;
+    endcase
   endfunction
 
   function automatic logic [63:0] gen_imm(logic [31:0] i);
@@ -529,6 +559,13 @@ module rv64gch_core #(
   assign mem_is_load_x = (ex_pkt.ctrl.lsu_op >= LSU_LB) & (ex_pkt.ctrl.lsu_op <= LSU_LWU);
   assign mem_is_store_x = (ex_pkt.ctrl.lsu_op >= LSU_SB) & (ex_pkt.ctrl.lsu_op <= LSU_SD);
 
+  logic fpu_started;
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) fpu_started <= 1'b0;
+    else if (!stall) fpu_started <= 1'b0;
+    else if (ex_pkt.valid && ex_pkt.ctrl.fpu_op != FPU_NONE) fpu_started <= 1'b1;
+  end
+
   always_comb begin
     mdu_start = 1'b0; fpu_start = 1'b0;
     if (ex_pkt.valid) begin
@@ -538,7 +575,7 @@ module rv64gch_core #(
         ALU_DIVW, ALU_DIVUW, ALU_REMW, ALU_REMUW:
           mdu_start = 1'b1;
       endcase
-      if (ex_pkt.ctrl.fpu_op != FPU_NONE) fpu_start = 1'b1;
+      if (ex_pkt.ctrl.fpu_op != FPU_NONE && !fpu_started) fpu_start = 1'b1;
     end
   end
 
@@ -747,8 +784,15 @@ module rv64gch_core #(
 
   always_comb begin
     trap = 1'b0; cause = 4'd0;
-    if (ex_pkt.valid & ex_pkt.ctrl.illegal) begin
-      trap = 1'b1; cause = CAUSE_ILLEGAL_INSN;
+    if (ex_pkt.valid) begin
+      if (ex_pkt.ctrl.illegal) begin
+        trap = 1'b1; cause = CAUSE_ILLEGAL_INSN;
+      end else if (ex_pkt.ctrl.is_ecall) begin
+        trap = 1'b1; cause = (priv == PRIV_M) ? CAUSE_M_ECALL :
+                              (priv == PRIV_S) ? CAUSE_SUP_ECALL : CAUSE_USER_ECALL;
+      end else if (ex_pkt.ctrl.is_ebreak) begin
+        trap = 1'b1; cause = CAUSE_BREAKPOINT;
+      end
     end
   end
 
