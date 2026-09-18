@@ -1,7 +1,9 @@
 `timescale 1ns/1ps
 // Testbench for the integrated FPU module (rtl/core/fpu/fpu.sv).
-// Smoke test of the single-precision datapath and the core<->FPU op mapping
-// (compute_result_s) used by the rv64uf ISA tests.
+// Vectors are taken from the riscv-tests rv64uf suite (fmadd.S, fadd.S,
+// fdiv.S, fmin.S, fcmp.S, fclass.S, fcvt.S, fcvt_w.S, move.S) so the unit
+// FPU is validated against the same expectations the core-level ISA tests
+// enforce (result bits + exact fflags).
 module tb_fpu;
   import rtl_core_pkg::*;
 
@@ -10,7 +12,7 @@ module tb_fpu;
   fpu_op_e op = FPU_NONE;
   logic [2:0] rm = RM_RNE;
   logic is_double = 0, is_unsigned = 0, is_word = 0;
-  logic [63:0] a = 0, b = 0;
+  logic [63:0] a = 0, b = 0, c = 0;
   logic [63:0] result;
   logic [4:0] fflags;
   logic done, busy;
@@ -20,183 +22,246 @@ module tb_fpu;
   fpu dut (
     .clk(clk), .rst_n(rst_n), .start(start), .op(op), .rm(rm),
     .is_double(is_double), .is_unsigned(is_unsigned), .is_word(is_word),
-    .a(a), .b(b), .result(result), .fflags(fflags), .done(done), .busy(busy)
+    .a(a), .b(b), .c(c),
+    .result(result), .fflags(fflags), .done(done), .busy(busy)
   );
 
-  task automatic do_op(input fpu_op_e o, input logic [31:0] sa, input logic [31:0] sb,
-                       input logic [2:0] mode, output logic [31:0] res);
+  task automatic do_op3(input fpu_op_e o, input logic [63:0] sa, input logic [63:0] sb,
+                       input logic [63:0] sc, input logic [2:0] mode,
+                       output logic [63:0] res, output logic [4:0] rff);
     @(negedge clk);
-    op = o; rm = mode; a = {32'h0, sa}; b = {32'h0, sb}; start = 1;
+    op = o; rm = mode; a = sa; b = sb; c = sc; start = 1;
     @(negedge clk);
     start = 0;
     while (!done) @(negedge clk);
-    res = result[31:0];
+    res = result; rff = fflags;
+  endtask
+
+  task automatic do_op(input fpu_op_e o, input logic [63:0] sa, input logic [63:0] sb,
+                      input logic [2:0] mode, output logic [63:0] res,
+                      output logic [4:0] rff);
+    do_op3(o, sa, sb, 64'd0, mode, res, rff);
   endtask
 
   int errors = 0, tests = 0;
-  logic [31:0] got, exp;
+  logic [63:0] got;
+  logic [4:0]  gff;
 
-  // Reference using real arithmetic: convert single bits to real via $bitstoreal
-  // on the raw bit pattern (Verilator supports $bitstoreal on 64-bit patterns;
-  // single-precision bit patterns must be widened with the exponent rebiased).
-  // Simpler approach: use shorts. Here we use $realtobits/$bitstoreal on the
-  // double that equals the single value: the single bits are a valid double
-  // only after conversion, so we re-derive via a real-typed conversion helper.
-  function automatic real bits_to_real(input logic [31:0] s);
-    // Decode single-precision manually into a real.
-    real frac, val;
-    int e;
-    frac = 0.0;
-    for (int k = 22; k >= 0; k--) if (s[k]) frac = frac + ($rtoi(2)**(-(23-k))) * 1.0;
-    // value = (-1)^sign * 2^(e-127) * (1 + frac_field/2^23)
-    val = 1.0 + (s[22:0] * 1.0) / (2.0**23);
-    e = s[30:23];
-    if (e == 0) begin
-      val = (s[22:0] * 1.0) / (2.0**23);
-      e = 1;
+  task automatic chk64(input logic [63:0] exp, input logic [4:0] expff);
+    tests++;
+    if (got !== exp || gff !== expff) begin
+      errors++;
+      $display("FAIL op=%0s got=%h ff=%h exp=%h expff=%h", op.name(), got, gff, exp, expff);
     end
-    val = val * (2.0**(e - 127));
-    if (s[31]) val = -val;
-    return val;
-  endfunction
+  endtask
 
-  function automatic logic [31:0] real_to_bits(input real r);
-    // Encode a real to single precision (RNE), only valid for the normal range.
-    int e;
-    real frac;
-    logic [31:0] s;
-    logic [7:0] eb;
-    logic [22:0] fr;
-    logic sg;
-    sg = (r < 0.0);
-    if (r < 0.0) r = -r;
-    if (r == 0.0) return sg ? 32'h80000000 : 32'h00000000;
-    e = $rtoi($floor($log2(r)));
-    frac = r / (2.0**e) - 1.0;
-    fr = $rtoi(frac * (2.0**23));
-    eb = e + 127;
-    return {sg, eb[7:0], fr};
-  endfunction
+  task automatic chk32(input logic [31:0] exp, input logic [4:0] expff);
+    tests++;
+    if (got[31:0] !== exp || gff !== expff) begin
+      errors++;
+      $display("FAIL op=%0s got=%h ff=%h exp=%h expff=%h", op.name(), got[31:0], gff, exp, expff);
+    end
+  endtask
 
-  function automatic logic [31:0] ref_s(input logic [31:0] sa, input logic [31:0] sb,
-                                        input fpu_op_e o);
-    real ra, rb, rr;
-    ra = bits_to_real(sa); rb = bits_to_real(sb);
-    case (o)
-      FPU_FADD:  rr = ra + rb;
-      FPU_FSUB:  rr = ra - rb;
-      FPU_FMUL:  rr = ra * rb;
-      FPU_FDIV:  rr = ra / rb;
-      default:   rr = 0.0;
-    endcase
-    return real_to_bits(rr);
-  endfunction
-
-  logic [31:0] vec_a [0:5];
-  logic [31:0] vec_b [0:5];
-  int i;
+  // IEEE single bit patterns used by the rv64uf vectors
+  localparam logic [31:0] F_1_0    = 32'h3F800000;
+  localparam logic [31:0] F_2_0    = 32'h40000000;
+  localparam logic [31:0] F_2_5    = 32'h40200000;
+  localparam logic [31:0] F_3_5    = 32'h40600000;
+  localparam logic [31:0] F_5_0    = 32'h40A00000;
+  localparam logic [31:0] F_M1_0   = 32'hBF800000;
+  localparam logic [31:0] F_M2_0   = 32'hC0000000;
+  localparam logic [31:0] F_M12    = 32'hC1400000;
+  localparam logic [31:0] F_M1235_1= 32'hC49A6333;  // -1235.1
+  localparam logic [31:0] F_11_10  = 32'h3F8CCCCD;  // 1.1
+  localparam logic [31:0] F_M11_10 = 32'hBF8CCCCD;  // -1.1
+  localparam logic [31:0] F_1236_2 = 32'h449A8666;  // 1236.2
+  localparam logic [31:0] F_M1236_2= 32'hC49A8666;
+  localparam logic [31:0] F_15     = 32'h3FC00000;  // 1.5
+  localparam logic [31:0] F_M15    = 32'hBFC00000;  // -1.5
+  localparam logic [31:0] F_8      = 32'h41000000;  // 8.0
+  localparam logic [31:0] F_1234   = 32'h449A4000;  // 1234
+  localparam logic [31:0] QNANF    = 32'h7FC00000;
+  localparam logic [31:0] SNANF    = 32'h7F800001;
+  localparam logic [31:0] INFF     = 32'h7F800000;
+  localparam logic [31:0] NINFF    = 32'hFF800000;
 
   initial begin
-    vec_a[0] = 32'h3F800000; vec_b[0] = 32'h40000000; // 1.0 + 2.0 = 3.0
-    vec_a[1] = 32'hBF800000; vec_b[1] = 32'h3F000000; // -1.0 + 0.5 = -0.5
-    vec_a[2] = 32'h40490FDB; vec_b[2] = 32'h402DF854; // pi * e
-    vec_a[3] = 32'h41200000; vec_b[3] = 32'hC0A00000; // 10.0 / -5.0 = -2.0
-    vec_a[4] = 32'h3F000000; vec_b[4] = 32'h40400000; // 0.5 * 3.0 = 1.5
-    vec_a[5] = 32'h40490FDB; vec_b[5] = 32'h40490FDB; // pi / pi = 1.0
-
     rst_n = 0;
     repeat (3) @(negedge clk);
     rst_n = 1;
 
-    for (i = 0; i < 6; i++) begin
-      do_op(FPU_FADD, vec_a[i], vec_b[i], RM_RNE, got);
-      exp = ref_s(vec_a[i], vec_b[i], FPU_FADD);
-      tests++;
-      if (got !== exp) begin errors++; $display("FADD fail a=%h b=%h got=%h exp=%h", vec_a[i], vec_b[i], got, exp); end
-    end
-    for (i = 0; i < 6; i++) begin
-      do_op(FPU_FSUB, vec_a[i], vec_b[i], RM_RNE, got);
-      exp = ref_s(vec_a[i], vec_b[i], FPU_FSUB);
-      tests++;
-      if (got !== exp) begin errors++; $display("FSUB fail a=%h b=%h got=%h exp=%h", vec_a[i], vec_b[i], got, exp); end
-    end
-    for (i = 0; i < 6; i++) begin
-      do_op(FPU_FMUL, vec_a[i], vec_b[i], RM_RNE, got);
-      exp = ref_s(vec_a[i], vec_b[i], FPU_FMUL);
-      tests++;
-      if (got !== exp) begin errors++; $display("FMUL fail a=%h b=%h got=%h exp=%h", vec_a[i], vec_b[i], got, exp); end
-    end
-    for (i = 0; i < 6; i++) begin
-      do_op(FPU_FDIV, vec_a[i], vec_b[i], RM_RNE, got);
-      exp = ref_s(vec_a[i], vec_b[i], FPU_FDIV);
-      tests++;
-      if (got !== exp) begin errors++; $display("FDIV fail a=%h b=%h got=%h exp=%h", vec_a[i], vec_b[i], got, exp); end
-    end
+    // ---------------- FADD/FSUB (riscv-tests fadd.S) ----------------
+    do_op(FPU_FADD, F_2_5, F_1_0, RM_RNE, got, gff);  // 2.5+1.0 = 3.5
+    chk32(F_3_5, 5'd0);
+    do_op(FPU_FSUB, F_2_5, F_1_0, RM_RNE, got, gff);  // 2.5-1.0 = 1.5
+    chk32(F_15, 5'd0);
+    do_op(FPU_FSUB, F_M1235_1, F_11_10, RM_RNE, got, gff);  // -1235.1+1.1
+    chk32(F_M1236_2, 5'd1);  // -1236.2, inexact
+    do_op(FPU_FSUB, INFF, INFF, RM_RNE, got, gff);     // Inf-Inf
+    chk32(QNANF, FF_NV);
 
-    // FSQRT(4.0) = 2.0
-    do_op(FPU_FSQRT, 32'h40800000, 32'h0, RM_RNE, got);
-    tests++;
-    if (got !== 32'h40000000) begin errors++; $display("FSQRT fail got=%h", got); end
+    // ---------------- FMUL (fadd.S 8-10) ----------------
+    do_op(FPU_FMUL, F_2_5, F_1_0, RM_RNE, got, gff);  // 2.5*1.0
+    chk32(F_2_5, 5'd0);
+    do_op(FPU_FMUL, F_M1235_1, F_M11_10, RM_RNE, got, gff); // (-1235.1)*(-1.1)
+    chk32(32'h44A9D385, 5'd1);
 
-    // FSQRT(2.0) = 1.4142135...
-    do_op(FPU_FSQRT, 32'h40000000, 32'h0, RM_RNE, got);
-    tests++;
-    if (got !== 32'h3FB504F3) begin errors++; $display("FSQRT2 fail got=%h", got); end
+    // ---------------- FDIV/FSQRT (fdiv.S) ----------------
+    do_op(FPU_FDIV, F_M2_0, F_2_0, RM_RNE, got, gff);  // -2/2 = -1
+    chk32(F_M1_0, 5'd0);
+    do_op(FPU_FSQRT, 32'h42C80000, 64'd0, RM_RNE, got, gff);  // sqrt(100)=10
+    chk32(32'h41200000, 5'd0);
+    do_op(FPU_FSQRT, F_M1_0, 64'd0, RM_RNE, got, gff);        // sqrt(-1)
+    chk32(QNANF, FF_NV);
 
-    // FMIN/FMAX
-    do_op(FPU_FMIN, 32'hBF800000, 32'h3F800000, RM_RNE, got);
-    tests++;
-    if (got !== 32'hBF800000) begin errors++; $display("FMIN fail got=%h", got); end
-    do_op(FPU_FMAX, 32'hBF800000, 32'h3F800000, RM_RNE, got);
-    tests++;
-    if (got !== 32'h3F800000) begin errors++; $display("FMAX fail got=%h", got); end
+    // ---------------- FMADD family (fmadd.S) ----------------
+    // FMADD 1.0*2.5+1.0 = 3.5
+    do_op3(FPU_FMADD, F_1_0, F_2_5, F_1_0, RM_RNE, got, gff);
+    chk32(F_3_5, 5'd0);
+    // FMADD (-1.0)*(-1235.1)+1.1 = 1236.2 (inexact)
+    do_op3(FPU_FMADD, F_M1_0, F_M1235_1, F_11_10, RM_RNE, got, gff);
+    chk32(F_1236_2, 5'd1);
+    // FMADD 2.0*(-5.0)+(-2.0) = -12
+    do_op3(FPU_FMADD, F_2_0, 32'hC0A00000, 32'hC0000000, RM_RNE, got, gff);
+    chk32(F_M12, 5'd0);
+    // FNMADD 1.0*2.5+1.0 -> -(3.5)
+    do_op3(FPU_FNMADD, F_1_0, F_2_5, F_1_0, RM_RNE, got, gff);
+    chk32(32'hC0600000, 5'd0);
+    // FNMADD (-1.0)*(-1235.1)+1.1 -> -(1236.2)
+    do_op3(FPU_FNMADD, F_M1_0, F_M1235_1, F_11_10, RM_RNE, got, gff);
+    chk32(F_M1236_2, 5'd1);
+    // FMSUB 1.0*2.5-1.0 = 1.5
+    do_op3(FPU_FMSUB, F_1_0, F_2_5, F_1_0, RM_RNE, got, gff);
+    chk32(F_15, 5'd0);
+    // FMSUB (-1.0)*(-1235.1)-1.1 = 1234
+    do_op3(FPU_FMSUB, F_M1_0, F_M1235_1, F_11_10, RM_RNE, got, gff);
+    chk32(F_1234, 5'd1);
+    // FNMSUB 1.0*2.5-1.0 -> -(1.5)
+    do_op3(FPU_FNMSUB, F_1_0, F_2_5, F_1_0, RM_RNE, got, gff);
+    chk32(F_M15, 5'd0);
+    // FNMSUB 2.0*(-5.0)-(-2.0) = 8 per fmadd.S vector 13
+    do_op3(FPU_FNMSUB, F_2_0, 32'hC0A00000, 32'hC0000000, RM_RNE, got, gff);
+    chk32(F_8, 5'd0);
+    // FMADD with zero addend: product of 1.0*2.5 stays
+    do_op3(FPU_FMADD, F_1_0, F_2_5, 32'h00000000, RM_RNE, got, gff);
+    chk32(F_2_5, 5'd0);
 
-    // FSGNJ family
-    do_op(FPU_FSGNJ, 32'h3F800000, 32'hBF800000, RM_RNE, got);
-    tests++;
-    if (got !== 32'hBF800000) begin errors++; $display("FSGNJ fail got=%h", got); end
-    do_op(FPU_FSGNJN, 32'h3F800000, 32'hBF800000, RM_RNE, got);
-    tests++;
-    if (got !== 32'h3F800000) begin errors++; $display("FSGNJN fail got=%h", got); end
-    do_op(FPU_FSGNJX, 32'hBF800000, 32'hBF800000, RM_RNE, got);
-    tests++;
-    if (got !== 32'h3F800000) begin errors++; $display("FSGNJX fail got=%h", got); end
+    // ---------------- FMIN/FMAX (fmin.S) ----------------
+    do_op(FPU_FMIN, F_2_5, F_1_0, RM_RNE, got, gff);
+    chk32(F_1_0, 5'd0);
+    do_op(FPU_FMAX, F_2_5, F_1_0, RM_RNE, got, gff);
+    chk32(F_2_5, 5'd0);
+    do_op(FPU_FMIN, F_M1235_1, F_11_10, RM_RNE, got, gff);
+    chk32(F_M1235_1, 5'd0);
+    // FMIN(+0,-0) = -0
+    do_op(FPU_FMIN, 32'h00000000, 32'h80000000, RM_RNE, got, gff);
+    chk32(32'h80000000, 5'd0);
+    // FMAX(sNaN, 1.0) = 1.0, NV
+    do_op(FPU_FMAX, SNANF, F_1_0, RM_RNE, got, gff);
+    chk32(F_1_0, FF_NV);
 
-    // FEQ/FLT/FLE (compare results come back as 0/1 in bit 0)
-    do_op(FPU_FEQ, 32'h3F800000, 32'h3F800000, RM_RNE, got);
-    tests++;
-    if (got[0] !== 1'b1) begin errors++; $display("FEQ fail got=%h", got); end
-    do_op(FPU_FLT, 32'hBF800000, 32'h3F800000, RM_RNE, got);
-    tests++;
-    if (got[0] !== 1'b1) begin errors++; $display("FLT fail got=%h", got); end
-    do_op(FPU_FLE, 32'h3F800000, 32'h3F800000, RM_RNE, got);
-    tests++;
-    if (got[0] !== 1'b1) begin errors++; $display("FLE fail got=%h", got); end
+    // ---------------- FCMP (fcmp.S) ----------------
+    do_op(FPU_FEQ, 32'hBFAE147B, 32'hBFAE147B, RM_RNE, got, gff); // -1.36
+    chk32(32'd1, 5'd0);
+    do_op(FPU_FLT, 32'hBFAE147B, 32'hBFAE147B, RM_RNE, got, gff);
+    chk32(32'd0, 5'd0);
+    do_op(FPU_FLE, 32'hBFAE147B, 32'hBFAE147B, RM_RNE, got, gff);
+    chk32(32'd1, 5'd0);
+    do_op(FPU_FLT, QNANF, F_1_0, RM_RNE, got, gff);
+    chk32(32'd0, FF_NV);
 
-    // FMV ops (core mapping)
-    do_op(FPU_MV_X2F, 32'hDEADBEEF, 32'h0, RM_RNE, got);
-    tests++;
-    if (got !== 32'hDEADBEEF) begin errors++; $display("MV_X2F fail got=%h", got); end
-    do_op(FPU_MV_F2X, 32'hCAFEBABE, 32'h0, RM_RNE, got);
-    tests++;
-    if (got !== 32'hCAFEBABE) begin errors++; $display("MV_F2X fail got=%h", got); end
+    // ---------------- FSGNJ family ----------------
+    do_op(FPU_FSGNJ, 32'h3F800000, 32'hBF800000, RM_RNE, got, gff);
+    chk32(32'hBF800000, 5'd0);
+    do_op(FPU_FSGNJN, 32'h3F800000, 32'hBF800000, RM_RNE, got, gff);
+    chk32(32'h3F800000, 5'd0);
+    do_op(FPU_FSGNJX, 32'hBF800000, 32'hBF800000, RM_RNE, got, gff);
+    chk32(32'h3F800000, 5'd0);
 
-    // F2I: 1.0 -> 1
-    do_op(FPU_F2I, 32'h3F800000, 32'h0, RM_RNE, got);
-    tests++;
-    if (got !== 32'h1) begin errors++; $display("F2I fail got=%h", got); end
+    // ---------------- FCLASS (fclass.S) ----------------
+    do_op(FPU_CLASS, NINFF, 64'd0, RM_RNE, got, gff);  chk32(32'd1<<0, 5'd0);
+    do_op(FPU_CLASS, 32'hBF800000, 64'd0, RM_RNE, got, gff); chk32(32'd1<<1, 5'd0);
+    do_op(FPU_CLASS, 32'h807FFFFF, 64'd0, RM_RNE, got, gff); chk32(32'd1<<2, 5'd0);
+    do_op(FPU_CLASS, 32'h80000000, 64'd0, RM_RNE, got, gff); chk32(32'd1<<3, 5'd0);
+    do_op(FPU_CLASS, 32'h00000000, 64'd0, RM_RNE, got, gff); chk32(32'd1<<4, 5'd0);
+    do_op(FPU_CLASS, 32'h007FFFFF, 64'd0, RM_RNE, got, gff); chk32(32'd1<<5, 5'd0);
+    do_op(FPU_CLASS, F_1_0, 64'd0, RM_RNE, got, gff);  chk32(32'd1<<6, 5'd0);
+    do_op(FPU_CLASS, INFF, 64'd0, RM_RNE, got, gff);   chk32(32'd1<<7, 5'd0);
+    do_op(FPU_CLASS, SNANF, 64'd0, RM_RNE, got, gff);  chk32(32'd1<<8, 5'd0);
+    do_op(FPU_CLASS, QNANF, 64'd0, RM_RNE, got, gff);  chk32(32'd1<<9, 5'd0);
 
-    // I2F: 2 -> 2.0
-    do_op(FPU_I2F, 32'h2, 32'h0, RM_RNE, got);
-    tests++;
-    if (got !== 32'h40000000) begin errors++; $display("I2F fail got=%h", got); end
+    // ---------------- FCVT int->fp (fcvt.S) ----------------
+    is_unsigned = 0; is_word = 0;
+    do_op(FPU_I2F, 64'd2, 64'd0, RM_RNE, got, gff);       // fcvt.s.w 2 -> 2.0
+    chk32(F_2_0, 5'd0);
+    do_op(FPU_I2F, -64'd2, 64'd0, RM_RNE, got, gff);      // fcvt.s.w -2 -> -2.0
+    chk32(32'hC0000000, 5'd0);
+    is_unsigned = 1;
+    do_op(FPU_I2F, -64'd2, 64'd0, RM_RNE, got, gff);      // fcvt.s.wu 0xFFFFFFFE
+    chk32(32'h4F800000, 5'd1);
+    is_unsigned = 0; is_word = 1;
+    do_op(FPU_I2F, -64'd2, 64'd0, RM_RNE, got, gff);      // fcvt.s.l -2 -> -2.0
+    chk32(32'hC0000000, 5'd0);
+    is_unsigned = 1;
+    do_op(FPU_I2F, -64'd2, 64'd0, RM_RNE, got, gff);      // fcvt.s.lu 2^64-2
+    chk32(32'h5F800000, 5'd1);
+    is_unsigned = 0; is_word = 0;
 
-    // FCLASS of +1.0 -> bit 6 (positive normal)
-    do_op(FPU_CLASS, 32'h3F800000, 32'h0, RM_RNE, got);
-    tests++;
-    if (got !== 32'h40) begin errors++; $display("FCLASS fail got=%h", got); end
+    // ---------------- FCVT fp->int (fcvt_w.S) ----------------
+    // fcvt.w.s(-1.1, rtz) = -1, NX
+    do_op(FPU_F2I, 32'hBF8CCCCD, 64'd0, RM_RTZ, got, gff);
+    chk32(32'hFFFFFFFF, FF_NX);
+    // fcvt.w.s(-1.0) = -1 exact
+    do_op(FPU_F2I, F_M1_0, 64'd0, RM_RNE, got, gff);
+    chk32(32'hFFFFFFFF, 5'd0);
+    // fcvt.w.s(1.1, rtz) = 1, NX
+    do_op(FPU_F2I, F_11_10, 64'd0, RM_RTZ, got, gff);
+    chk32(32'd1, FF_NX);
+    // fcvt.w.s(3e9, rtz) saturates to 2^31-1, NV
+    do_op(FPU_F2I, 32'h4F32D05E, 64'd0, RM_RTZ, got, gff);
+    chk32(32'h000000007FFFFFFF, FF_NV);
+    is_unsigned = 1;
+    // fcvt.wu.s(3e9, rtz) = 3000000000
+    do_op(FPU_F2I, 32'h4F32D05E, 64'd0, RM_RTZ, got, gff);
+    chk64(64'hFFFFFFFFB2D05E00, 5'd0);  // W result sign-extended to XLEN
+    // fcvt.wu.s(-3.0, rtz) saturates to 0, NV
+    do_op(FPU_F2I, 32'hC0400000, 64'd0, RM_RTZ, got, gff);
+    chk32(32'd0, FF_NV);
+    // fcvt.wu.s(-1.0) -> 0, NV
+    do_op(FPU_F2I, F_M1_0, 64'd0, RM_RNE, got, gff);
+    chk32(32'd0, FF_NV);
+    is_unsigned = 0;
+    // fcvt.l.s(-1.0) = -1
+    is_word = 1;
+    do_op(FPU_F2I, F_M1_0, 64'd0, RM_RNE, got, gff);
+    chk64(64'hFFFFFFFFFFFFFFFF, 5'd0);
+    // fcvt.l.s(3e9, rtz) = 3000000000
+    do_op(FPU_F2I, 32'h4F32D05E, 64'd0, RM_RTZ, got, gff);
+    chk64(64'd3000000000, 5'd0);
+    // fcvt.l.s(NaN) = 2^63-1, NV
+    do_op(FPU_F2I, QNANF, 64'd0, RM_RNE, got, gff);
+    chk64(64'h7FFFFFFFFFFFFFFF, FF_NV);
+    // fcvt.l.s(-Inf) = -2^63, NV
+    do_op(FPU_F2I, NINFF, 64'd0, RM_RNE, got, gff);
+    chk64(64'h8000000000000000, FF_NV);
+    // fcvt.lu.s(3e9, rtz) = 3000000000
+    is_unsigned = 1;
+    do_op(FPU_F2I, 32'h4F32D05E, 64'd0, RM_RTZ, got, gff);
+    chk64(64'd3000000000, 5'd0);
+    // fcvt.lu.s(-3.0) = 0, NV
+    do_op(FPU_F2I, 32'hC0400000, 64'd0, RM_RTZ, got, gff);
+    chk64(64'd0, FF_NV);
+    is_unsigned = 0; is_word = 0;
+
+    // ---------------- FMV ----------------
+    do_op(FPU_MV_X2F, 32'hDEADBEEF, 64'd0, RM_RNE, got, gff);
+    chk64({32'hFFFFFFFF, 32'hDEADBEEF}, 5'd0);
+    do_op(FPU_MV_F2X, 32'hCAFEBABE, 64'd0, RM_RNE, got, gff);
+    chk64({32'hFFFFFFFF, 32'hCAFEBABE}, 5'd0);
 
     $display("TOTAL errors=%0d tests=%0d %s", errors, tests, (errors==0) ? "PASS" : "FAIL");
+    if (errors != 0) $fatal(1, "FPU unit test FAILED");
     $finish;
   end
 endmodule

@@ -3,6 +3,7 @@ module hazard_unit #(
 ) (
   input  logic [4:0]      id_rs1,
   input  logic [4:0]      id_rs2,
+  input  logic [4:0]      id_rs3,
   input  logic [4:0]      ex_rd,
   input  logic            ex_mem_read,
   input  logic            ex_mul_busy,
@@ -20,7 +21,8 @@ module hazard_unit #(
   logic load_use_hazard;
 
   assign load_use_hazard = ex_mem_read && (ex_rd != 5'd0) &&
-                           ((ex_rd == id_rs1) || (ex_rd == id_rs2));
+                           ((ex_rd == id_rs1) || (ex_rd == id_rs2) ||
+                            (ex_rd == id_rs3));
 
   assign stall = load_use_hazard | ex_mul_busy | ex_fpu_busy | mem_lsu_busy |
                  (is_csr_op & csr_hazard);

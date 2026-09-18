@@ -25,6 +25,9 @@ package rtl_core_pkg;
   localparam opcode_t OP_FPSTORE = 7'b0100111;
   localparam opcode_t OP_FPOP     = 7'b1010011;
   localparam opcode_t OP_FMADD    = 7'b1000011;
+  localparam opcode_t OP_FMSUB    = 7'b1000111;
+  localparam opcode_t OP_FNMSUB   = 7'b1001011;
+  localparam opcode_t OP_FNMADD   = 7'b1001111;
 
   typedef enum logic [4:0] {
     ALU_NONE = 0,
@@ -44,7 +47,8 @@ package rtl_core_pkg;
     FPU_F2I, FPU_I2F, FPU_F2D, FPU_D2F, FPU_MV_X2F, FPU_MV_F2X, FPU_CLASS,
     FPU_FCVT_S_W, FPU_FCVT_S_WU, FPU_FCVT_S_L, FPU_FCVT_S_LU,
     FPU_FCVT_W_S, FPU_FCVT_WU_S, FPU_FCVT_L_S, FPU_FCVT_LU_S,
-    FPU_FCVT_D_S, FPU_FCVT_S_D
+    FPU_FCVT_D_S, FPU_FCVT_S_D,
+    FPU_FMADD, FPU_FMSUB, FPU_FNMADD, FPU_FNMSUB
   } fpu_op_e;
 
   typedef enum logic [3:0] {
@@ -87,6 +91,7 @@ package rtl_core_pkg;
     funct7_t     funct7;
     regaddr_t    rs1;
     regaddr_t    rs2;
+    regaddr_t    rs3;
     regaddr_t    rd;
     logic [63:0] imm;
     alu_op_e     alu_op;

@@ -8,6 +8,7 @@ module csr_unit #(
   input  logic [XLEN-1:0]   hartid,
   input  logic              csr_we,
   input  logic [11:0]       csr_addr,
+  input  logic [11:0]       csr_raddr,
   input  logic [XLEN-1:0]   csr_wdata,
   input  logic [1:0]        csr_op,
   input  logic [4:0]        csr_rs1,
@@ -57,11 +58,11 @@ module csr_unit #(
       end
       2'b10: begin // CSRRS
         csr_op_we = csr_we & (csr_rs1 != 5'd0);
-        csr_wval  = csr_rdata_q | csr_wdata;
+        csr_wval  = csr_val(csr_addr) | csr_wdata;
       end
       2'b11: begin // CSRRC
         csr_op_we = csr_we & (csr_rs1 != 5'd0);
-        csr_wval  = csr_rdata_q & ~csr_wdata;
+        csr_wval  = csr_val(csr_addr) & ~csr_wdata;
       end
       default: begin
         csr_op_we = csr_we;
@@ -69,6 +70,47 @@ module csr_unit #(
       end
     endcase
   end
+  // Current value of a CSR at the write port's address, including the
+  // fflags an FP op retires in WB this same cycle (accumulated into
+  // fcsr[4:0] at the WB posedge, so a read/modify in this cycle must see it).
+  function automatic logic [XLEN-1:0] csr_val(input logic [11:0] a);
+    logic [XLEN-1:0] v;
+    case (a)
+      CSR_MSTATUS:  v = mstatus;
+      CSR_MISA:     v = 64'h80000000001411AD;
+      CSR_MIE:      v = mie;
+      CSR_MTVEC:    v = mtvec;
+      CSR_MEPC:     v = mepc;
+      CSR_MCAUSE:   v = mcause;
+      CSR_MTVAL:    v = mtval;
+      CSR_MIP:      v = mip;
+      CSR_MSCRATCH: v = mscratch;
+      CSR_MCYCLE:   v = mcycle;
+      CSR_CYCLE:    v = mcycle;
+      CSR_MINSTRET: v = minstret;
+      CSR_INSTRET:  v = minstret;
+      CSR_MVENDORID:v = '0;
+      CSR_MARCHID:  v = '0;
+      CSR_MIMPID:   v = '0;
+      CSR_MHARTID:  v = hartid;
+      CSR_SSTATUS:  v = sstatus;
+      CSR_SIE:      v = sie;
+      CSR_STVEC:    v = stvec;
+      CSR_SEPC:     v = sepc;
+      CSR_SCAUSE:   v = scause;
+      CSR_STVAL:    v = stval;
+      CSR_SIP:      v = sip;
+      CSR_SSCRATCH: v = sscratch;
+      CSR_FCSR:     v = (fcsr & ~64'd31) |
+                        (fcsr_fflags_we ? {59'd0, fcsr[4:0] | fcsr_fflags_in}
+                                        : {59'd0, fcsr[4:0]});
+      CSR_FFLAGS:   v = {59'd0, fcsr_fflags_we ? (fcsr[4:0] | fcsr_fflags_in)
+                                             : fcsr[4:0]};
+      CSR_FRM:      v = {61'd0, fcsr[7:5]};
+      default:      v = '0;
+    endcase
+    return v;
+  endfunction
 
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
@@ -114,7 +156,7 @@ module csr_unit #(
           CSR_STVAL:    stval    <= csr_wval;
           CSR_SIP:      sip      <= csr_wval;
           CSR_SSCRATCH: sscratch <= csr_wval;
-          CSR_FCSR:     fcsr     <= {csr_wval[7:0], 56'd0};
+          CSR_FCSR:     fcsr     <= {56'd0, csr_wval[7:0]};
           CSR_FFLAGS:   fcsr[4:0]<= csr_wval[4:0];
           CSR_FRM:      fcsr[7:5] <= csr_wval[2:0];
           default: ;
@@ -125,39 +167,33 @@ module csr_unit #(
     end
   end
 
+  // CSR read: the reading instruction supplies its own address (csr_raddr)
+  // while it is in MEM, one stage ahead of the WB instruction driving the
+  // write port (csr_addr). A read of a CSR being written this same cycle, or
+  // of fflags being accumulated by an FP op retiring in WB, must forward the
+  // about-to-be-written value, not the stale register content.
   always_comb begin
-    csr_rdata_q = '0;
-    case (csr_addr)
-      CSR_MSTATUS:  csr_rdata_q = mstatus;
-      CSR_MISA:     csr_rdata_q = 64'h80000000001411AD;
-      CSR_MIE:      csr_rdata_q = mie;
-      CSR_MTVEC:    csr_rdata_q = mtvec;
-      CSR_MEPC:     csr_rdata_q = mepc;
-      CSR_MCAUSE:   csr_rdata_q = mcause;
-      CSR_MTVAL:    csr_rdata_q = mtval;
-      CSR_MIP:      csr_rdata_q = mip;
-      CSR_MSCRATCH: csr_rdata_q = mscratch;
-      CSR_MCYCLE:   csr_rdata_q = mcycle;
-      CSR_CYCLE:    csr_rdata_q = mcycle;
-      CSR_MINSTRET: csr_rdata_q = minstret;
-      CSR_INSTRET:  csr_rdata_q = minstret;
-      CSR_MVENDORID:csr_rdata_q = '0;
-      CSR_MARCHID:  csr_rdata_q = '0;
-      CSR_MIMPID:   csr_rdata_q = '0;
-      CSR_MHARTID:  csr_rdata_q = hartid;
-      CSR_SSTATUS:  csr_rdata_q = sstatus;
-      CSR_SIE:      csr_rdata_q = sie;
-      CSR_STVEC:    csr_rdata_q = stvec;
-      CSR_SEPC:     csr_rdata_q = sepc;
-      CSR_SCAUSE:   csr_rdata_q = scause;
-      CSR_STVAL:    csr_rdata_q = stval;
-      CSR_SIP:      csr_rdata_q = sip;
-      CSR_SSCRATCH: csr_rdata_q = sscratch;
-      CSR_FCSR:     csr_rdata_q = fcsr;
-      CSR_FFLAGS:   csr_rdata_q = {27'd0, fcsr[4:0]};
-      CSR_FRM:      csr_rdata_q = {29'd0, fcsr[7:5]};
-      default:      csr_rdata_q = '0;
-    endcase
+    csr_rdata_q = csr_val(csr_raddr);
+    // Same-cycle WB write bypass: only when the reader addresses the same
+    // CSR the writer in WB is writing (or the FFLAGS/FCSR aliases).
+    if (csr_op_we && (csr_raddr == csr_addr)) begin
+      case (csr_raddr)
+        CSR_FCSR:   csr_rdata_q = (csr_wval & ~64'd31) |
+                                  (fcsr_fflags_we ? {59'd0, fcsr[4:0] | fcsr_fflags_in}
+                                                  : {59'd0, fcsr[4:0]});
+        CSR_FFLAGS: csr_rdata_q = {59'd0, csr_wval[4:0]} |
+                                  (fcsr_fflags_we ? {59'd0, fcsr[4:0] | fcsr_fflags_in}
+                                                  : 64'd0);
+        CSR_FRM:    csr_rdata_q = {61'd0, csr_wval[2:0]};
+        default:    csr_rdata_q = csr_wval;
+      endcase
+    end else if (csr_op_we && (csr_addr == CSR_FCSR) &&
+                 (csr_raddr == CSR_FFLAGS)) begin
+      csr_rdata_q = {59'd0, csr_wval[4:0]};
+    end else if (csr_op_we && (csr_addr == CSR_FFLAGS) &&
+                 (csr_raddr == CSR_FCSR)) begin
+      csr_rdata_q = (fcsr & ~64'd31) | {59'd0, csr_wval[4:0]};
+    end
   end
 
   assign csr_rdata = csr_rdata_q;

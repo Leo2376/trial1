@@ -19,6 +19,7 @@ FPU_EXE := obj_dir/Vtb_fpu
 fpu:
 	verilator --binary --timing -Wno-WIDTH -Wno-UNUSED -Wno-UNOPTFLAT \
 	  -Wno-INITIALDLY -Wno-WIDTHTRUNC -Wno-WIDTHEXPAND -Wno-UNUSEDSIGNAL \
+	  -Wno-TIMESCALEMOD \
 	  -top-module tb_fpu \
 	  ../../rtl/core/rtl_core_pkg.sv ../../rtl/core/fpu/fpu.sv tb_fpu.sv
 	./$(FPU_EXE)
