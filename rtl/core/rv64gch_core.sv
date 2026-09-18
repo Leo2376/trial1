@@ -890,13 +890,9 @@ module rv64gch_core #(
       end else if (ex_pkt.ctrl.is_ecall) begin
         trap = 1'b1; cause = (priv == PRIV_M) ? CAUSE_M_ECALL :
                               (priv == PRIV_S) ? CAUSE_SUP_ECALL : CAUSE_USER_ECALL;
-        $display("[trap] ecall trapped at pc=%0h, cause=%0d, gp=%0h, ex_valid=%b, ex_is_ecall=%b", 
-                 ex_pkt.pc, cause, rf_rdata1, ex_pkt.valid, ex_pkt.ctrl.is_ecall);
       end else if (ex_pkt.ctrl.is_ebreak) begin
         trap = 1'b1; cause = CAUSE_BREAKPOINT;
       end
-    end else begin
-      $display("[trap] no valid ex_pkt, trap=0");
     end
   end
 
