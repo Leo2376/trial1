@@ -36,12 +36,15 @@ package rtl_core_pkg;
     ALU_DIVW, ALU_DIVUW, ALU_REMW, ALU_REMUW, ALU_MULW
   } alu_op_e;
 
-  typedef enum logic [4:0] {
-    FPU_NONE = 5'd0,
+  typedef enum logic [5:0] {
+    FPU_NONE = 6'd0,
     FPU_FADD, FPU_FSUB, FPU_FMUL, FPU_FDIV, FPU_FSQRT,
     FPU_FMIN, FPU_FMAX, FPU_FSGNJ, FPU_FSGNJN, FPU_FSGNJX,
     FPU_FLE, FPU_FLT, FPU_FEQ,
-    FPU_F2I, FPU_I2F, FPU_F2D, FPU_D2F, FPU_MV_X2F, FPU_MV_F2X, FPU_CLASS
+    FPU_F2I, FPU_I2F, FPU_F2D, FPU_D2F, FPU_MV_X2F, FPU_MV_F2X, FPU_CLASS,
+    FPU_FCVT_S_W, FPU_FCVT_S_WU, FPU_FCVT_S_L, FPU_FCVT_S_LU,
+    FPU_FCVT_W_S, FPU_FCVT_WU_S, FPU_FCVT_L_S, FPU_FCVT_LU_S,
+    FPU_FCVT_D_S, FPU_FCVT_S_D
   } fpu_op_e;
 
   typedef enum logic [3:0] {
@@ -109,7 +112,7 @@ package rtl_core_pkg;
     logic        is_sret;
     logic        is_wfi;
     logic        illegal;
-    logic [2:0]  fp_fmt;
+    logic [3:0]  fp_fmt;
     logic [2:0]  fp_rm;
   } ctrl_t;
 

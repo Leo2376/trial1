@@ -361,7 +361,7 @@ module rv64gch_core #(
   // (compare/class/f2i/mv.x) that write the integer regfile.
   function automatic logic [9:0] decode_fpu_op(logic [31:0] i);
     logic [2:0] f3; logic [6:0] f7; logic [4:0] rs2;
-    logic [2:0] fmt;  fpu_op_e fop;  wb_sel_e wbs;
+    logic [3:0] fmt;  fpu_op_e fop;  wb_sel_e wbs;
     fmt = '0; fop = FPU_NONE; wbs = WB_FP;
     f3 = i[14:12]; f7 = i[31:25]; rs2 = i[24:20];
     fmt[0] = f7[0]; // single/double precision for arithmetic ops
@@ -406,6 +406,8 @@ module rv64gch_core #(
                   else fop = FPU_NONE; end
       6'b110000: begin // FCVT.*.X (int->fp): rs2 selects int width; fp dest
                   fmt[0] = f7[0]; // 0=>fcvt.s.w, 1=>fcvt.d.w (double dest)
+                  fmt[2] = rs2[0]; // is_unsigned
+                  fmt[3] = rs2[1]; // is_word (1=64-bit, 0=32-bit)
                   case (rs2)
                     5'd0, 5'd2: fop = FPU_I2F; // w / l (signed)
                     5'd1, 5'd3: fop = FPU_I2F; // wu / lu (unsigned)
@@ -413,6 +415,8 @@ module rv64gch_core #(
                   endcase end
       6'b110100: begin // FCVT.X.* (fp->int): rs2 selects int width; int dest
                   fmt[0] = f7[0]; fmt[1] = 1'b1; wbs = WB_INT;
+                  fmt[2] = rs2[0]; // is_unsigned
+                  fmt[3] = rs2[1]; // is_word
                   case (rs2)
                     5'd0, 5'd2: fop = FPU_F2I; // w / l (signed)
                     5'd1, 5'd3: fop = FPU_F2I; // wu / lu (unsigned)
@@ -675,6 +679,9 @@ module rv64gch_core #(
   fpu u_fpu (
     .clk(clk), .rst_n(rst_n),
     .start(fpu_start), .op(ex_pkt.ctrl.fpu_op), .rm(ex_pkt.ctrl.fp_rm),
+    .is_double(ex_pkt.ctrl.fp_fmt[0]),
+    .is_unsigned(ex_pkt.ctrl.fp_fmt[2]),
+    .is_word(ex_pkt.ctrl.fp_fmt[3]),
     .a(fp_rdata1), .b(fp_rdata2),
     .result(fpu_res), .fflags(), .done(fpu_done), .busy(fpu_busy_q)
   );
@@ -877,8 +884,19 @@ module rv64gch_core #(
 
   always_comb begin
     trap = 1'b0; cause = 4'd0;
-    if (ex_pkt.valid & ex_pkt.ctrl.illegal) begin
-      trap = 1'b1; cause = CAUSE_ILLEGAL_INSN;
+    if (ex_pkt.valid) begin
+      if (ex_pkt.ctrl.illegal) begin
+        trap = 1'b1; cause = CAUSE_ILLEGAL_INSN;
+      end else if (ex_pkt.ctrl.is_ecall) begin
+        trap = 1'b1; cause = (priv == PRIV_M) ? CAUSE_M_ECALL :
+                              (priv == PRIV_S) ? CAUSE_SUP_ECALL : CAUSE_USER_ECALL;
+        $display("[trap] ecall trapped at pc=%0h, cause=%0d, gp=%0h, ex_valid=%b, ex_is_ecall=%b", 
+                 ex_pkt.pc, cause, rf_rdata1, ex_pkt.valid, ex_pkt.ctrl.is_ecall);
+      end else if (ex_pkt.ctrl.is_ebreak) begin
+        trap = 1'b1; cause = CAUSE_BREAKPOINT;
+      end
+    end else begin
+      $display("[trap] no valid ex_pkt, trap=0");
     end
   end
 

@@ -45,6 +45,67 @@ module fpu #(
   assign done   = (st == F_DONE);
   assign busy   = (st != F_IDLE) & (st != F_DONE);
 
+  // Simple state machine for handshake - computes result in F_ARITH
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      st       <= F_IDLE;
+      res_r    <= '0;
+      fflags_r <= '0;
+    end else begin
+      case (st)
+        F_IDLE: begin
+          if (start) begin
+            fflags_r <= '0;
+            st <= F_ARITH;
+          end
+        end
+        F_ARITH: begin
+          res_r <= compute_result(a, b, op, rm, is_double, is_unsigned, is_word);
+          st <= F_DONE;
+        end
+        F_DONE: st <= F_IDLE;
+        default: st <= F_IDLE;
+      endcase
+    end
+  end
+
+  // Combinational result computation for all operations
+  function automatic logic [63:0] compute_result(
+    input logic [63:0] a,
+    input logic [63:0] b,
+    input rtl_core_pkg::fpu_op_e op,
+    input logic [2:0] rm,
+    input logic is_double,
+    input logic is_unsigned,
+    input logic is_word
+  );
+    logic [4:0] ff;
+    logic [63:0] r;
+    if (is_double) begin
+      r = {{32{1'b0}}, compute_result_s(a[31:0], b[31:0], op, rm, ff)};
+    end else begin
+      r = {{32{1'b0}}, compute_result_s(a[31:0], b[31:0], op, rm, ff)};
+    end
+    return r;
+  endfunction
+
+  // Single-precision arithmetic dispatch
+  function automatic logic [31:0] compute_result_s(
+    input logic [31:0] a,
+    input logic [31:0] b,
+    input rtl_core_pkg::fpu_op_e op,
+    input logic [2:0] rm,
+    output logic [4:0] ff
+  );
+    ff = '0;
+    unique case (op)
+      FPU_FADD:  return faddsub_s(a, b, 1'b0, rm, ff);
+      FPU_FSUB:  return faddsub_s(a, b, 1'b1, rm, ff);
+      // Other ops: stubs for now
+      default:   return a + b;
+    endcase
+  endfunction
+
   localparam logic [31:0] CANON_S_NAN = 32'h7FC00000;
   localparam logic [63:0] CANON_D_NAN = 64'h7FF8000000000000;
   localparam logic [31:0] S_INF_P = 32'h7F800000;
