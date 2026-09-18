@@ -33,3 +33,29 @@ jobs:
         run: |
           cd sim/riscv-tests
           make isa RISCV_SRC=/tmp/riscv-tests/isa
+
+  rv64um:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Verilator & RISC-V toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y verilator gcc-riscv64-unknown-elf
+          verilator --version
+          riscv64-unknown-elf-gcc --version
+
+      - name: Fetch riscv-tests ISA sources
+        run: |
+          git clone --depth 1 https://github.com/riscv-software-src/riscv-tests.git /tmp/riscv-tests
+          ls /tmp/riscv-tests/isa/rv64um | head
+
+      - name: Build Verilator simulator
+        run: |
+          cd sim/verilator
+          make
+
+      - name: Run rv64um (M-extension) ISA regression
+        run: |
+          EXT=rv64um RISCV_SRC=/tmp/riscv-tests/isa ./tools/scripts/run_isa_tests.sh
