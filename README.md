@@ -16,7 +16,7 @@ synthesis), not FPGA.
 | M extension (mul/div) | **DONE** | rv64um 13/13 PASS |
 | F extension (single-precision FP) | **DONE** | rv64uf 11/11 PASS |
 | Zicsr / Zifencei | **DONE** | covered by suites above |
-| FPU fflags/frm/fcsr CSRs | **DONE** | move.S, fsflags readback |
+| FPU fflags/frm/fcsr CSRs | **DONE** | move.S, fsflags readback, dyn_rm.S (rm=dyn->frm) |
 | SoC top + AXI4 fabric + DRAM model | **DONE** | core-level sim boot |
 | D extension (double-precision) | **DONE** | rv64ud 12/12 PASS |
 | C extension (RVC decompressor) | **DONE** | rv64uc/rvc PASS, tb_decompressor 44/44 |
@@ -79,6 +79,12 @@ Three levels, all driven by the upstream riscv-tests ISA suites:
    sources (rv64ui/rv64um/rv64uf/rv64uc/rv64ua, selectable via `EXT=`), converts ELF to hex
    (`tools/scripts/elf2hex.py`), runs the core sim, and reports PASS/FAIL
    per test against the tohost value.
+4. **Directed core tests** — `software/tests/dyn_rm.S` (rm=dyn uses
+   fcsr.frm for fdiv.s/d incl. the back-to-back csrw->dyn hazard path;
+   riscv-tests never use dyn) and `software/tests/l1i_conflict.S` (5 code
+   lines forced into one 4-way L1I set: eviction + refill byte-exactness).
+   Build per the header comments, run with
+   `Vtb_rv64gch_core +hex=<test>.hex`, expect `TEST PASSED`.
 
 Debug methodology (proven on the FPU work): when a test fails, disassemble the
 failing test case, write a minimal directed asm program that reports the
@@ -102,7 +108,12 @@ cd sim/verilator && make fpu      # 79/79 PASS
 cd sim/verilator && make decomp   # 44/44 PASS
 ```
 
-Last full regression (with L1I in fetch path): rv64ui 50/50, rv64um 13/13, rv64uf 11/11, rv64uc 1/1 (rvc), rv64ua 19/19, rv64ud 12/12, tb_fpu 79/79, tb_decompressor 44/44.
+# Directed core tests (see software/tests/*.S headers for build lines)
+./sim/verilator/obj_dir/Vtb_rv64gch_core +hex=/tmp/dyn_rm.hex         # TEST PASSED
+./sim/verilator/obj_dir/Vtb_rv64gch_core +hex=/tmp/l1i_conflict.hex   # TEST PASSED
+```
+
+Last full regression (with 4-way L1I in fetch path): rv64ui 50/50, rv64um 13/13, rv64uf 11/11, rv64uc 1/1 (rvc), rv64ua 19/19, rv64ud 12/12, tb_fpu 79/79, tb_decompressor 44/44, dyn_rm PASS, l1i_conflict PASS.
 
 ## RTL Directory Structure & Module Relationships
 
