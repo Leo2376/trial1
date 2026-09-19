@@ -67,6 +67,25 @@ module rv64gch_top #(
     .flush_i(fence_i_retire)
   );
 
+  // L1 data cache (blocking, write-back) between the core data port and
+  // the shared AXI arbiter. The arbiter sees the cache's memory side
+  // (l1d_*); FENCE needs no action (in-order + blocking retires everything
+  // before it) and there is no coherence/DMA yet, so flush is tied off.
+  logic        l1d_req, l1d_we, l1d_ack, l1d_ready, l1d_lock;
+  logic [47:0] l1d_addr;
+  logic [7:0]  l1d_be;
+  logic [63:0] l1d_wdata, l1d_rdata;
+  l1d #(.ADDR_W(ADDR_W), .DATA_W(DATA_W)) u_l1d (
+    .clk(clk), .rst_n(rst_n),
+    .req_i(dmem_req), .we_i(dmem_we), .addr_i(dmem_addr),
+    .be_i(dmem_be), .wdata_i(dmem_wdata), .lock_i(dmem_lock),
+    .rdata_o(dmem_rdata), .ack_o(dmem_ack), .ready_o(dmem_ready),
+    .req_o(l1d_req), .we_o(l1d_we), .addr_o(l1d_addr), .be_o(l1d_be),
+    .wdata_o(l1d_wdata), .lock_o(l1d_lock),
+    .rdata_i(l1d_rdata), .ack_i(l1d_ack), .ready_i(l1d_ready),
+    .flush_i(1'b0)
+  );
+
   assign core_active_o = (dbg_pc != 32'd0);
 
   logic        axi_req, axi_we, axi_ack, axi_ready, axi_err, axi_idle;
@@ -82,15 +101,15 @@ module rv64gch_top #(
   // completion ack is routed correctly even if the request selectors change
   // while the transaction is in progress (e.g. a pipeline flush dropping a
   // fetch request).
-  assign sel_dmem = dmem_req;
+  assign sel_dmem = l1d_req;
 
-  assign axi_req   = sel_dmem ? dmem_req   : (l1_req & l1_ready);
-  assign axi_we    = sel_dmem ? dmem_we    : 1'b0;
-  assign axi_addr  = sel_dmem ? dmem_addr  : l1_addr;
-  assign axi_be    = sel_dmem ? dmem_be    : 8'hFF;
-  assign axi_wdata = sel_dmem ? dmem_wdata : 64'd0;
+  assign axi_req   = sel_dmem ? (l1d_req & l1d_ready) : (l1_req & l1_ready);
+  assign axi_we    = sel_dmem ? l1d_we    : 1'b0;
+  assign axi_addr  = sel_dmem ? l1d_addr  : l1_addr;
+  assign axi_be    = sel_dmem ? l1d_be    : 8'hFF;
+  assign axi_wdata = sel_dmem ? l1d_wdata : 64'd0;
 
-  assign dmem_rdata = axi_rdata;
+  assign l1d_rdata = axi_rdata;
   assign l1_rdata   = axi_rdata;
 
   // The owner is latched exactly when the AXI master accepts a new
@@ -119,19 +138,20 @@ module rv64gch_top #(
     end
   end
 
-  assign dmem_ack = axi_ack &  axi_owner_dmem;
-  assign l1_ack   = axi_ack & ~axi_owner_dmem;
+  assign l1d_ack = axi_ack &  axi_owner_dmem;
+  assign l1_ack  = axi_ack & ~axi_owner_dmem;
 
-  // Fill requests can issue when the master is idle and no data request
-  // is pending. Data memory can issue when the master is idle.
-  assign l1_ready   = axi_ready & ~sel_dmem;
-  assign dmem_ready = axi_ready;
+  // Instruction fills can issue when the master is idle and no data-side
+  // (L1D fill/writeback) request is pending. The data side can issue when
+  // the master is idle.
+  assign l1_ready  = axi_ready & ~sel_dmem;
+  assign l1d_ready = axi_ready;
 
   axi4_master #(.ADDR_W(ADDR_W), .DATA_W(DATA_W), .ID_W(ID_W)) u_axi (
     .clk(clk), .rst_n(rst_n),
     .req(axi_req), .we(axi_we),
     .addr(axi_addr), .be(axi_be), .wdata(axi_wdata),
-    .size(4'd3), .lock(dmem_lock & sel_dmem),
+    .size(4'd3), .lock(l1d_lock & sel_dmem),
     .rdata(axi_rdata), .ack(axi_ack), .ready(axi_ready), .err(axi_err),
     .idle_o(axi_idle),
     .bus(mem)

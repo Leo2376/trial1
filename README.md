@@ -22,7 +22,8 @@ synthesis), not FPGA.
 | C extension (RVC decompressor) | **DONE** | rv64uc/rvc PASS, tb_decompressor 44/44 |
 | A extension (LR/SC/AMO) | **DONE** | rv64ua 19/19 PASS |
 | L1I (32 KiB, 4-way, blocking) | **DONE** | all ISA suites + conflict test PASS |
-| L1D, L2 caches | Not started | — |
+| L1D (32 KiB, 4-way, blocking, write-back) | **DONE** | all ISA suites (incl. rv64ua) + l1d_wb PASS |
+| L2 cache | Not started | — |
 | MMU (Sv39/Sv48) | Not started | — |
 | Dual-issue frontend | Not started | — |
 | RVV 1.0 vector engine | Not started | — |
@@ -51,9 +52,17 @@ single-cycle, FDIV/FSQRT iterative); fflags accumulate to CSR via WB.
    same-set conflict/eviction test PASS. Bring-up exposed a stale-`ready`
    owner-latch race in `rv64gch_top`, fixed with a combinational `idle_o`
    accept gate in `axi4_master`).
-   Remaining: **L1D** (needs LSU extraction from core MEM stage) + **L2**.
-   Biggest architectural gap toward ASIC target; prerequisite for
-   dual-issue fetch bandwidth.
+   **L1D DONE** (32 KiB 4-way write-back in `rtl/cache/l1d/l1d.sv`, inserted
+   on the core data port like L1I so the inline LSU is untouched; MMIO at
+   or above `MMIO_BASE` bypasses as uncacheable single beats so tohost
+   still reaches the hostif model; AMO/LR/SC ride the ordinary read/write
+   path, atomic by in-order+blocking construction; `l1d_wb.S` proves the
+   dirty-evict-writeback-refill chain byte-exact incl. sb/sh merge).
+   L1D bring-up caught two more bugs: writebacks used the missing line's
+   address instead of the victim's, and tree-PLRU updates pointed the wrong
+   way (fixed in both caches).
+   Remaining: **L2**. Biggest architectural gap toward ASIC target;
+   prerequisite for dual-issue fetch bandwidth.
 5. **MMU (Sv39/Sv48)** — page-table walk unit, TLBs, satp plumbing.
 6. **Dual-issue frontend** — 8B/cycle fetch, dual decode, ALU+MDU/FPU pairing,
    wider hazard/forwarding.
@@ -81,8 +90,10 @@ Three levels, all driven by the upstream riscv-tests ISA suites:
    per test against the tohost value.
 4. **Directed core tests** — `software/tests/dyn_rm.S` (rm=dyn uses
    fcsr.frm for fdiv.s/d incl. the back-to-back csrw->dyn hazard path;
-   riscv-tests never use dyn) and `software/tests/l1i_conflict.S` (5 code
-   lines forced into one 4-way L1I set: eviction + refill byte-exactness).
+   riscv-tests never use dyn), `software/tests/l1i_conflict.S` (5 code
+   lines forced into one 4-way L1I set: eviction + refill byte-exactness),
+   and `software/tests/l1d_wb.S` (5 data lines forced into one 4-way L1D
+   set: dirty-evict-writeback-refill byte-exactness incl. sb/sh merge).
    Build per the header comments, run with
    `Vtb_rv64gch_core +hex=<test>.hex`, expect `TEST PASSED`.
 
@@ -111,9 +122,10 @@ cd sim/verilator && make decomp   # 44/44 PASS
 # Directed core tests (see software/tests/*.S headers for build lines)
 ./sim/verilator/obj_dir/Vtb_rv64gch_core +hex=/tmp/dyn_rm.hex         # TEST PASSED
 ./sim/verilator/obj_dir/Vtb_rv64gch_core +hex=/tmp/l1i_conflict.hex   # TEST PASSED
+./sim/verilator/obj_dir/Vtb_rv64gch_core +hex=/tmp/l1d_wb.hex         # TEST PASSED
 ```
 
-Last full regression (with 4-way L1I in fetch path): rv64ui 50/50, rv64um 13/13, rv64uf 11/11, rv64uc 1/1 (rvc), rv64ua 19/19, rv64ud 12/12, tb_fpu 79/79, tb_decompressor 44/44, dyn_rm PASS, l1i_conflict PASS.
+Last full regression (4-way L1I + L1D in path): rv64ui 50/50, rv64um 13/13, rv64uf 11/11, rv64uc 1/1 (rvc), rv64ua 19/19, rv64ud 12/12, tb_fpu 79/79, tb_decompressor 44/44, dyn_rm PASS, l1i_conflict PASS, l1d_wb PASS.
 
 ## RTL Directory Structure & Module Relationships
 
@@ -145,9 +157,10 @@ rtl/
 ├── vpu/                           # Vector/Matrix Unit (EMPTY, future)
 │   ├── ctrl/  regfile/  vlane/  munit/  vsew_lmul/  ldst/
 ├── mmu/                           # Sv48 MMU (EMPTY, future)
-├── cache/                         # l1i DONE, rest EMPTY (future)
+├── cache/                         # l1i + l1d DONE, rest EMPTY (future)
 │   ├── l1i/l1i.sv               # L1I 32KiB 4-way blocking (IMPLEMENTED)
-│   ├── l1d/  l2/  llc/  coherence/
+│   ├── l1d/l1d.sv               # L1D 32KiB 4-way write-back (IMPLEMENTED)
+│   ├── l2/  llc/  coherence/
 ├── soc/                           # SoC integration (IMPLEMENTED)
 │   ├── top/
 │   │   ├── rv64gch_top.sv        # Top-level SoC: core + fabric + boot ROM
@@ -210,7 +223,7 @@ VPU (RVV 1.0 + IME 1.0) ──┘
 | Level | Size | Type | Status |
 |-------|------|------|--------|
 | L1I   | 32 KiB | Instruction cache | done (4-way blocking, tree-PLRU, fence.i invalidate) |
-| L1D   | 32 KiB | Data cache | planned |
+| L1D   | 32 KiB | Data cache | done (4-way WB write-allocate, MMIO bypass) |
 | L2    | 256 KiB | Private unified | planned |
 | LLC   | 1 MiB | Shared CPU+VPU over the single AXI4 bus | planned |
 

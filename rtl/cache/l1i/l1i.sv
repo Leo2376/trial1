@@ -75,7 +75,8 @@ module l1i #(
   logic [DATA_W-1:0]   data  [NUM_SETS][NUM_WAYS][WORDS_PER_LINE];
   // Tree-PLRU per set: [2]=root (0=left{0,1} LRU, 1=right{2,3} LRU),
   // [1]=left (0=way0 LRU, 1=way1 LRU), [0]=right (0=way2 LRU, 1=way3 LRU).
-  // Bits point TOWARD the least-recently-used way.
+  // Bits point TOWARD the least-recently-used way; touching way w sets
+  // them AWAY from w (root <= (w<2), mid <= (w==edge0)).
   logic [2:0]          plru  [NUM_SETS];
 
   logic [ADDR_W-1:0] req_q;    // latched CPU request under lookup
@@ -172,9 +173,9 @@ module l1i #(
           if (hit) begin
             resp_q <= data[lk_set][hit_way][lk_word];
             // PLRU update: point away from the accessed way (toward LRU).
-            plru[lk_set][2] <= (hit_way >= 2);
-            if (hit_way < 2) plru[lk_set][1] <= (hit_way == 1);
-            else             plru[lk_set][0] <= (hit_way == 3);
+            plru[lk_set][2] <= (hit_way < 2);
+            if (hit_way < 2) plru[lk_set][1] <= (hit_way == 0);
+            else             plru[lk_set][0] <= (hit_way == 2);
             st <= S_RESP;
             `ifdef L1I_DEBUG
             $display("[l1i %0t] HIT addr=%h way=%0d data=%h", $time, req_q,
@@ -216,9 +217,9 @@ module l1i #(
                 valid[miss_set][victim_q] <= 1'b1;
                 lep[miss_set][victim_q]   <= cur_epoch;
                 // Filled way is now MRU: point away from it.
-                plru[miss_set][2] <= (victim_q >= 2);
-                if (victim_q < 2) plru[miss_set][1] <= (victim_q == 1);
-                else              plru[miss_set][0] <= (victim_q == 3);
+                plru[miss_set][2] <= (victim_q < 2);
+                if (victim_q < 2) plru[miss_set][1] <= (victim_q == 0);
+                else              plru[miss_set][0] <= (victim_q == 2);
               end
               st <= S_LOOKUP;
             end else begin
