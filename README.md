@@ -23,7 +23,7 @@ synthesis), not FPGA.
 | A extension (LR/SC/AMO) | **DONE** | rv64ua 19/19 PASS |
 | L1I (32 KiB, 4-way, blocking) | **DONE** | all ISA suites + conflict test PASS |
 | L1D (32 KiB, 4-way, blocking, write-back) | **DONE** | all ISA suites (incl. rv64ua) + l1d_wb PASS |
-| L2 cache | Not started | — |
+| L2 (256 KiB, 8-way, blocking, write-back) | **DONE** | all ISA suites + l2_wb PASS |
 | MMU (Sv39/Sv48) | Not started | — |
 | Dual-issue frontend | Not started | — |
 | RVV 1.0 vector engine | Not started | — |
@@ -61,8 +61,14 @@ single-cycle, FDIV/FSQRT iterative); fflags accumulate to CSR via WB.
    L1D bring-up caught two more bugs: writebacks used the missing line's
    address instead of the victim's, and tree-PLRU updates pointed the wrong
    way (fixed in both caches).
-   Remaining: **L2**. Biggest architectural gap toward ASIC target;
-   prerequisite for dual-issue fetch bandwidth.
+   **L2 DONE** (256 KiB 8-way write-back unified in `rtl/cache/l2/l2.sv`,
+   1024 sets x 32B lines, tree-PLRU, dual-port with L1D-side priority;
+   both L1s feed it and it is the only AXI requester, so the old
+   fetch/data arbiter + owner latch in `rv64gch_top` is gone; MMIO
+   bypasses as uncacheable on both ports; `l2_wb.S` forces an L2 dirty
+   eviction to DRAM and checks the refill byte-exact).
+   Memory hierarchy through L2 complete; remaining: LLC (only needed with
+   VPU traffic), then MMU.
 5. **MMU (Sv39/Sv48)** — page-table walk unit, TLBs, satp plumbing.
 6. **Dual-issue frontend** — 8B/cycle fetch, dual decode, ALU+MDU/FPU pairing,
    wider hazard/forwarding.
@@ -93,7 +99,9 @@ Three levels, all driven by the upstream riscv-tests ISA suites:
    riscv-tests never use dyn), `software/tests/l1i_conflict.S` (5 code
    lines forced into one 4-way L1I set: eviction + refill byte-exactness),
    and `software/tests/l1d_wb.S` (5 data lines forced into one 4-way L1D
-   set: dirty-evict-writeback-refill byte-exactness incl. sb/sh merge).
+   set: dirty-evict-writeback-refill byte-exactness incl. sb/sh merge),
+   and `software/tests/l2_wb.S` (9 data lines forced into one 8-way L2
+   set: L2 dirty eviction to DRAM + refill byte-exactness).
    Build per the header comments, run with
    `Vtb_rv64gch_core +hex=<test>.hex`, expect `TEST PASSED`.
 
@@ -123,9 +131,10 @@ cd sim/verilator && make decomp   # 44/44 PASS
 ./sim/verilator/obj_dir/Vtb_rv64gch_core +hex=/tmp/dyn_rm.hex         # TEST PASSED
 ./sim/verilator/obj_dir/Vtb_rv64gch_core +hex=/tmp/l1i_conflict.hex   # TEST PASSED
 ./sim/verilator/obj_dir/Vtb_rv64gch_core +hex=/tmp/l1d_wb.hex         # TEST PASSED
+./sim/verilator/obj_dir/Vtb_rv64gch_core +hex=/tmp/l2_wb.hex          # TEST PASSED
 ```
 
-Last full regression (4-way L1I + L1D in path): rv64ui 50/50, rv64um 13/13, rv64uf 11/11, rv64uc 1/1 (rvc), rv64ua 19/19, rv64ud 12/12, tb_fpu 79/79, tb_decompressor 44/44, dyn_rm PASS, l1i_conflict PASS, l1d_wb PASS.
+Last full regression (L1I + L1D + L2 in path): rv64ui 50/50, rv64um 13/13, rv64uf 11/11, rv64uc 1/1 (rvc), rv64ua 19/19, rv64ud 12/12, tb_fpu 79/79, tb_decompressor 44/44, dyn_rm PASS, l1i_conflict PASS, l1d_wb PASS, l2_wb PASS.
 
 ## RTL Directory Structure & Module Relationships
 
@@ -160,7 +169,8 @@ rtl/
 ├── cache/                         # l1i + l1d DONE, rest EMPTY (future)
 │   ├── l1i/l1i.sv               # L1I 32KiB 4-way blocking (IMPLEMENTED)
 │   ├── l1d/l1d.sv               # L1D 32KiB 4-way write-back (IMPLEMENTED)
-│   ├── l2/  llc/  coherence/
+│   ├── l2/l2.sv                 # L2 256KiB 8-way write-back (IMPLEMENTED)
+│   ├── llc/  coherence/
 ├── soc/                           # SoC integration (IMPLEMENTED)
 │   ├── top/
 │   │   ├── rv64gch_top.sv        # Top-level SoC: core + fabric + boot ROM
@@ -224,7 +234,7 @@ VPU (RVV 1.0 + IME 1.0) ──┘
 |-------|------|------|--------|
 | L1I   | 32 KiB | Instruction cache | done (4-way blocking, tree-PLRU, fence.i invalidate) |
 | L1D   | 32 KiB | Data cache | done (4-way WB write-allocate, MMIO bypass) |
-| L2    | 256 KiB | Private unified | planned |
+| L2    | 256 KiB | Private unified | done (8-way WB, dual-port, tree-PLRU) |
 | LLC   | 1 MiB | Shared CPU+VPU over the single AXI4 bus | planned |
 
 ## Directory Conventions

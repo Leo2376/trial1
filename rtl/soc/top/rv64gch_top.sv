@@ -88,70 +88,48 @@ module rv64gch_top #(
 
   assign core_active_o = (dbg_pc != 32'd0);
 
+  // Unified L2 victim shared by both L1s. Port A serves L1I fills
+  // (read-only); port B serves L1D fills/writebacks with data-side
+  // priority inside the L2. The L2 is blocking with a single memory-side
+  // port, so it is the only AXI requester: no arbitration or owner
+  // tracking is needed downstream (the stale-ready race that required the
+  // old owner latch cannot occur with one requester).
+  logic        m2_req, m2_we, m2_ack, m2_ready, m2_lock;
+  logic [47:0] m2_addr;
+  logic [7:0]  m2_be;
+  logic [63:0] m2_wdata, m2_rdata;
+  l2 #(.ADDR_W(ADDR_W), .DATA_W(DATA_W)) u_l2 (
+    .clk(clk), .rst_n(rst_n),
+    .req_a_i(l1_req), .addr_a_i(l1_addr),
+    .rdata_a_o(l1_rdata), .ack_a_o(l1_ack), .ready_a_o(l1_ready),
+    .req_b_i(l1d_req), .we_b_i(l1d_we), .addr_b_i(l1d_addr),
+    .be_b_i(l1d_be), .wdata_b_i(l1d_wdata), .lock_b_i(l1d_lock),
+    .rdata_b_o(l1d_rdata), .ack_b_o(l1d_ack), .ready_b_o(l1d_ready),
+    .req_o(m2_req), .we_o(m2_we), .addr_o(m2_addr), .be_o(m2_be),
+    .wdata_o(m2_wdata), .lock_o(m2_lock),
+    .rdata_i(m2_rdata), .ack_i(m2_ack), .ready_i(m2_ready)
+  );
+
   logic        axi_req, axi_we, axi_ack, axi_ready, axi_err, axi_idle;
   logic [47:0] axi_addr;
   logic [7:0]  axi_be;
   logic [63:0] axi_wdata, axi_rdata;
-  logic        sel_dmem;
-  logic        axi_owner_dmem;  // latched: 1 = in-flight AXI transaction owned by dmem
 
-  // Data memory has priority over instruction fetch for the shared AXI port.
-  // A request is forwarded to the master only when the master is idle
-  // (axi_ready). The owner of the in-flight transaction is latched so the
-  // completion ack is routed correctly even if the request selectors change
-  // while the transaction is in progress (e.g. a pipeline flush dropping a
-  // fetch request).
-  assign sel_dmem = l1d_req;
+  assign axi_req   = m2_req & m2_ready;
+  assign axi_we    = m2_we;
+  assign axi_addr  = m2_addr;
+  assign axi_be    = m2_be;
+  assign axi_wdata = m2_wdata;
 
-  assign axi_req   = sel_dmem ? (l1d_req & l1d_ready) : (l1_req & l1_ready);
-  assign axi_we    = sel_dmem ? l1d_we    : 1'b0;
-  assign axi_addr  = sel_dmem ? l1d_addr  : l1_addr;
-  assign axi_be    = sel_dmem ? l1d_be    : 8'hFF;
-  assign axi_wdata = sel_dmem ? l1d_wdata : 64'd0;
-
-  assign l1d_rdata = axi_rdata;
-  assign l1_rdata   = axi_rdata;
-
-  // The owner is latched exactly when the AXI master accepts a new
-  // request (its A_IDLE && req sampling). Gated by the master's
-  // combinational idle_o, not the registered ready: after an accept, ready
-  // stays high for one more cycle while the master is already in A_AR/A_AW,
-  // and a request present in that window (held fill req, or a data request
-  // racing a just-accepted fill beat) must NOT re-latch ownership, or the
-  // in-flight transaction's ack would be misrouted. When a transaction
-  // completes (axi_ack) the master returns to idle in the same cycle, so a
-  // new request can be accepted simultaneously; the new owner must take
-  // precedence over clearing the previous one.
-  always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-      axi_owner_dmem <= 1'b0;
-    end else if (axi_idle && axi_req) begin
-      axi_owner_dmem <= sel_dmem;
-      `ifdef L1I_DEBUG
-      $display("[top %0t] ACCEPT sel_dmem=%b addr=%h", $time, sel_dmem, axi_addr);
-      `endif
-    end else if (axi_ack) begin
-      axi_owner_dmem <= 1'b0;
-      `ifdef L1I_DEBUG
-      $display("[top %0t] ACK owner_dmem=%b rdata=%h", $time, axi_owner_dmem, axi_rdata);
-      `endif
-    end
-  end
-
-  assign l1d_ack = axi_ack &  axi_owner_dmem;
-  assign l1_ack  = axi_ack & ~axi_owner_dmem;
-
-  // Instruction fills can issue when the master is idle and no data-side
-  // (L1D fill/writeback) request is pending. The data side can issue when
-  // the master is idle.
-  assign l1_ready  = axi_ready & ~sel_dmem;
-  assign l1d_ready = axi_ready;
+  assign m2_rdata = axi_rdata;
+  assign m2_ack   = axi_ack;
+  assign m2_ready = axi_ready;
 
   axi4_master #(.ADDR_W(ADDR_W), .DATA_W(DATA_W), .ID_W(ID_W)) u_axi (
     .clk(clk), .rst_n(rst_n),
     .req(axi_req), .we(axi_we),
     .addr(axi_addr), .be(axi_be), .wdata(axi_wdata),
-    .size(4'd3), .lock(l1d_lock & sel_dmem),
+    .size(4'd3), .lock(m2_lock),
     .rdata(axi_rdata), .ack(axi_ack), .ready(axi_ready), .err(axi_err),
     .idle_o(axi_idle),
     .bus(mem)
