@@ -21,7 +21,7 @@ synthesis), not FPGA.
 | D extension (double-precision) | **DONE** | rv64ud 12/12 PASS |
 | C extension (RVC decompressor) | **DONE** | rv64uc/rvc PASS, tb_decompressor 44/44 |
 | A extension (LR/SC/AMO) | **DONE** | rv64ua 19/19 PASS |
-| L1I (32 KiB, DM, blocking) | **DONE** | all ISA suites PASS through cache |
+| L1I (32 KiB, 4-way, blocking) | **DONE** | all ISA suites + conflict test PASS |
 | L1D, L2 caches | Not started | — |
 | MMU (Sv39/Sv48) | Not started | — |
 | Dual-issue frontend | Not started | — |
@@ -45,10 +45,12 @@ single-cycle, FDIV/FSQRT iterative); fflags accumulate to CSR via WB.
 3. **A extension (rv64ua)** — **DONE**. LR/SC reservation + AMO
    read-modify-write implemented in the MEM-stage LSU (single-hart
    atomicity, `aq/rl` ignored, AXI `lock` path still unconnected).
-4. **L1 caches + L2 (256 KiB)** — **L1I DONE** (32 KiB direct-mapped
-   blocking in `rtl/cache/l1i/l1i.sv`, 32B lines, `fence.i` invalidate via
-   retire pulse; exposed a stale-`ready` owner-latch race in `rv64gch_top`,
-   fixed with a combinational `idle_o` accept gate in `axi4_master`).
+4. **L1 caches + L2 (256 KiB)** — **L1I DONE** (32 KiB 4-way
+   set-associative blocking in `rtl/cache/l1i/l1i.sv`, 256 sets x 32B
+   lines, tree-PLRU, `fence.i` invalidate via retire pulse; 5-line
+   same-set conflict/eviction test PASS. Bring-up exposed a stale-`ready`
+   owner-latch race in `rv64gch_top`, fixed with a combinational `idle_o`
+   accept gate in `axi4_master`).
    Remaining: **L1D** (needs LSU extraction from core MEM stage) + **L2**.
    Biggest architectural gap toward ASIC target; prerequisite for
    dual-issue fetch bandwidth.
@@ -133,7 +135,7 @@ rtl/
 │   ├── ctrl/  regfile/  vlane/  munit/  vsew_lmul/  ldst/
 ├── mmu/                           # Sv48 MMU (EMPTY, future)
 ├── cache/                         # l1i DONE, rest EMPTY (future)
-│   ├── l1i/l1i.sv               # L1I 32KiB DM blocking (IMPLEMENTED)
+│   ├── l1i/l1i.sv               # L1I 32KiB 4-way blocking (IMPLEMENTED)
 │   ├── l1d/  l2/  llc/  coherence/
 ├── soc/                           # SoC integration (IMPLEMENTED)
 │   ├── top/
@@ -196,7 +198,7 @@ VPU (RVV 1.0 + IME 1.0) ──┘
 
 | Level | Size | Type | Status |
 |-------|------|------|--------|
-| L1I   | 32 KiB | Instruction cache | done (DM blocking, fence.i invalidate) |
+| L1I   | 32 KiB | Instruction cache | done (4-way blocking, tree-PLRU, fence.i invalidate) |
 | L1D   | 32 KiB | Data cache | planned |
 | L2    | 256 KiB | Private unified | planned |
 | LLC   | 1 MiB | Shared CPU+VPU over the single AXI4 bus | planned |
