@@ -36,7 +36,9 @@ module rv64gch_core #(
   logic            valid_f, valid_d, valid_x, valid_m, valid_w;
   logic            is_c_f, is_c_d;
   logic            flush_all, flush_id, flush_ex;
-  logic            stall;
+  logic            stall, stall_raw, frm_stall;
+  logic [2:0]      frm;
+  logic [2:0]      fpu_rm_eff;
   logic [1:0]      priv;
 
   ctrl_t           dc;
@@ -619,6 +621,21 @@ module rv64gch_core #(
   logic lsu_busy;
   assign load_use_hazard_csr = 1'b0;
 
+  // Dynamic rounding (rm=111/DYN): the effective rounding mode comes from
+  // fcsr.frm. A DYN op in ID must wait until any older CSR write to FRM/FCSR
+  // has retired to WB (fcsr update), otherwise it would sample a stale frm.
+  // Later CSR writes cannot overtake: the pipeline stalls on fpu_busy while
+  // the DYN op is in EX, so frm is stable for the whole in-flight op.
+  function automatic logic writes_frm(input ctrl_t c);
+    return c.writes_csr & (c.csr_addr == CSR_FRM || c.csr_addr == CSR_FCSR);
+  endfunction
+  logic id_needs_frm, frm_pending;
+  assign id_needs_frm = valid_d & (dc.fpu_op != FPU_NONE) & (dc.fp_rm == RM_DYN);
+  assign frm_pending = (ex_pkt.valid & writes_frm(ex_pkt.ctrl)) |
+                       (mem_pkt.valid & writes_frm(mem_pkt.ctrl)) |
+                       (wb_pkt.valid & writes_frm(wb_pkt.ctrl));
+  assign frm_stall = id_needs_frm & frm_pending;
+
   hazard_unit u_haz (
     .id_rs1(rs1_d), .id_rs2(rs2_d), .id_rs3(rs3_d),
     .ex_rd(rd_x), .ex_mem_read(mem_is_load_x),
@@ -626,8 +643,9 @@ module rv64gch_core #(
     .mem_lsu_busy(lsu_busy),
     .branch_taken(redirect), .trap(trap),
     .is_csr_op(dc.writes_csr), .csr_hazard(load_use_hazard_csr),
-    .stall(stall), .flush_id(flush_id), .flush_ex(flush_ex)
+    .stall(stall_raw), .flush_id(flush_id), .flush_ex(flush_ex)
   );
+  assign stall = stall_raw | frm_stall;
 
   logic flush_redirect;
   assign flush_redirect = redirect | trap;
@@ -805,9 +823,12 @@ module rv64gch_core #(
   assign fp_a = fp_op_int_src ? rs1_fwd : fp_fwd_a;
   assign fp_b = fp_fwd_b;
   assign fp_c = fp_fwd_c;
+  // Spec: rm=111 (DYN) takes the rounding mode from fcsr.frm. Prior FRM/FCSR
+  // writes are stalled out above, so frm is stable for the in-flight op.
+  assign fpu_rm_eff = (ex_pkt.ctrl.fp_rm == RM_DYN) ? frm : ex_pkt.ctrl.fp_rm;
   fpu u_fpu (
     .clk(clk), .rst_n(rst_n),
-    .start(fpu_start), .op(ex_pkt.ctrl.fpu_op), .rm(ex_pkt.ctrl.fp_rm),
+    .start(fpu_start), .op(ex_pkt.ctrl.fpu_op), .rm(fpu_rm_eff),
     .is_double(ex_pkt.ctrl.fp_fmt[0]),
     .is_unsigned(ex_pkt.ctrl.fp_fmt[2]),
     .is_word(ex_pkt.ctrl.fp_fmt[3]),
@@ -1118,7 +1139,6 @@ module rv64gch_core #(
   assign wb_data_w = wb_pkt.data;
 
   logic [4:0] fcsr_fflags_we;
-  logic [2:0] frm;
   logic [4:0] fcsr_fflags;
   assign fcsr_fflags_we = wb_pkt.valid & wb_pkt.ctrl.is_fp & (wb_pkt.ctrl.fpu_op != FPU_NONE);
   csr_unit u_csr (
