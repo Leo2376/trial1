@@ -63,7 +63,13 @@ package rtl_core_pkg;
     LSU_LR, LSU_SC, LSU_AMO
   } lsu_op_e;
 
-  typedef enum logic [2:0] { AMO_ADD=0, AMO_SWAP, AMO_XOR, AMO_AND, AMO_OR, AMO_MIN, AMO_MAX, AMO_MINU } amo_op_e;
+  // funct5 field of OP_AMO (instr[31:27]); aq/rl bits [26:25] ignored.
+  typedef enum logic [4:0] {
+    AMO_ADD=5'b00000, AMO_SWAP=5'b00001, AMO_XOR=5'b00100,
+    AMO_AND=5'b01100, AMO_OR=5'b01000, AMO_MIN=5'b10000,
+    AMO_MAX=5'b10100, AMO_MINU=5'b11000, AMO_MAXU=5'b11100,
+    AMO_LR=5'b00010, AMO_SC=5'b00011
+  } amo_op_e;
 
   typedef enum logic [3:0] {
     SRC_NONE=0, SRC_REG, SRC_IMM_I, SRC_IMM_S, SRC_IMM_B, SRC_IMM_U, SRC_IMM_J, SRC_PC

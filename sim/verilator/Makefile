@@ -24,6 +24,16 @@ fpu:
 	  ../../rtl/core/rtl_core_pkg.sv ../../rtl/core/fpu/fpu.sv tb_fpu.sv
 	./$(FPU_EXE)
 
+# Decompressor (RVC) unit testbench (make decomp)
+DECOMP_EXE := obj_dir/Vtb_decompressor
+decomp:
+	verilator --binary --timing -Wno-WIDTH -Wno-UNUSED -Wno-UNOPTFLAT \
+	  -Wno-INITIALDLY -Wno-WIDTHTRUNC -Wno-WIDTHEXPAND -Wno-UNUSEDSIGNAL \
+	  -Wno-TIMESCALEMOD -Wno-CASEOVERLAP \
+	  -top-module tb_decompressor \
+	  ../../rtl/core/frontend/decompressor.sv tb_decompressor.sv
+	./$(DECOMP_EXE)
+
 # Generate hex from smoke test (default)
 prog_smoke.vh: $(GEN_HEX)
 	python3 $(GEN_HEX) prog_smoke.vh
@@ -43,9 +53,10 @@ run: $(HEX_FILE) $(EXE)
 
 # Run a specific FPU test: make TEST=fadd
 # Run FPU unit testbench: make fpu
+# Run decompressor unit testbench: make decomp
 # Run smoke test: make TEST=smoke
 
 clean:
 	rm -rf obj_dir prog.vh prog_*.vh
 
-.PHONY: all run fpu clean
+.PHONY: all run fpu decomp clean

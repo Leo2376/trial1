@@ -75,6 +75,8 @@ module rv64gch_core #(
     logic [63:0] pc;
     logic [31:0] instr;
     ctrl_t       ctrl;
+    logic        is_c;
+    logic        illegal_c;
     logic [63:0] rs1;
     logic [63:0] rs2;
     logic [63:0] fa;
@@ -133,10 +135,15 @@ module rv64gch_core #(
 
   logic [31:0] instr_expanded;
   logic        fetch_is_c;
+  logic        fetch_illegal_c;
   logic [31:0] fetch_instr;
+  logic [15:0] fetch_low_half;
   logic [63:0] fetch_word_q;   // latched fetch word, held across stalls
   logic [63:0] fetch_pc_q;     // pc the latched word was fetched for
   logic        fetch_complete;  // fetch read returned, awaiting consumption
+  logic [63:0] fetch_hi_q;     // second word for 32-bit insn straddling 64-bit boundary
+  logic        fetch_hi_valid;
+  logic        fetch_need_hi;
   logic        fetch_done;
   logic        fetch_busy;
   // A latched fetch result is only usable if it corresponds to the
@@ -145,38 +152,64 @@ module rv64gch_core #(
   // pc_f (using the word-aligned address) makes the skid buffer safe
   // across flushes without relying solely on flush_all clearing it.
   logic fetch_res_valid;
-  assign fetch_res_valid = fetch_complete & (fetch_pc_q[47:3] == pc_f[47:3]);
+  assign fetch_res_valid = fetch_complete & (fetch_pc_q[47:3] == pc_f[47:3]) &
+                           (~fetch_need_hi | fetch_hi_valid);
   // Assemble the 32-bit instruction window from the latched fetched
-  // 64-bit word based on pc_f[2:1]. A 32-bit (non-compressed) instruction
+  // 64-bit word(s) based on pc_f[2:1]. A 32-bit (non-compressed) instruction
   // can straddle the 32-bit boundary inside the 64-bit fetch word when it
   // is located at byte offset 2 (pc_f[2:1] == 2'b01), so the lower and
-  // upper halves must be stitched together. Compressed (16-bit)
-  // instructions never straddle a 16-bit boundary, so the half-word
-  // selected by pc_f[1] is always valid.
+  // upper halves must be stitched together. A 32-bit instruction at byte
+  // offset 6 (pc_f[2:1] == 2'b11) straddles the 64-bit word boundary: its
+  // low half lives in fetch_word_q[63:48] and its high half in
+  // fetch_hi_q[15:0] (fetched with a second AXI transaction). Compressed
+  // (16-bit) instructions never straddle, so the half-word selected by
+  // pc_f[2:1] is always valid on its own.
   always_comb begin
     unique case (pc_f[2:1])
       2'b00: fetch_instr = fetch_word_q[31:0];
       2'b01: fetch_instr = {fetch_word_q[47:32], fetch_word_q[31:16]};
       2'b10: fetch_instr = fetch_word_q[63:32];
-      2'b11: fetch_instr = {16'b0, fetch_word_q[63:48]};
+      2'b11: fetch_instr = fetch_need_hi ? {fetch_hi_q[15:0], fetch_word_q[63:48]}
+                                          : {16'b0, fetch_word_q[63:48]};
     endcase
   end
+  // Low half-word at the current PC determines compressed vs 32-bit and
+  // whether a second word is needed (32-bit at offset 6).
+  always_comb begin
+    unique case (pc_f[2:1])
+      2'b00: fetch_low_half = fetch_word_q[15:0];
+      2'b01: fetch_low_half = fetch_word_q[31:16];
+      2'b10: fetch_low_half = fetch_word_q[47:32];
+      2'b11: fetch_low_half = fetch_word_q[63:48];
+    endcase
+  end
+  assign fetch_need_hi = (pc_f[2:1] == 2'b11) & fetch_complete &
+                         (fetch_low_half[1:0] == 2'b11) &
+                         (fetch_pc_q[47:3] == pc_f[47:3]);
   // The decompressor inspects the lowest 16 bits of the assembled window.
-  decompressor u_decomp (.cin(fetch_instr[15:0]), .iout(instr_expanded), .is_c(fetch_is_c));
+  decompressor u_decomp (.cin(fetch_instr[15:0]), .iout(instr_expanded),
+                         .is_c(fetch_is_c), .illegal(fetch_illegal_c));
 
   logic [31:0] instr_d_use;
+  logic        illegal_d_use;
   assign instr_d_use = fetch_is_c ? instr_expanded : fetch_instr;
+  assign illegal_d_use = fetch_is_c & fetch_illegal_c;
 
   // fetch_done is a latched (level) signal gated by the result being valid
   // for the current pc and the pipeline being able to consume it. This
   // prevents a fetch completion pulse from being lost while the pipeline is
   // stalled (e.g. a load-use hazard or multi-cycle LSU access), which would
   // otherwise deadlock the core, while a stale result from a flushed pc is
-  // ignored.
+  // ignored. For a 32-bit instruction at byte offset 6 the window straddles
+  // two 64-bit words, so fetch_res_valid waits for the second word.
   assign fetch_done    = fetch_res_valid & ~stall;
   assign fetch_req     = valid_f & fetch_ready & ~stall & ~fetch_busy & ~fetch_res_valid;
   assign fetch_we      = 1'b0;
-  assign fetch_addr    = pc_f;
+  // Second word of a straddling fetch: next 64-bit aligned word.
+  assign fetch_addr    = (fetch_complete & ~fetch_hi_valid &
+                          (fetch_pc_q[47:3] == pc_f[47:3]) &
+                          (pc_f[2:1] == 2'b11)) ?
+                         ({pc_f[47:3], 3'b0} + 48'd8) : pc_f;
   assign fetch_be      = 8'hFF;
   assign fetch_wdata   = '0;
 
@@ -187,34 +220,49 @@ module rv64gch_core #(
       fetch_complete <= 1'b0;
       fetch_word_q   <= '0;
       fetch_pc_q     <= '0;
+      fetch_hi_q     <= '0;
+      fetch_hi_valid <= 1'b0;
     end else if (flush_all) begin
       fetch_busy     <= 1'b0;
       fetch_complete <= 1'b0;
+      fetch_hi_valid <= 1'b0;
       valid_f        <= 1'b1;
     end else begin
       // Latch the returned word on completion so it survives a stall.
+      // The first ack fills the low word; if the instruction straddles
+      // (32-bit at offset 6) a second ack fills the high word. Busy tracks
+      // only the in-flight AXI transaction (set on issue, cleared on ack)
+      // so the straddling second word can be issued right after the first
+      // returns; complete/hi_valid hold the buffered result across stalls.
       if (fetch_ack & fetch_busy) begin
-        fetch_word_q   <= fetch_rdata;
-        fetch_pc_q     <= fetch_addr;
-        fetch_complete <= 1'b1;
-      end
-      // A new fetch is issued only when the master is idle and the fetch
-      // wins arbitration. Busy stays set until the read returns; complete
-      // then holds the result until the unstalled pipeline consumes it.
-      if (fetch_req & fetch_ready)
+        fetch_busy <= 1'b0;
+        if (!fetch_complete) begin
+          fetch_word_q   <= fetch_rdata;
+          fetch_pc_q     <= fetch_addr;
+          fetch_complete <= 1'b1;
+        end else begin
+          fetch_hi_q     <= fetch_rdata;
+          fetch_hi_valid <= 1'b1;
+        end
+      end else if (fetch_req & fetch_ready) begin
+        // A new fetch is issued only when the master is idle and the fetch
+        // wins arbitration.
         fetch_busy <= 1'b1;
+      end
       if (fetch_done) begin
         fetch_busy     <= 1'b0;
         fetch_complete <= 1'b0;
+        fetch_hi_valid <= 1'b0;
       end
     end
   end
 
   assign instr_f = instr_d_use;
 
+  logic illegal_c_d;
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-      valid_d <= 1'b0; pc_d <= '0; instr_d <= '0; is_c_d <= 1'b0;
+      valid_d <= 1'b0; pc_d <= '0; instr_d <= '0; is_c_d <= 1'b0; illegal_c_d <= 1'b0;
     end else if (flush_all) begin
       valid_d <= 1'b0;
     end else if (!stall) begin
@@ -223,6 +271,7 @@ module rv64gch_core #(
         pc_d    <= pc_f;
         is_c_d  <= fetch_is_c;
         instr_d <= instr_d_use;
+        illegal_c_d <= illegal_d_use;
       end else begin
         valid_d <= 1'b0;
       end
@@ -340,9 +389,33 @@ module rv64gch_core #(
       OP_FENCE:  begin
                   if (f3 == 3'b001) c.fence_i = 1'b1;
                 end
-      OP_AMO:    begin c.wb_sel = WB_MEM; c.lsu_op = LSU_AMO;
+      OP_AMO:    begin
+                  // funct3: 010=W, 011=D (else illegal); funct5 selects
+                  // LR/SC vs AMO op; LR requires rs2==0. aq/rl ignored.
+                  c.wb_sel = WB_MEM; c.a_src = SRC_REG;
                   c.amo_op = amo_op_e'(i[31:27]);
-                  c.a_src = SRC_REG; end
+                  case (amo_op_e'(i[31:27]))
+                    AMO_LR: begin
+                      c.lsu_op = LSU_LR;
+                      if ((f3 != 3'b010 && f3 != 3'b011) || i[24:20] != 5'd0)
+                        c.illegal = 1'b1;
+                    end
+                    AMO_SC: begin
+                      c.lsu_op = LSU_SC;
+                      if (f3 != 3'b010 && f3 != 3'b011)
+                        c.illegal = 1'b1;
+                    end
+                    AMO_ADD, AMO_SWAP, AMO_XOR, AMO_AND, AMO_OR,
+                    AMO_MIN, AMO_MAX, AMO_MINU, AMO_MAXU: begin
+                      c.lsu_op = LSU_AMO;
+                      if (f3 != 3'b010 && f3 != 3'b011)
+                        c.illegal = 1'b1;
+                    end
+                    default: begin
+                      c.lsu_op = LSU_AMO;
+                      c.illegal = 1'b1;
+                    end
+                  endcase end
       OP_FPLOAD: begin c.is_fp = 1'b1; c.wb_sel = WB_FP;
                   // FLW (funct3=2, 32-bit) / FLD (funct3=3, 64-bit).
                   c.lsu_op = (f3 == 3'b010) ? LSU_LW : LSU_LD; end
@@ -564,10 +637,17 @@ module rv64gch_core #(
       if (flush_redirect) begin
         ex_pkt <= '0;
       end else begin
-        ex_pkt.valid <= valid_d & ~dc.illegal;
+        ex_pkt.valid <= valid_d;
         ex_pkt.pc    <= pc_d;
         ex_pkt.instr <= instr_d;
         ex_pkt.ctrl  <= dc;
+        // Fold decompressor-illegal into the control illegal bit so the
+        // EX-stage trap logic catches reserved RVC encodings. The
+        // decompressor already substitutes a NOP payload, so no register
+        // or memory side-effect can occur before the trap flushes.
+        ex_pkt.ctrl.illegal <= dc.illegal | illegal_c_d;
+        ex_pkt.is_c <= is_c_d;
+        ex_pkt.illegal_c <= illegal_c_d;
         ex_pkt.rs1   <= rf_rdata1;
         ex_pkt.rs2   <= rf_rdata2;
         // FP operands are latched here (with WB->ID bypass already applied)
@@ -684,7 +764,8 @@ module rv64gch_core #(
                                     ex_pkt.ctrl.is_jal | ex_pkt.ctrl.is_jalr);
   assign redirect_target = branch_target;
 
-  assign mem_is_load_x = (ex_pkt.ctrl.lsu_op >= LSU_LB) & (ex_pkt.ctrl.lsu_op <= LSU_LWU);
+  assign mem_is_load_x = ((ex_pkt.ctrl.lsu_op >= LSU_LB) & (ex_pkt.ctrl.lsu_op <= LSU_LWU)) |
+                         (ex_pkt.ctrl.lsu_op == LSU_LR) | (ex_pkt.ctrl.lsu_op == LSU_AMO);
   assign mem_is_store_x = (ex_pkt.ctrl.lsu_op >= LSU_SB) & (ex_pkt.ctrl.lsu_op <= LSU_SD);
 
   logic mdu_in_ex;
@@ -736,16 +817,74 @@ module rv64gch_core #(
     if (is_mdu_op(ex_pkt.ctrl.alu_op))
       ex_result = mdu_res;
     if (ex_pkt.ctrl.fpu_op != FPU_NONE) ex_result = fpu_res;
+    // JAL/JALR link: return address is the next sequential PC, which is
+    // pc+2 for a compressed instruction and pc+4 otherwise.
     if (ex_pkt.ctrl.is_jal | ex_pkt.ctrl.is_jalr)
-      ex_result = ex_pkt.pc + 64'd4;
+      ex_result = ex_pkt.pc + (ex_pkt.is_c ? 64'd2 : 64'd4);
   end
+
+  // LR/SC reservation (single hart): set by LR, checked+cleared by SC,
+  // cleared on trap. Compared on full byte address.
+  logic        lr_valid_q;
+  logic [47:0] lr_addr_q;
+
+  // AMO ALU: old = aligned memory value, op2 = rs2. W operates on low 32b.
+  function automatic logic [63:0] amo_compute(logic [63:0] old, logic [63:0] op2,
+                                             amo_op_e op, logic is_d);
+    logic [31:0] o32, p32, r32;
+    logic [63:0] r64;
+    if (!is_d) begin
+      o32 = old[31:0]; p32 = op2[31:0];
+      unique case (op)
+        AMO_ADD:  r32 = o32 + p32;
+        AMO_SWAP: r32 = p32;
+        AMO_XOR:  r32 = o32 ^ p32;
+        AMO_AND:  r32 = o32 & p32;
+        AMO_OR:   r32 = o32 | p32;
+        AMO_MIN:  r32 = ($signed(o32) < $signed(p32)) ? o32 : p32;
+        AMO_MAX:  r32 = ($signed(o32) >= $signed(p32)) ? o32 : p32;
+        AMO_MINU: r32 = (o32 < p32) ? o32 : p32;
+        AMO_MAXU: r32 = (o32 >= p32) ? o32 : p32;
+        default:  r32 = o32;
+      endcase
+      return {{32{r32[31]}}, r32};
+    end
+    unique case (op)
+      AMO_ADD:  r64 = old + op2;
+      AMO_SWAP: r64 = op2;
+      AMO_XOR:  r64 = old ^ op2;
+      AMO_AND:  r64 = old & op2;
+      AMO_OR:   r64 = old | op2;
+      AMO_MIN:  r64 = ($signed(old) < $signed(op2)) ? old : op2;
+      AMO_MAX:  r64 = ($signed(old) >= $signed(op2)) ? old : op2;
+      AMO_MINU: r64 = (old < op2) ? old : op2;
+      AMO_MAXU: r64 = (old >= op2) ? old : op2;
+      default:  r64 = old;
+    endcase
+    return r64;
+  endfunction
+
+  // SC success checked at EX->MEM entry: reservation must be valid and match.
+  // Safe: entry only advances when !stall, i.e. no older LR/AMO still in MEM.
+  logic [47:0] ex_mem_addr;
+  assign ex_mem_addr = rs1_fwd + ex_pkt.imm;
+  logic        ex_sc_success;
+  assign ex_sc_success = (ex_pkt.ctrl.lsu_op == LSU_SC) &
+                         lr_valid_q & (lr_addr_q == ex_mem_addr);
+  logic        ex_is_amo;
+  assign ex_is_amo = (ex_pkt.ctrl.lsu_op == LSU_AMO);
+  logic        ex_amo_is_d;
+  assign ex_amo_is_d = (ex_pkt.ctrl.funct3 == 3'b011);
 
   always_comb begin
     mem_pkt_n = '0;
     mem_pkt_n.valid = ex_pkt.valid;
     mem_pkt_n.pc    = ex_pkt.pc;
     mem_pkt_n.ctrl  = ex_pkt.ctrl;
-    mem_pkt_n.alu_res = ex_result;
+    // SC returns 0 on success / 1 on failure in rd (via alu_res + WB mux);
+    // all other ops keep the EX result.
+    mem_pkt_n.alu_res = (ex_pkt.ctrl.lsu_op == LSU_SC) ?
+                        (ex_sc_success ? 64'd0 : 64'd1) : ex_result;
     mem_pkt_n.rs2   = rs2_fwd;
     // CSR write operand is rs1 (forwarded), NOT the ALU result. The prior
     // path set wb_pkt.data = csr_rdata (old value) and fed that back as the
@@ -754,7 +893,10 @@ module rv64gch_core #(
     // zero-extended for CSRRWI/CSRRSI/CSRRCI (funct3[2]).
     mem_pkt_n.csr_wdata = (ex_pkt.ctrl.funct3[2]) ? {59'd0, ex_pkt.ctrl.rs1} : rs1_fwd;
     mem_pkt_n.mem_addr = rs1_fwd + ex_pkt.imm;
-    mem_pkt_n.is_store = mem_is_store_x;
+    // SC writes memory only on reservation success; AMO always reads then
+    // writes (phased in the MEM FSM below).
+    mem_pkt_n.is_store = mem_is_store_x | ex_is_amo |
+                         ((ex_pkt.ctrl.lsu_op == LSU_SC) & ex_sc_success);
     mem_pkt_n.is_load  = mem_is_load_x;
     mem_pkt_n.store_data = (ex_pkt.ctrl.is_fp ? fp_b : rs2_fwd) << (mem_pkt_n.mem_addr[2:0]*8);
   mem_pkt_n.fflags = fpu_fflags;
@@ -769,6 +911,11 @@ module rv64gch_core #(
       LSU_SB, LSU_SH:  mem_pkt_n.be = (ex_pkt.ctrl.lsu_op == LSU_SB) ?
                                      (8'h01 << mem_pkt_n.mem_addr[2:0]) :
                                      (8'h03 << mem_pkt_n.mem_addr[2:0]);
+      LSU_LR, LSU_SC, LSU_AMO: begin
+        // funct3 011=D (8B), 010=W (4B); decode guarantees one of the two.
+        mem_pkt_n.be = (ex_pkt.ctrl.funct3 == 3'b011) ? 8'hFF :
+                       (8'h0F << mem_pkt_n.mem_addr[2:0]);
+      end
     endcase
   end
 
@@ -778,19 +925,26 @@ module rv64gch_core #(
   // transaction: once the AXI master has accepted a load/store request it
   // stays asserted until the load/store leaves the MEM stage (the pipeline
   // advances mem_pkt), so a completed transaction cannot be re-driven. lsu_busy
-  // is raised when a load/store enters MEM and drops when that transaction's
-  // own ack returns, unstalling the pipeline so the load/store drains to WB.
+  // is raised when a load/store/atomic enters MEM and drops when its final
+  // transaction's own ack returns, unstalling the pipeline so it drains to WB.
+  // AMO is two transactions (read old, write new): amo_wr_q tracks the phase.
+  logic amo_wr_q;
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       mem_pkt     <= '0;
       lsu_busy    <= 1'b0;
       axi_issued  <= 1'b0;
       axi_pending <= 1'b0;
+      lr_valid_q  <= 1'b0;
+      lr_addr_q   <= '0;
+      amo_wr_q    <= 1'b0;
     end else if (trap) begin
       mem_pkt     <= '0;
       lsu_busy    <= 1'b0;
       axi_issued  <= 1'b0;
       axi_pending <= 1'b0;
+      lr_valid_q  <= 1'b0;
+      amo_wr_q    <= 1'b0;
     end else if (!stall) begin
       if (ex_pkt.valid)
         mem_pkt <= mem_pkt_n;
@@ -800,23 +954,47 @@ module rv64gch_core #(
         lsu_busy    <= 1'b1;
         axi_issued  <= 1'b0;
         axi_pending <= 1'b0;
+        amo_wr_q    <= 1'b0;
       end else begin
         lsu_busy    <= 1'b0;
         axi_issued  <= 1'b0;
         axi_pending <= 1'b0;
+        amo_wr_q    <= 1'b0;
+        // SC (fail or success) consumes the reservation as it drains.
+        if (mem_pkt_n.valid & (mem_pkt_n.ctrl.lsu_op == LSU_SC))
+          lr_valid_q <= 1'b0;
       end
     end else begin
       // Pipeline stalled (lsu_busy holds it). Issue the AXI request once and
       // keep it issued until the load/store leaves MEM; clear lsu_busy only on
-      // this transaction's own completion so the pipeline can then drain.
+      // the final transaction's own completion so the pipeline can then drain.
       if (mem_req & mem_ready) begin
         axi_issued  <= 1'b1;
         axi_pending <= 1'b1;
       end
       if (axi_pending & mem_ack) begin
-        lsu_busy    <= 1'b0;
-        axi_pending <= 1'b0;
+        // LR sets the reservation when its read returns.
+        if (mem_pkt.valid & (mem_pkt.ctrl.lsu_op == LSU_LR)) begin
+          lr_valid_q  <= 1'b1;
+          lr_addr_q   <= mem_pkt.mem_addr;
+          lsu_busy    <= 1'b0;
+          axi_pending <= 1'b0;
+        // AMO read phase: advance to write phase, re-arm issue, stay busy.
+        end else if (mem_pkt.valid & (mem_pkt.ctrl.lsu_op == LSU_AMO) & ~amo_wr_q) begin
+          amo_wr_q    <= 1'b1;
+          axi_issued  <= 1'b0;
+          axi_pending <= 1'b0;
+        end else begin
+          lsu_busy    <= 1'b0;
+          axi_pending <= 1'b0;
+        end
       end
+      // SC (success or fail) consumes the reservation once it leaves MEM;
+      // the drain happens via fetch_done path clearing busy above, but flag
+      // the clear here too for the success path that just acked.
+      if (axi_pending & mem_ack & mem_pkt.valid &
+          (mem_pkt.ctrl.lsu_op == LSU_SC))
+        lr_valid_q <= 1'b0;
     end
   end
 
@@ -835,12 +1013,23 @@ module rv64gch_core #(
   // duplicate store write whose B response later arrives as a stale ack and
   // corrupts a following load's lsu_busy). axi_issued clears when the
   // transaction's ack returns, readying for the next load/store.
+  // AMO is read-then-write: we=0 in the read phase (amo_wr_q==0), we=1 with
+  // the computed new value in the write phase.
   logic axi_issued;
+  logic mem_is_amo_w;
+  assign mem_is_amo_w = mem_pkt.valid & (mem_pkt.ctrl.lsu_op == LSU_AMO) & amo_wr_q;
+  logic [63:0] amo_old_aligned;
+  assign amo_old_aligned = align_load(load_data_q, 3'b0, (mem_pkt.ctrl.funct3 == 3'b011) ? LSU_LD : LSU_LW);
+  logic [63:0] amo_new;
+  assign amo_new = amo_compute(amo_old_aligned, mem_pkt.rs2, mem_pkt.ctrl.amo_op,
+                               (mem_pkt.ctrl.funct3 == 3'b011));
   assign mem_req   = mem_pkt.valid & (mem_pkt.is_store | mem_pkt.is_load) & ~axi_issued;
-  assign mem_we    = mem_pkt.is_store;
+  // AMO read phase must issue with we=0 (the entry is_store bit is 1, so it
+  // cannot be used directly); write phase uses the computed amo_new.
+  assign mem_we    = (mem_pkt.ctrl.lsu_op == LSU_AMO) ? amo_wr_q : mem_pkt.is_store;
   assign mem_addr  = mem_pkt.mem_addr;
   assign mem_be    = mem_pkt.be;
-  assign mem_wdata = mem_pkt.store_data;
+  assign mem_wdata = mem_is_amo_w ? (amo_new << (mem_pkt.mem_addr[2:0]*8)) : mem_pkt.store_data;
   assign mem_lock  = mem_pkt.lock;
 
   function automatic logic [63:0] align_load(logic [63:0] d, logic [2:0] off, lsu_op_e op);
@@ -865,12 +1054,20 @@ module rv64gch_core #(
   // in MEM with the bus read data still holding a fetch word; latching on a
   // bare mem_ack would capture the wrong value. axi_pending is asserted for
   // the current mem_pkt's transaction and cleared only by its own ack.
+  // LR/AMO widths come from funct3 (010=W, 011=D); AMO latches only in its
+  // read phase (write ack must not overwrite the old value in load_data_q).
   logic [63:0] load_data_q;
   logic        axi_pending;
+  logic        amo_read_ack;
+  assign amo_read_ack = mem_pkt.valid & (mem_pkt.ctrl.lsu_op == LSU_AMO) & ~amo_wr_q;
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) load_data_q <= '0;
-    else if (axi_pending & mem_ack & mem_pkt.valid & mem_pkt.is_load)
-      load_data_q <= align_load(mem_rdata, mem_pkt.mem_addr[2:0], mem_pkt.ctrl.lsu_op);
+    else if (axi_pending & mem_ack & mem_pkt.valid & mem_pkt.is_load &
+             (mem_pkt.ctrl.lsu_op != LSU_AMO | amo_read_ack))
+      load_data_q <= align_load(mem_rdata, mem_pkt.mem_addr[2:0],
+        ((mem_pkt.ctrl.lsu_op == LSU_LR) | (mem_pkt.ctrl.lsu_op == LSU_AMO)) ?
+          ((mem_pkt.ctrl.funct3 == 3'b011) ? LSU_LD : LSU_LW) :
+          mem_pkt.ctrl.lsu_op);
   end
   always_comb begin
     mem_rdata_aligned = load_data_q;
@@ -887,7 +1084,9 @@ module rv64gch_core #(
     wb_pkt_n.fflags = mem_pkt.fflags;
     case (mem_pkt.ctrl.wb_sel)
       WB_INT: wb_pkt_n.data = mem_pkt.alu_res;
-      WB_MEM: wb_pkt_n.data = mem_rdata_aligned;
+      // SC returns its 0/1 status (in alu_res), not memory data.
+      WB_MEM: wb_pkt_n.data = (mem_pkt.ctrl.lsu_op == LSU_SC) ? mem_pkt.alu_res :
+                              mem_rdata_aligned;
       WB_FP:  wb_pkt_n.data = (mem_pkt.ctrl.opcode == OP_FPLOAD)
                              ? ((mem_pkt.ctrl.funct3 == 3'b010)
                                 ? {32'hFFFFFFFF, mem_rdata_aligned[31:0]}  // FLW NaN-box

@@ -71,10 +71,10 @@ module tb_rv64gch_core;
       @(negedge clk);
       cycle_cnt = cycle_cnt + 1;
       if (cycle_cnt % 100000 == 0)
-        $display("[tb] cycle=%0d pc=%0h core_active=%b trap=%b cause=%0d ex_valid=%b id_valid=%b stall=%b fpu_busy=%b fetch_done=%b fetch_complete=%b fetch_res_valid=%b valid_f=%b pc_f=%0h fetch_req=%b fetch_ready=%b fetch_ack=%b axi_req=%b axi_ready=%b axi_ack=%b", 
+        $display("[tb] cycle=%0d pc=%0h core_active=%b trap=%b cause=%0d ex_valid=%b id_valid=%b is_c=%b ill_c=%b stall=%b fpu_busy=%b fetch_done=%b fetch_complete=%b hi_valid=%b need_hi=%b fetch_res_valid=%b valid_f=%b pc_f=%0h fetch_req=%b fetch_ready=%b fetch_ack=%b axi_req=%b axi_ready=%b axi_ack=%b", 
                  cycle_cnt, u_cpu.dbg_pc, core_active, u_cpu.u_core.trap, u_cpu.u_core.cause,
-                 u_cpu.u_core.ex_pkt.valid, u_cpu.u_core.valid_d, u_cpu.u_core.stall, u_cpu.u_core.fpu_busy,
-                 u_cpu.u_core.fetch_done, u_cpu.u_core.fetch_complete, u_cpu.u_core.fetch_res_valid, u_cpu.u_core.valid_f, u_cpu.u_core.pc_f,
+                 u_cpu.u_core.ex_pkt.valid, u_cpu.u_core.valid_d, u_cpu.u_core.is_c_d, u_cpu.u_core.illegal_c_d, u_cpu.u_core.stall, u_cpu.u_core.fpu_busy,
+                 u_cpu.u_core.fetch_done, u_cpu.u_core.fetch_complete, u_cpu.u_core.fetch_hi_valid, u_cpu.u_core.fetch_need_hi, u_cpu.u_core.fetch_res_valid, u_cpu.u_core.valid_f, u_cpu.u_core.pc_f,
                  u_cpu.u_core.fetch_req, u_cpu.fetch_ready, u_cpu.fetch_ack,
                  u_cpu.axi_req, u_cpu.axi_ready, u_cpu.axi_ack);
     end
