@@ -30,6 +30,14 @@ module tb_fpu;
                        input logic [63:0] sc, input logic [2:0] mode,
                        output logic [63:0] res, output logic [4:0] rff);
     @(negedge clk);
+    // RV64D NaN-boxing: single-precision FP sources must be boxed, mirroring
+    // what the core guarantees (double values and integer sources
+    // I2F/MV_X2F stay raw).
+    if (!is_double && o != FPU_I2F && o != FPU_MV_X2F) begin
+      if (sa[63:32] != 32'hFFFFFFFF) sa = {32'hFFFFFFFF, sa[31:0]};
+      if (sb[63:32] != 32'hFFFFFFFF) sb = {32'hFFFFFFFF, sb[31:0]};
+      if (sc[63:32] != 32'hFFFFFFFF) sc = {32'hFFFFFFFF, sc[31:0]};
+    end
     op = o; rm = mode; a = sa; b = sb; c = sc; start = 1;
     @(negedge clk);
     start = 0;
@@ -259,6 +267,54 @@ module tb_fpu;
     chk64({32'hFFFFFFFF, 32'hDEADBEEF}, 5'd0);
     do_op(FPU_MV_F2X, 32'hCAFEBABE, 64'd0, RM_RNE, got, gff);
     chk64({32'hFFFFFFFF, 32'hCAFEBABE}, 5'd0);
+
+    // ---------------- Double-precision (rv64ud mirror) ----------------
+    is_double = 1; is_unsigned = 0; is_word = 0;
+    // FADD.D 2.5+1.0=3.5 / FSUB.D 2.5-1.0=1.5
+    do_op(FPU_FADD, 64'h4004000000000000, 64'h3FF0000000000000, RM_RNE, got, gff);
+    chk64(64'h400C000000000000, 5'd0);
+    do_op(FPU_FSUB, 64'h4004000000000000, 64'h3FF0000000000000, RM_RNE, got, gff);
+    chk64(64'h3FF8000000000000, 5'd0);
+    // FADD.D -1235.1+1.1=-1234.0 inexact
+    do_op(FPU_FADD, 64'hC0934C6666666666, 64'h3FF199999999999A, RM_RNE, got, gff);
+    chk64(64'hC093480000000000, 5'd1);
+    // FMUL.D 2.5*2.0=5.0 / FDIV.D 1.0/2.0=0.5 / FSQRT.D(4.0)=2.0
+    do_op(FPU_FMUL, 64'h4004000000000000, 64'h4000000000000000, RM_RNE, got, gff);
+    chk64(64'h4014000000000000, 5'd0);
+    do_op(FPU_FDIV, 64'h3FF0000000000000, 64'h4000000000000000, RM_RNE, got, gff);
+    chk64(64'h3FE0000000000000, 5'd0);
+    do_op(FPU_FSQRT, 64'h4010000000000000, 64'd0, RM_RNE, got, gff);
+    chk64(64'h4000000000000000, 5'd0);
+    // FMADD.D 1.0*2.5+1.0=3.5
+    do_op3(FPU_FMADD, 64'h3FF0000000000000, 64'h4004000000000000,
+           64'h3FF0000000000000, RM_RNE, got, gff);
+    chk64(64'h400C000000000000, 5'd0);
+    // FMIN.D/FMAX.D/FEQ.D/FLT.D/FCLASS.D
+    do_op(FPU_FMIN, 64'h4004000000000000, 64'h3FF0000000000000, RM_RNE, got, gff);
+    chk64(64'h3FF0000000000000, 5'd0);
+    do_op(FPU_FMAX, 64'h4004000000000000, 64'h3FF0000000000000, RM_RNE, got, gff);
+    chk64(64'h4004000000000000, 5'd0);
+    do_op(FPU_FEQ, 64'h3FF0000000000000, 64'h3FF0000000000000, RM_RNE, got, gff);
+    chk64(64'd1, 5'd0);
+    do_op(FPU_FLT, 64'h3FF0000000000000, 64'h4000000000000000, RM_RNE, got, gff);
+    chk64(64'd1, 5'd0);
+    do_op(FPU_CLASS, 64'h3FF0000000000000, 64'd0, RM_RNE, got, gff);
+    chk64(64'd1<<6, 5'd0);
+    // FCVT.D.W(2)=2.0 / FCVT.W.D(1.5,rtz)=1,NX / FCVT.S.D/FCVT.D.S roundtrip
+    do_op(FPU_I2F, 64'd2, 64'd0, RM_RNE, got, gff);
+    chk64(64'h4000000000000000, 5'd0);
+    do_op(FPU_F2I, 64'h3FF8000000000000, 64'd0, RM_RTZ, got, gff);
+    chk64(64'd1, FF_NX);
+    do_op(FPU_D2F, 64'hC0934C6666666666, 64'd0, RM_RNE, got, gff);
+    chk64({32'hFFFFFFFF, 32'hC49A6333}, 5'd1);
+    do_op(FPU_F2D, 64'hFFFFFFFFBFC00000, 64'd0, RM_RNE, got, gff);
+    chk64(64'hBFF8000000000000, 5'd0);
+    // FMV.D.X / FMV.X.D full-width copies
+    do_op(FPU_MV_X2F, 64'hDEADBEEFCAFEBABE, 64'd0, RM_RNE, got, gff);
+    chk64(64'hDEADBEEFCAFEBABE, 5'd0);
+    do_op(FPU_MV_F2X, 64'hCAFEBABEDEADBEEF, 64'd0, RM_RNE, got, gff);
+    chk64(64'hCAFEBABEDEADBEEF, 5'd0);
+    is_double = 0;
 
     $display("TOTAL errors=%0d tests=%0d %s", errors, tests, (errors==0) ? "PASS" : "FAIL");
     if (errors != 0) $fatal(1, "FPU unit test FAILED");

@@ -18,7 +18,7 @@ synthesis), not FPGA.
 | Zicsr / Zifencei | **DONE** | covered by suites above |
 | FPU fflags/frm/fcsr CSRs | **DONE** | move.S, fsflags readback |
 | SoC top + AXI4 fabric + DRAM model | **DONE** | core-level sim boot |
-| D extension (double-precision) | Partial (datapath exists, unverified) | — |
+| D extension (double-precision) | **DONE** | rv64ud 12/12 PASS |
 | C extension (RVC decompressor) | **DONE** | rv64uc/rvc PASS, tb_decompressor 44/44 |
 | A extension (LR/SC/AMO) | **DONE** | rv64ua 19/19 PASS |
 | L1 I$/D$, L2 caches | Not started | — |
@@ -36,8 +36,11 @@ single-cycle, FDIV/FSQRT iterative); fflags accumulate to CSR via WB.
 1. **C extension (rv64uc)** — **DONE**. `decompressor.sv` rewritten from the
    CVA6 reference (RV64+F); core handles `is_c` link (`pc+2`), straddling
    fetch (32-bit insn at offset 6), and reserved-encoding traps.
-2. **D extension (rv64ud)** — nearest win. Double-precision datapath
-   functions already in `fpu.sv`; test-and-fix. Completes "G".
+2. **D extension (rv64ud)** — **DONE** ("G" complete: IMAFD ✓). Double
+   datapath implemented in `fpu.sv` instruction-by-instruction
+   (add/sub/mul/div/sqrt/min/max/class/cmp/cvt/cvt_w/move/fmadd, plus
+   recoding/structural); also fixed `round_pack_d`, fused-op `fmt` decode,
+   `FCVT.S.D`/`D.S` decode aliasing, and single-precision NaN-boxing.
 3. **A extension (rv64ua)** — **DONE**. LR/SC reservation + AMO
    read-modify-write implemented in the MEM-stage LSU (single-hart
    atomicity, `aq/rl` ignored, AXI `lock` path still unconnected).
@@ -55,9 +58,10 @@ single-cycle, FDIV/FSQRT iterative); fflags accumulate to CSR via WB.
 
 Three levels, all driven by the upstream riscv-tests ISA suites:
 
-1. **Unit level** — `sim/verilator/tb_fpu.sv` (`make fpu`): 61 directed
-   vectors taken from rv64uf (fadd/fdiv/fmin/fcmp/fclass/fcvt/fcvt_w/move/
-   fmadd), checking result bits and exact fflags per op.
+1. **Unit level** — `sim/verilator/tb_fpu.sv` (`make fpu`): 79 directed
+   vectors (61 single from rv64uf + 18 double from rv64ud: add/sub/mul/
+   div/sqrt/min/max/cmp/class/cvt/move/fmadd), checking result bits and
+   exact fflags per op.
    `sim/verilator/tb_decompressor.sv` (`make decomp`): 44 directed vectors
    per RV64C encoding (assembler-captured), checking expanded bits, `is_c`,
    and `illegal`.
@@ -82,15 +86,16 @@ EXT=rv64um tools/scripts/run_isa_tests.sh   # 13/13
 EXT=rv64uf tools/scripts/run_isa_tests.sh   # 11/11
 EXT=rv64uc tools/scripts/run_isa_tests.sh   # 1/1 (rvc)
 EXT=rv64ua tools/scripts/run_isa_tests.sh   # 19/19
+EXT=rv64ud tools/scripts/run_isa_tests.sh   # 12/12
 
 # FPU unit testbench
-cd sim/verilator && make fpu      # 61/61 PASS
+cd sim/verilator && make fpu      # 79/79 PASS
 
 # Decompressor (RVC) unit testbench
 cd sim/verilator && make decomp   # 44/44 PASS
 ```
 
-Last full regression: rv64ui 50/50, rv64um 13/13, rv64uf 11/11, rv64uc 1/1 (rvc), rv64ua 19/19, tb_fpu 61/61, tb_decompressor 44/44.
+Last full regression: rv64ui 50/50, rv64um 13/13, rv64uf 11/11, rv64uc 1/1 (rvc), rv64ua 19/19, rv64ud 12/12, tb_fpu 79/79, tb_decompressor 44/44.
 
 ## RTL Directory Structure & Module Relationships
 
@@ -114,7 +119,7 @@ rtl/
 │   ├── mul_div/
 │   │   └── mdu.sv                # Multiply/Divide unit (iterative)
 │   ├── fpu/
-│   │   └── fpu.sv                # FPU: F verified, D datapath unverified
+│   │   └── fpu.sv                # FPU: F + D verified (single + double)
 │   ├── csr/
 │   │   └── csr_unit.sv           # CSRs: M/S-mode, fcsr, separate read port
 │   ├── issue/                    # Dual-issue logic (EMPTY, future)
@@ -177,7 +182,7 @@ VPU (RVV 1.0 + IME 1.0) ──┘
 ## ISA Support
 
 - **Base**: RV64I — **verified**
-- **Extensions**: M ✓, F ✓, Zicsr/Zifencei ✓ | D ~, C ✓, A ✓ | H planned
+- **Extensions**: M ✓, F ✓, D ✓, C ✓, A ✓ ("G" complete), Zicsr/Zifencei ✓ | H planned
 - **Vector**: RVV 1.0 (VLEN=256, ELEN=64) — planned, shared CPU AXI4 bus (no separate IF)
 - **Matrix**: IME 1.0 (shared VPU regfile) — planned, shared CPU AXI4 bus (no separate IF)
 

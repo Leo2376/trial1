@@ -425,7 +425,8 @@ module rv64gch_core #(
       OP_FPOP:   begin c.is_fp = 1'b1; {c.fp_fmt, c.fpu_op, c.wb_sel, c.fp_rm} = decode_fpu_op(i); end
       OP_FMADD, OP_FMSUB, OP_FNMSUB, OP_FNMADD: begin
                   c.is_fp = 1'b1; c.rs3 = i[31:27]; c.wb_sel = WB_FP;
-                  c.fp_fmt[0] = i[26];   // single/double precision
+                  // fmt lives in bits [26:25] (00=S, 01=D): double iff i[25].
+                  c.fp_fmt[0] = i[25];
                   c.fp_rm = i[14:12];
                   case (i[6:0])
                     OP_FMADD:  c.fpu_op = FPU_FMADD;
@@ -511,10 +512,14 @@ module rv64gch_core #(
                     5'd1, 5'd3: fop = FPU_F2I; // wu / lu (unsigned)
                     default: fop = FPU_NONE;
                   endcase end
-      6'b010000: begin // FCVT.S.D (f7=0100000) single dest from double src
-                  fmt[0] = 1'b0; fop = FPU_D2F; end
-      6'b010001: begin // FCVT.D.S (f7=0100001) double dest from single src
-                  fmt[0] = 1'b1; fop = FPU_F2D; end
+      // FCVT.S.D (f7=0100000, double src) and FCVT.D.S (f7=0100001,
+      // single src) share funct7[6:1]; f7[0] selects the direction.
+      6'b010000: begin
+                  if (f7[0]) begin // FCVT.D.S: double dest from single src
+                    fmt[0] = 1'b1; fop = FPU_F2D;
+                  end else begin    // FCVT.S.D: single dest from double src
+                    fmt[0] = 1'b0; fop = FPU_D2F;
+                  end end
       default: fop = FPU_NONE;
     endcase
     return {fmt, fop, wbs, rm};

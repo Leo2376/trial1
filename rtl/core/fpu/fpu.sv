@@ -93,7 +93,8 @@ module fpu #(
   );
     ff = '0;
     if (op == rtl_core_pkg::FPU_F2D) begin
-      return fcvt_d_s(a[31:0], rm, ff);
+      // Single source must be NaN-boxed; otherwise it reads as canonical NaN.
+      return fcvt_d_s((a[63:32] == 32'hFFFFFFFF) ? a[31:0] : CANON_S_NAN, rm, ff);
     end else if (op == rtl_core_pkg::FPU_D2F) begin
       logic [31:0] r32;
       r32 = fcvt_s_d(a, rm, ff);
@@ -104,11 +105,24 @@ module fpu #(
       logic [63:0] iv;
       iv = is_word ? a :
            is_unsigned ? {32'h0, a[31:0]} : {{32{a[31]}}, a[31:0]};
+      if (is_double)
+        return fcvt_int_d(iv, is_unsigned, rm, ff);
       return {{32{1'b1}}, fcvt_int_s(iv, is_unsigned, rm, ff)};
     end else if (is_double) begin
-      return compute_result_d(a[63:0], b[63:0], c[63:0], op, rm, ff);
+      return compute_result_d(a[63:0], b[63:0], c[63:0], op, rm, is_unsigned, is_word, ff);
     end else begin
-      return compute_result_s(a[31:0], b[31:0], c[31:0], op, rm, ff);
+      // RV64D NaN-boxing: a single-precision FP source whose upper 32 bits
+      // are not all 1s reads as the canonical NaN. Moves are exempt:
+      // FMV.X.W copies raw FP bits out, FMV.W.X copies raw integer bits in
+      // (integer sources are never boxed).
+      if (op == rtl_core_pkg::FPU_MV_F2X)
+        return {{32{a[31]}}, a[31:0]};
+      if (op == rtl_core_pkg::FPU_MV_X2F)
+        return {{32{1'b1}}, a[31:0]};
+      return compute_result_s((a[63:32] == 32'hFFFFFFFF) ? a[31:0] : CANON_S_NAN,
+                              (b[63:32] == 32'hFFFFFFFF) ? b[31:0] : CANON_S_NAN,
+                              (c[63:32] == 32'hFFFFFFFF) ? c[31:0] : CANON_S_NAN,
+                              op, rm, ff);
     end
   endfunction
 
@@ -122,6 +136,8 @@ module fpu #(
     input logic [63:0] c,
     input rtl_core_pkg::fpu_op_e op,
     input logic [2:0] rm,
+    input logic is_unsigned,
+    input logic is_word,
     output logic [4:0] ff
   );
     ff = '0;
@@ -133,6 +149,29 @@ module fpu #(
       rtl_core_pkg::FPU_FSQRT: return fsqrt_d(a, rm, ff);
       rtl_core_pkg::FPU_FMIN: return fmin_d(a, b, ff);
       rtl_core_pkg::FPU_FMAX: return fmax_d(a, b, ff);
+      rtl_core_pkg::FPU_FMADD:  return fmadd_d(a, b, c, 1'b0, 1'b0, rm, ff);
+      rtl_core_pkg::FPU_FMSUB:  return fmadd_d(a, b, c, 1'b0, 1'b1, rm, ff);
+      rtl_core_pkg::FPU_FNMSUB: return fmadd_d(a, b, c, 1'b1, 1'b0, rm, ff);
+      rtl_core_pkg::FPU_FNMADD: return fmadd_d(a, b, c, 1'b1, 1'b1, rm, ff);
+      rtl_core_pkg::FPU_FSGNJ: return fsgnj_d(a, b, ff);
+      rtl_core_pkg::FPU_FSGNJN: return fsgnjn_d(a, b, ff);
+      rtl_core_pkg::FPU_FSGNJX: return fsgnjx_d(a, b, ff);
+      rtl_core_pkg::FPU_FEQ: begin
+        ff = (is_snan_d(a) | is_snan_d(b)) ? FF_NV : 5'd0;
+        return {63'd0, feq_d(a, b)};
+      end
+      rtl_core_pkg::FPU_FLT: begin
+        ff = (is_nan_d(a) | is_nan_d(b)) ? FF_NV : 5'd0;
+        return {63'd0, flt_d(a, b)};
+      end
+      rtl_core_pkg::FPU_FLE: begin
+        ff = (is_nan_d(a) | is_nan_d(b)) ? FF_NV : 5'd0;
+        return {63'd0, flt_d(a, b) | feq_d(a, b)};
+      end
+      // Conversion ops (double precision):
+      //   FPU_I2F is routed in compute_result; FPU_F2I: fcvt.{w|wu|l|lu}.d.
+      rtl_core_pkg::FPU_F2I: return fcvt_d_int(a, is_unsigned, is_word, rm, ff);
+      rtl_core_pkg::FPU_CLASS: return {54'd0, fclass_d(a)};
       // Double moves copy the full 64-bit pattern (no NaN-boxing).
       rtl_core_pkg::FPU_MV_F2X: return a;
       rtl_core_pkg::FPU_MV_X2F: return a;
@@ -697,6 +736,7 @@ module fpu #(
     logic sga, sgb; logic [7:0] ea, eb; logic [23:0] ma, mb;
     logic [47:0] prod; logic [27:0] F; logic signed [9:0] eout; logic [4:0] f;
     logic stk;
+    logic signed [9:0] Ea, Eb; integer La, Lb, k;
     f = 5'd0;
     if (is_nan_s(sxa) | is_nan_s(sxb)) begin
       if (is_snan_s(sxa) | is_snan_s(sxb)) f = f | FF_NV;
@@ -709,13 +749,28 @@ module fpu #(
     // Zero x finite = signed zero (IEEE: exact, no flags).
     if (is_zero_s(sxa) | is_zero_s(sxb)) begin ff = f; return {sga ^ sgb, 32'd0}; end
     ea = sxa[30:23]; eb = sxb[30:23];
-    ma = (ea==8'd0) ? {1'b0, sxa[22:0]} : {1'b1, sxa[22:0]};
-    mb = (eb==8'd0) ? {1'b0, sxb[22:0]} : {1'b1, sxb[22:0]};
-    if (ea==8'd0) ea = 8'd1;
-    if (eb==8'd0) eb = 8'd1;
+    ma = {1'b1, sxa[22:0]}; mb = {1'b1, sxb[22:0]};
+    Ea = $signed({2'b00, ea}) - 10'sd127;
+    Eb = $signed({2'b00, eb}) - 10'sd127;
+    // Normalize subnormal inputs (reached here only when nonzero): leading 1
+    // to bit 23, unbiased exponent E = L - 149.
+    if (ea==8'd0) begin
+      La = -1;
+      for (k = 22; k >= 0; k = k - 1)
+        if (sxa[k] && La < 0) La = k;
+      ma = {1'b1, sxa[22:0] << (23-La)};
+      Ea = La - 149;
+    end
+    if (eb==8'd0) begin
+      Lb = -1;
+      for (k = 22; k >= 0; k = k - 1)
+        if (sxb[k] && Lb < 0) Lb = k;
+      mb = {1'b1, sxb[22:0] << (23-Lb)};
+      Eb = Lb - 149;
+    end
     // Product range [1.0,4.0): ma,mb are 1.x (24-bit, implicit at bit 23), so
     // prod leading bit is 46 (value in [1.0,2.0)) or 47 (value in [2.0,4.0)).
-    eout = $signed({2'b00, ea} + {2'b00, eb} - 10'd127);
+    eout = Ea + Eb + 10'sd127;
     prod = ma * mb;   // 48-bit
     if (prod[47]) begin
       // value in [2.0,4.0) = 2 * [1.0,2.0): normalize by shifting right 1 and
@@ -1071,6 +1126,25 @@ module fpu #(
     return a;
   endfunction
 
+  // FSGNJ double family: all bits except the sign come from rs1 (a).
+  function automatic logic [63:0] fsgnj_d(input logic [63:0] a, input logic [63:0] b,
+                                          output logic [4:0] ff);
+    ff = 5'd0;
+    return {b[63], a[62:0]};
+  endfunction
+
+  function automatic logic [63:0] fsgnjn_d(input logic [63:0] a, input logic [63:0] b,
+                                           output logic [4:0] ff);
+    ff = 5'd0;
+    return {~b[63], a[62:0]};
+  endfunction
+
+  function automatic logic [63:0] fsgnjx_d(input logic [63:0] a, input logic [63:0] b,
+                                           output logic [4:0] ff);
+    ff = 5'd0;
+    return {a[63] ^ b[63], a[62:0]};
+  endfunction
+
   // FSGNJ family: all bits except the sign come from rs1 (a); the sign is
   // rs2's (b) sign, its inverse, or the XOR of both. No flags, no NaN
   // canonicalization.
@@ -1090,6 +1164,24 @@ module fpu #(
                                            output logic [4:0] ff);
     ff = 5'd0;
     return {a[31] ^ b[31], a[30:0]};
+  endfunction
+
+  // FCLASS double - classify into the 10-bit mask (same bit order as single).
+  function automatic logic [9:0] fclass_d(input logic [63:0] a);
+    logic [9:0] cls;
+    cls = 10'd0;
+    if (is_nan_d(a)) begin
+      cls = is_snan_d(a) ? 10'b0100000000 : 10'b1000000000;
+    end else if (is_inf_d(a)) begin
+      cls = a[63] ? 10'b0000000001 : 10'b0010000000;
+    end else if (is_zero_d(a)) begin
+      cls = a[63] ? 10'b0000001000 : 10'b0000010000;
+    end else if (a[62:52] == 11'd0) begin
+      cls = a[63] ? 10'b0000000100 : 10'b0000100000;
+    end else begin
+      cls = a[63] ? 10'b0000000010 : 10'b0001000000;
+    end
+    return cls;
   endfunction
 
   // FCLASS - classify into the 10-bit mask:
@@ -1117,83 +1209,263 @@ module fpu #(
   // Conversion operations
   // =========================================================================
 
-  // FCVT.S.D - convert double to single
+  // FCVT.S.D - convert double to single. Normalized 53-bit significand
+  // m53 feeds round_pack_s with its leading 1 at F[26]; exponent is
+  // clamped so the packer's overflow/underflow paths trigger correctly.
   function automatic logic [31:0] fcvt_s_d(input logic [63:0] d,
                                             input logic [2:0] rmode,
                                             output logic [4:0] ff);
-    logic [63:0] sgn_d, exp_d, frac_d;
-    logic [31:0] sgn_s, exp_s, frac_s;
-    logic [10:0] exp_bias;
-    logic [52:0] frac_full;
+    logic sgn;
+    logic [10:0] exp_d;
+    logic [51:0] frac_d;
+    logic [52:0] m53;
     logic [27:0] F;
+    logic signed [11:0] Eb;
     logic signed [9:0] eout;
-    
+    integer L, k;
+
     ff = 5'd0;
-    
+
     if (is_nan_d(d)) begin
       if (is_snan_d(d)) ff = FF_NV;
       return CANON_S_NAN;
     end
     if (is_inf_d(d)) return d[63] ? S_INF_N : S_INF_P;
     if (is_zero_d(d)) return d[63] ? 32'h80000000 : 32'h00000000;
-    
-    // Extract double components
-    sgn_d = d[63];
+
+    sgn = d[63];
     exp_d = d[62:52];
     frac_d = d[51:0];
-    
-    // Convert exponent: double bias 1023 -> single bias 127
-    exp_bias = {1'b0, exp_d} - 11'd1023 + 11'd127;
-    
-    // Combine fraction with implicit bit
-    frac_full = {1'b1, frac_d};
-    
-    // Shift fraction right by (52-23)=29 bits to get 24-bit single fraction
-    // with guard/round/sticky
-    F = {frac_full[52:25], 1'b0} | {27'd0, (|frac_full[24:0])};
-    F[0] = F[0] | (|frac_full[24:0]);
-    
-    eout = $signed(exp_bias);
-    
-    return round_pack_s(sgn_d, eout, F, rmode, ff);
+
+    if (exp_d == 11'd0) begin
+      // Denormal input: normalize (L = leading-1 position), E = L - 1074.
+      L = -1;
+      for (k = 51; k >= 0; k = k - 1)
+        if (frac_d[k] && L < 0) L = k;
+      m53 = ({1'b0, frac_d} << (52 - L));
+      Eb = L - 1074;
+    end else begin
+      m53 = {1'b1, frac_d};
+      Eb = $signed({1'b0, exp_d}) - 12'sd1023;
+    end
+
+    // 28-bit field: F[27]=0, F[26]=implicit 1, F[25:3]=frac, g/r/s below.
+    F = {1'b0, m53[52:27], 1'b0};
+    F[0] = F[0] | (|m53[26:0]);
+
+    // Clamp to the packer's tractable range: Eb > 127 overflows to inf;
+    // Eb < -154 always flushes to zero (magnitude < 2^-154); in between,
+    // the packer's denormal path forms single subnormals.
+    if (Eb > 12'sd127) eout = 10'sd255;
+    else if (Eb < -12'sd154) begin
+      ff = FF_UF | FF_NX; return {sgn, 31'd0};
+    end
+    else eout = Eb + 127;
+
+    return round_pack_s(sgn, eout, F, rmode, ff);
   endfunction
 
-  // FCVT.D.S - convert single to double
+  // FCVT.D.S - convert single to double. Widening is always exact: pack
+  // directly (no rounding). Denormal inputs are normalized explicitly.
   function automatic logic [63:0] fcvt_d_s(input logic [31:0] s,
                                             input logic [2:0] rmode,
                                             output logic [4:0] ff);
-    logic [31:0] sgn_s, exp_s, frac_s;
-    logic [63:0] sgn_d, exp_d, frac_d;
-    logic [11:0] exp_bias;
-    logic [58:0] F;
-    
+    logic sgn_s;
+    logic [7:0] exp_s;
+    logic [22:0] frac_s;
+    logic signed [11:0] Eb;
+    logic [51:0] frac_d;
+    integer L, k;
+
     ff = 5'd0;
-    
+
     if (is_nan_s(s)) begin
       if (is_snan_s(s)) ff = FF_NV;
       return CANON_D_NAN;
     end
     if (is_inf_s(s)) return s[31] ? D_INF_N : D_INF_P;
     if (is_zero_s(s)) return s[31] ? 64'h8000000000000000 : 64'h0000000000000000;
-    
-    // Extract single components
+
     sgn_s = s[31];
     exp_s = s[30:23];
     frac_s = s[22:0];
-    
-    // Convert exponent: single bias 127 -> double bias 1023
-    exp_bias = {3'b000, exp_s} - 8'd127 + 8'd1023;
-    
-    // Expand fraction to 53 bits (52 explicit + 1 implicit)
-    frac_d = {frac_s, 29'd0};
-    
-    // Build 59-bit field for double rounding
-    F = {1'b1, frac_d, 5'b0};
-    
-    return round_pack_d(sgn_s, exp_bias, F, rmode, ff);
+
+    if (exp_s == 8'd0) begin
+      // Denormal: normalize (L = leading-1 position), E = L - 149.
+      L = -1;
+      for (k = 22; k >= 0; k = k - 1)
+        if (frac_s[k] && L < 0) L = k;
+      Eb = L - 149;
+      frac_d = {frac_s << (23 - L), 29'd0};
+    end else begin
+      Eb = $signed({4'b0000, exp_s}) - 12'sd127;
+      frac_d = {frac_s, 29'd0};
+    end
+
+    return {sgn_s, Eb[10:0] + 11'd1023, frac_d};
   endfunction
 
   // =========================================================================
+  // FMADD double: fused multiply-add with a single rounding step. Exact
+  // 106-bit product of the 53-bit significands is aligned with the addend
+  // in a 190-bit field (product leading bit fixed at bit DFMA_T), low bits
+  // compress into a sticky, and the normalized sum is rounded once via
+  // round_pack_d. Scaled from fmadd_s (132-bit field, T=129).
+  localparam int DFMA_T = 187;
+  function automatic logic [63:0] fmadd_d(input logic [63:0] a, input logic [63:0] b,
+                                          input logic [63:0] c,
+                                          input logic        neg_prod,
+                                          input logic        sub_c,
+                                          input logic [2:0]  rmode,
+                                          output logic [4:0] ff);
+    logic sga, sgb, sgc, sgprod, sgc_eff, eff_sub, sgout;
+    logic prod_zero, cz;
+    logic [10:0] ea, eb, ec;
+    logic [52:0] ma, mb, mc;
+    logic [105:0] prod, pn;
+    logic [189:0] bigF, smlF, sumF;
+    integer e_p, e_c, d, dm, expn, L, i;
+    logic stk;
+    logic [58:0] F;
+    logic signed [12:0] eb_out;
+    logic [11:0] eb12;
+    logic [4:0] f;
+    logic [63:0] mr;
+
+    f = 5'd0;
+    if (is_nan_d(a) | is_nan_d(b) | is_nan_d(c)) begin
+      if (is_snan_d(a) | is_snan_d(b) | is_snan_d(c)) f = f | FF_NV;
+      ff = f; return CANON_D_NAN;
+    end
+    sga = a[63]; sgb = b[63]; sgc = c[63];
+    sgprod  = sga ^ sgb ^ neg_prod;
+    sgc_eff = sgc ^ sub_c;
+    prod_zero = (a[62:52] == 11'd0) | (b[62:52] == 11'd0);
+    cz        = (c[62:52] == 11'd0);
+
+    if ((is_inf_d(a) & is_zero_d(b)) | (is_zero_d(a) & is_inf_d(b))) begin
+      f = f | FF_NV; ff = f; return CANON_D_NAN;
+    end
+    if (is_inf_d(a) | is_inf_d(b)) begin
+      if (is_inf_d(c) & (sgc_eff != sgprod)) begin
+        f = f | FF_NV; ff = f; return CANON_D_NAN;
+      end
+      ff = f; return {sgprod, 11'h7FF, 52'd0};
+    end
+    if (is_inf_d(c)) begin ff = f; return c; end
+
+    if (prod_zero) begin
+      // Product is (signed) zero: the result is the addend alone (a zero
+      // addend yields the zero-sign rule).
+      if (cz) begin
+        ff = f; return {sgprod & sgc_eff, 63'd0};
+      end
+      ff = f; return sgc_eff ? {1'b1, c[62:0]} : c;
+    end
+    if (cz) begin
+      // Addend is zero: the rounded product alone, with the product sign.
+      mr = fmul_d(a, b, rmode, ff);
+      return {sgprod, mr[62:0]};
+    end
+
+    ea = a[62:52]; eb = b[62:52]; ec = c[62:52];
+    ma = {1'b1, a[51:0]}; mb = {1'b1, b[51:0]}; mc = {1'b1, c[51:0]};
+    prod = ma * mb;                       // exact 106-bit product
+    // Normalize the product so pn[105] is the leading one: pn in [2^105,2^106)
+    // with value P = pn * 2^expn.
+    if (prod[105]) begin pn = prod;      expn = (ea - 1023) + (eb - 1023) - 104; end
+    else           begin pn = {prod[104:0], 1'b0}; expn = (ea - 1023) + (eb - 1023) - 105; end
+    e_p = expn + 105;   // unbiased exponent of the product
+    e_c = ec - 1023;    // unbiased exponent of the addend
+    d  = e_p - e_c;
+    dm = -d;
+
+    eff_sub = sgprod ^ sgc_eff;
+    stk = 1'b0;
+    if (d >= 0) begin
+      // Product is the larger-magnitude operand: pn[105] at field bit T.
+      bigF = 190'd0;
+      bigF[DFMA_T -: 106] = pn;
+      if (d <= DFMA_T - 53) begin
+        // Addend fully inside the field: mc[52] at bit T-d.
+        smlF = 190'd0;
+        smlF[DFMA_T-d -: 53] = mc;
+      end else if (d <= DFMA_T) begin
+        // Low bits of mc shift out below bit 0; compress them into sticky.
+        smlF = 190'(mc) >> (d - (DFMA_T - 52));
+        stk  = |(mc & ((190'd1 << (d - (DFMA_T - 52))) - 1));
+      end else begin
+        smlF = 190'd0;
+        stk  = |mc;
+      end
+      if (stk) smlF[0] = 1'b1;
+      if (!eff_sub) begin
+        sumF = bigF + smlF;
+        sgout = sgprod;
+      end else if (bigF >= smlF) begin
+        sumF = bigF - smlF;
+        sgout = sgprod;
+      end else begin
+        sumF = smlF - bigF;
+        sgout = sgc_eff;
+      end
+    end else begin
+      // Addend is the larger-magnitude operand: mc[52] at field bit T.
+      bigF = 190'd0;
+      bigF[DFMA_T -: 53] = mc;
+      if (dm <= DFMA_T - 106) begin
+        // Product fully inside the field: pn[105] at bit T-dm.
+        smlF = 190'd0;
+        smlF[DFMA_T-dm -: 106] = pn;
+      end else if (dm <= DFMA_T) begin
+        smlF = 190'(pn) >> (dm - (DFMA_T - 105));
+        stk  = |(pn & ((190'd1 << (dm - (DFMA_T - 105))) - 1));
+      end else begin
+        smlF = 190'd0;
+        stk  = |pn;
+      end
+      if (stk) smlF[0] = 1'b1;
+      if (!eff_sub) begin
+        sumF = bigF + smlF;
+        sgout = sgc_eff;
+      end else if (bigF >= smlF) begin
+        sumF = bigF - smlF;
+        sgout = sgc_eff;
+      end else begin
+        sumF = smlF - bigF;
+        sgout = sgprod;
+      end
+    end
+
+    if (sumF == 190'd0) begin
+      // Exact cancellation: +0 except under RDN (-0).
+      ff = f; return {(rmode == RM_RDN), 63'd0};
+    end
+
+    // Leading-one position (sum can carry up to two bits above T).
+    L = 190;
+    for (i = 189; i >= 0; i = i - 1)
+      if ((L == 190) && sumF[i]) L = i;
+
+    // Biased exponent: field bit T has weight 2^larger_exp, so the sum's
+    // unbiased exponent is larger_exp + (L - T).
+    if (d >= 0) eb_out = e_p + (L - DFMA_T) + 1023;
+    else        eb_out = e_c + (L - DFMA_T) + 1023;
+
+    // Normalize so the leading one lands on bit 189, then slice the 59-bit
+    // round field: F[55]=leading 1, F[54:3]=52-bit fraction, G/R/sticky below.
+    sumF = sumF << (189 - L);
+    F = {3'b0, sumF[189:137], sumF[136], sumF[135], |sumF[134:0]};
+
+    // Clamp the biased exponent into the packer's 12-bit range: values above
+    // the double max can only come from true overflow (biased > 2046).
+    if (eb_out > 13'sd2046) eb12 = 12'h7FF;
+    else eb12 = eb_out[11:0];
+
+    ff = f;
+    return round_pack_d(sgout, eb12, F, rmode, ff);
+  endfunction
+
   // FMADD family: fused single-precision multiply-add with a single
   // rounding step (IEEE fused semantics, no double rounding). The exact
   // 48-bit product of the 24-bit significands is aligned with the addend in
@@ -1358,6 +1630,51 @@ module fpu #(
   // FCVT int to single: is_word=1 treats the integer as 64-bit (L/LU),
   // is_word=0 as 32-bit (W/WU, sign- or zero-extended). Unsigned inputs use
   // the magnitude directly. Rounds per rmode; sets NX when inexact.
+  // FCVT int to double (mirror of fcvt_int_s with the 59-bit double field:
+  // mantissa leading 1 at bit 63 maps to field bit 55, i.e. shift right 8).
+  function automatic logic [63:0] fcvt_int_d(input logic [63:0] int_val,
+                                             input logic        is_unsigned,
+                                             input logic [2:0] rmode,
+                                             output logic [4:0] ff);
+    logic [63:0] mag;
+    logic        sgn;
+    logic [63:0] mant;
+    integer      leading_zeros;
+    logic signed [12:0] eout;
+    logic [58:0] F;
+    logic        stk;
+
+    ff = 5'd0;
+    if (int_val == 64'd0) return 64'h0000000000000000;
+
+    if (is_unsigned) begin
+      sgn = 1'b0;
+      mag = int_val;
+    end else begin
+      sgn = int_val[63];
+      mag = sgn ? (~int_val + 64'd1) : int_val;
+    end
+    if (mag == 64'd0) return sgn ? 64'h8000000000000000 : 64'h0000000000000000;
+
+    leading_zeros = 0;
+    for (integer i = 63; i >= 0; i = i - 1) begin
+      if (mag[i] == 1'b0) leading_zeros = leading_zeros + 1;
+      else break;
+    end
+    mant = mag << leading_zeros;
+
+    // unbiased exponent of the leading 1
+    eout = 13'sd63 - leading_zeros;
+    // Field: mant's leading 1 is at bit 63; the significand maps to
+    // F[55:4] (52 frac bits), guard F[3]... i.e. shift right 8 with the
+    // low 8 bits folded into sticky. F[0] collects the sticky.
+    F  = 59'(mant >> 8);
+    stk = |mant[7:0];
+    F[0] = F[0] | stk;
+    eout = eout + 13'sd1023;
+    return round_pack_d(sgn, eout[11:0], F, rmode, ff);
+  endfunction
+
   function automatic logic [31:0] fcvt_int_s(input logic [63:0] int_val,
                                             input logic        is_unsigned,
                                             input logic [2:0] rmode,
@@ -1401,6 +1718,97 @@ module fpu #(
     F[0] = F[0] | stk;
     eout = eout + 10'sd127;
     return round_pack_s(sgn, eout, F, rmode, ff);
+  endfunction
+
+  // FCVT double to int with RISC-V saturation semantics (mirror of
+  // fcvt_s_int with a 53-bit significand and double bias).
+  function automatic logic [63:0] fcvt_d_int(input logic [63:0] d,
+                                             input logic        is_unsigned,
+                                             input logic        is_word,
+                                             input logic [2:0] rmode,
+                                             output logic [4:0] ff);
+    logic        sgn, subnorm;
+    logic [10:0] exp;
+    logic [51:0] frac;
+    logic [63:0] v64, mag, result;
+    logic [52:0] v53;
+    logic        inexact, out_of_range;
+    integer      e, sh;
+    logic        g, r, st, round_up;
+    logic [63:0] max_pos, max_neg;
+
+    ff = 5'd0;
+    if (is_nan_d(d)) begin
+      ff = FF_NV;
+      return is_unsigned ? 64'hFFFFFFFFFFFFFFFF :
+             (is_word ? 64'h7FFFFFFFFFFFFFFF : 64'h000000007FFFFFFF);
+    end
+    sgn = d[63]; exp = d[62:52]; frac = d[51:0];
+    if (is_unsigned) begin
+      max_pos = 64'hFFFFFFFFFFFFFFFF; max_neg = 64'd0;
+    end else if (is_word) begin
+      max_pos = 64'h7FFFFFFFFFFFFFFF; max_neg = 64'h8000000000000000;
+    end else begin
+      max_pos = 64'h000000007FFFFFFF; max_neg = 64'hFFFFFFFF80000000;
+    end
+    if (is_inf_d(d)) begin
+      ff = FF_NV;
+      return sgn ? max_neg : max_pos;
+    end
+    if (is_zero_d(d)) return 64'd0;
+
+    // Value = v53 * 2^(e-52): v53 is the 53-bit significand ({1,frac} for
+    // normals, {0,frac} for subnormals with e biased accordingly).
+    subnorm = (exp == 11'd0);
+    v53 = subnorm ? {1'b0, frac} : {1'b1, frac};
+    v64 = {11'd0, v53};
+    e = subnorm ? -1022 : (exp - 1023);
+    inexact = 1'b0;
+    if (e > 63) begin
+      // value >= 2^64: out of range for every destination
+      ff = FF_NV;
+      return sgn ? max_neg : max_pos;
+    end
+    sh = 52 - e;
+    if (sh > 0) begin
+      if (sh >= 54) begin
+        mag = 64'd0;
+        g = 1'b0; r = 1'b0; st = |v64;
+      end else begin
+        mag = v64 >> sh;
+        g = (v64 >> (sh-1)) & 64'd1;
+        r = (sh >= 2) ? ((v64 >> (sh-2)) & 64'd1) : 1'b0;
+        st = (sh >= 3) ? (|(v64 & ((64'd1 << (sh-2)) - 1))) : 1'b0;
+      end
+      inexact = g | r | st;
+      round_up = 1'b0;
+      if (inexact) begin
+        case (rmode)
+          RM_RNE: round_up = g & (r | st | mag[0]);
+          RM_RTZ: round_up = 1'b0;
+          RM_RDN: round_up = sgn & (g | r | st);
+          RM_RUP: round_up = ~sgn & (g | r | st);
+          RM_RMM: round_up = g;
+          default: round_up = g & (r | st | mag[0]);
+        endcase
+        mag = mag + (round_up ? 64'd1 : 64'd0);
+      end
+    end else begin
+      // e in [52,63]: v64 << (e-52), value <= 2^64, fits the range check
+      mag = v64 << (e - 52);
+    end
+    if (inexact) ff = ff | FF_NX;
+
+    // Range check on the rounded magnitude, then apply the sign.
+    if (sgn) out_of_range = (mag > (~max_neg + 64'd1));
+    else     out_of_range = (mag > max_pos);
+    if (out_of_range) begin
+      ff = FF_NV;
+      return sgn ? max_neg : max_pos;
+    end
+    result = sgn ? (~mag + 64'd1) : mag;
+    if (!is_word) result = {{32{result[31]}}, result[31:0]};
+    return result;
   endfunction
 
   // FCVT single to int with RISC-V saturation semantics: NaN, +/-Inf and
