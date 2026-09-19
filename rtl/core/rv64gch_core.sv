@@ -28,7 +28,22 @@ module rv64gch_core #(
   input  logic             mem_err,
   output logic [31:0]      dbg_pc,
   // Single-cycle pulse when a FENCE.I retires at WB (for L1I invalidation).
-  output logic             fence_i_o
+  output logic             fence_i_o,
+  // SFENCE.VMA retire pulse (TLB + L1D-drain trigger in the MMU stage).
+  output logic             sfence_o,
+  // Pulse when a SATP write retires at WB (TLB + L1D-drain trigger).
+  output logic             satp_we_o,
+  // L1D drain sweep in progress (SFENCE/SATP/FENCE.I writeback): stall.
+  input  logic             drain_busy_i,
+  // Walker memory port (physical; top routes to L2 port C).
+  output logic             ptw_req,
+  output logic             ptw_we,
+  output logic [47:0]      ptw_addr,
+  output logic [7:0]       ptw_be,
+  output logic [63:0]      ptw_wdata,
+  input  logic [63:0]      ptw_rdata,
+  input  logic             ptw_ack,
+  input  logic             ptw_ready
 );
   import rtl_core_pkg::*;
   import rv64gch_memmap_pkg::RESET_PC;
@@ -62,6 +77,7 @@ module rv64gch_core #(
   logic            redirect;
   logic [63:0]     redirect_target;
   logic [63:0]     csr_rdata;
+  logic [63:0]     csr_mstatus, csr_satp; // consumed by the MMU stage
   logic            csr_we, trap, mret_x, sret_x;
   logic [4:0]      cause;
   logic [63:0]     epc, tvec;
@@ -81,6 +97,9 @@ module rv64gch_core #(
     ctrl_t       ctrl;
     logic        is_c;
     logic        illegal_c;
+    logic        fault_f;   // fetch translation fault bubble
+    logic [4:0]  fcause;
+    logic [63:0] fva;
     logic [63:0] rs1;
     logic [63:0] rs2;
     logic [63:0] fa;
@@ -122,7 +141,23 @@ module rv64gch_core #(
 
   assign dbg_pc = pc_d;
 
-  assign priv = PRIV_M;
+  // Real privilege state (was hardwired M). mret/sret retire at WB while
+  // the CSR unit computes new_priv a cycle later, so the update is picked
+  // up delayed by one cycle; traps go to M immediately. No test changes
+  // priv yet (Bare M-mode), so this is behavior-neutral for now.
+  logic priv_upd_d;
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      priv <= PRIV_M;
+      priv_upd_d <= 1'b0;
+    end else if (trap) begin
+      priv <= PRIV_M;
+      priv_upd_d <= 1'b0;
+    end else begin
+      priv_upd_d <= wb_pkt.ctrl.is_mret | wb_pkt.ctrl.is_sret;
+      if (priv_upd_d) priv <= new_priv;
+    end
+  end
 
   assign next_pc = (redirect) ? redirect_target :
                   (fetch_is_c) ? (pc_f + 16'd2) : (pc_f + 64'd4);
@@ -207,15 +242,32 @@ module rv64gch_core #(
   // ignored. For a 32-bit instruction at byte offset 6 the window straddles
   // two 64-bit words, so fetch_res_valid waits for the second word.
   assign fetch_done    = fetch_res_valid & ~stall;
-  assign fetch_req     = valid_f & fetch_ready & ~stall & ~fetch_busy & ~fetch_res_valid;
+  // Fetch virtual address: the straddling second word is translated
+  // independently (it can sit on another page).
+  logic [63:0] fetch_va;
+  logic        fetch_second;
+  assign fetch_second = fetch_complete & ~fetch_hi_valid &
+                        (fetch_pc_q[47:3] == pc_f[47:3]) &
+                        (pc_f[2:1] == 2'b11);
+  assign fetch_va = fetch_second ? ({pc_f[63:3], 3'b0} + 64'd8) : pc_f;
+  // MMU translate (PIPT: caches see physical addresses only).
+  logic        mmu_hit_f, mmu_miss_f, mmu_fault_f;
+  logic [47:0] mmu_pa_f;
+  logic [4:0]  mmu_cause_f;
+  // fetch_req additionally waits on translation: miss holds for the walker,
+  // fault takes the bubble path below (never issues a bad address).
+  assign fetch_req     = valid_f & fetch_ready & ~stall & ~fetch_busy & ~fetch_res_valid &
+                         mmu_hit_f;
   assign fetch_we      = 1'b0;
-  // Second word of a straddling fetch: next 64-bit aligned word.
-  assign fetch_addr    = (fetch_complete & ~fetch_hi_valid &
-                          (fetch_pc_q[47:3] == pc_f[47:3]) &
-                          (pc_f[2:1] == 2'b11)) ?
-                         ({pc_f[47:3], 3'b0} + 48'd8) : pc_f;
+  assign fetch_addr    = mmu_pa_f;
   assign fetch_be      = 8'hFF;
   assign fetch_wdata   = '0;
+  // Fetch translation-fault bubble: latched once per faulting pc_f, then
+  // consumed into D like an instruction (pc_f frozen meanwhile). The trap
+  // fires from EX; flush_all clears the latch on redirect/trap.
+  logic        fault_f_q;
+  logic [4:0]  fcause_q;
+  logic [63:0] fva_q;
 
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
@@ -226,12 +278,27 @@ module rv64gch_core #(
       fetch_pc_q     <= '0;
       fetch_hi_q     <= '0;
       fetch_hi_valid <= 1'b0;
+      fault_f_q      <= 1'b0;
+      fcause_q       <= '0;
+      fva_q          <= '0;
     end else if (flush_all) begin
       fetch_busy     <= 1'b0;
       fetch_complete <= 1'b0;
       fetch_hi_valid <= 1'b0;
       valid_f        <= 1'b1;
+      fault_f_q      <= 1'b0;
     end else begin
+      // Grab a translation fault once per faulting pc (bubble path);
+      // release it once the F->D stage consumes the bubble. A lingering
+      // fault re-arms next cycle, but the first bubble already traps and
+      // flushes, so duplicates never survive.
+      if (!stall && !fault_f_q && mmu_fault_f) begin
+        fault_f_q <= 1'b1;
+        fcause_q  <= mmu_cause_f;
+        fva_q     <= fetch_va;
+      end else if (!stall && fault_f_q && !fetch_done) begin
+        fault_f_q <= 1'b0;
+      end
       // Latch the returned word on completion so it survives a stall.
       // The first ack fills the low word; if the instruction straddles
       // (32-bit at offset 6) a second ack fills the high word. Busy tracks
@@ -242,7 +309,7 @@ module rv64gch_core #(
         fetch_busy <= 1'b0;
         if (!fetch_complete) begin
           fetch_word_q   <= fetch_rdata;
-          fetch_pc_q     <= fetch_addr;
+          fetch_pc_q     <= pc_f;
           fetch_complete <= 1'b1;
         end else begin
           fetch_hi_q     <= fetch_rdata;
@@ -264,11 +331,16 @@ module rv64gch_core #(
   assign instr_f = instr_d_use;
 
   logic illegal_c_d;
+  logic fault_d;
+  logic [4:0]  fcause_d;
+  logic [63:0] fva_d;
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       valid_d <= 1'b0; pc_d <= '0; instr_d <= '0; is_c_d <= 1'b0; illegal_c_d <= 1'b0;
+      fault_d <= 1'b0; fcause_d <= '0; fva_d <= '0;
     end else if (flush_all) begin
       valid_d <= 1'b0;
+      fault_d <= 1'b0;
     end else if (!stall) begin
       if (fetch_done) begin
         valid_d <= valid_f;
@@ -276,8 +348,21 @@ module rv64gch_core #(
         is_c_d  <= fetch_is_c;
         instr_d <= instr_d_use;
         illegal_c_d <= illegal_d_use;
+        fault_d <= 1'b0;
+      end else if (fault_f_q) begin
+        // Translation-fault bubble: flows like an insn, traps from EX.
+        // pc_d carries the faulting VA; instr is a benign NOP.
+        valid_d <= 1'b1;
+        pc_d    <= fva_q;
+        is_c_d  <= 1'b1;
+        instr_d <= 32'h00000013;
+        illegal_c_d <= 1'b0;
+        fault_d <= 1'b1;
+        fcause_d <= fcause_q;
+        fva_d   <= fva_q;
       end else begin
         valid_d <= 1'b0;
+        fault_d <= 1'b0;
       end
     end
   end
@@ -379,6 +464,9 @@ module rv64gch_core #(
                       else if (i[31:20] == 12'h302) c.is_mret = 1'b1;
                       else if (i[31:20] == 12'h102) c.is_sret = 1'b1;
                       else if (i[31:20] == 12'h105) c.is_wfi = 1'b1;
+                      // SFENCE.VMA rs1,rs2: funct7=0001001, rd must be x0.
+                      else if ((i[31:25] == 7'b0001001) && (i[11:7] == 5'd0))
+                        c.is_sfence = 1'b1;
                     end
                     default: begin
                       // All CSR ops read; all may write. CSRRS/CSRRC only
@@ -537,7 +625,11 @@ module rv64gch_core #(
       OP_LUI, OP_AUIPC: r = {{32{i[31]}}, i[31:12], 12'b0};
       OP_JAL:  r = {{44{i[31]}}, i[19:12], i[20], i[30:21], 1'b0};
       OP_JALR: r = {{52{i[31]}}, i[31:20]};
-      OP_BRANCH:r = {{51{i[31]}}, i[7], i[30:25], i[11:8], 1'b0};
+      // B-type: {imm12=i[31], imm11=i[7], imm10:5=i[30:25],
+      // imm4:1=i[11:8], 0} = 13 bits + 51 sign bits = 64. (Was 63 bits:
+      // the explicit imm12 copy was missing, so bit 63 read 0 and every
+      // backward branch jumped wild. Forward-only suites never caught it.)
+      OP_BRANCH:r = {{51{i[31]}}, i[31], i[7], i[30:25], i[11:8], 1'b0};
       OP_LOAD, OP_SYSTEM, OP_FPLOAD, OP_FENCE:
                r = {{52{i[31]}}, i[31:20]};
       OP_OPIMM:
@@ -647,7 +739,26 @@ module rv64gch_core #(
     .is_csr_op(dc.writes_csr), .csr_hazard(load_use_hazard_csr),
     .stall(stall_raw), .flush_id(flush_id), .flush_ex(flush_ex)
   );
-  assign stall = stall_raw | frm_stall;
+  // A data-TLB miss stalls the whole pipe for the walker (fetch only
+  // waits for its own translation at issue; it needs no stall term).
+  logic dtlb_miss;
+  assign dtlb_miss = mmu_miss_d;
+  assign stall = stall_raw | frm_stall | drain_busy_i | dtlb_miss;
+  `ifdef CORE_DEBUG
+  // Event-driven fetch tracing (scheduler-safe: fires only on handshakes).
+  always @(posedge clk) begin
+    if (fetch_req & fetch_ready)
+      $display("[core %0t] ISSUE va=%h pa=%h busy=%b hit=%b fault=%b",
+               $time, fetch_va, fetch_addr, fetch_busy, mmu_hit_f, mmu_fault_f);
+    if (fetch_ack & fetch_busy)
+      $display("[core %0t] ACK data=%h complete=%b hi=%b",
+               $time, fetch_rdata, fetch_complete, fetch_hi_valid);
+    if (valid_f && !stall && !fetch_busy && !fetch_res_valid && !mmu_hit_f)
+      $display("[core %0t] WAIT-HIT va=%h fault=%b miss=%b satp=%h priv=%b",
+               $time, fetch_va, mmu_fault_f, mmu_miss_f,
+               csr_satp, priv);
+  end
+  `endif
 
   logic flush_redirect;
   assign flush_redirect = redirect | trap;
@@ -673,6 +784,9 @@ module rv64gch_core #(
         ex_pkt.ctrl.illegal <= dc.illegal | illegal_c_d;
         ex_pkt.is_c <= is_c_d;
         ex_pkt.illegal_c <= illegal_c_d;
+        ex_pkt.fault_f <= fault_d;
+        ex_pkt.fcause <= fcause_d;
+        ex_pkt.fva <= fva_d;
         ex_pkt.rs1   <= rf_rdata1;
         ex_pkt.rs2   <= rf_rdata2;
         // FP operands are latched here (with WB->ID bypass already applied)
@@ -785,9 +899,14 @@ module rv64gch_core #(
   assign branch_target = (ex_pkt.ctrl.is_jal | ex_pkt.ctrl.is_jalr) ?
                          (alu_a + alu_b) : (ex_pkt.pc + ex_pkt.imm);
 
+  // xRET redirects to epc (mret/sret previously fell through, which only
+  // worked when the target happened to be adjacent).
+  logic is_xret;
+  assign is_xret = ex_pkt.ctrl.is_mret | ex_pkt.ctrl.is_sret;
   assign redirect = ex_pkt.valid & (ex_pkt.ctrl.is_branch & branch_resolved |
-                                    ex_pkt.ctrl.is_jal | ex_pkt.ctrl.is_jalr);
-  assign redirect_target = branch_target;
+                                    ex_pkt.ctrl.is_jal | ex_pkt.ctrl.is_jalr |
+                                    is_xret);
+  assign redirect_target = is_xret ? epc : branch_target;
 
   assign mem_is_load_x = ((ex_pkt.ctrl.lsu_op >= LSU_LB) & (ex_pkt.ctrl.lsu_op <= LSU_LWU)) |
                          (ex_pkt.ctrl.lsu_op == LSU_LR) | (ex_pkt.ctrl.lsu_op == LSU_AMO);
@@ -892,13 +1011,57 @@ module rv64gch_core #(
     return r64;
   endfunction
 
+  // Data-address translation (PIPT: the L1D sees physical only). The VA
+  // is full-width; the PA feeds mem_pkt. A TLB miss stalls the pipe for
+  // the walker; a fault traps from EX with tval=VA (MEM never issues).
+  logic [63:0] ex_va_full;
+  assign ex_va_full = rs1_fwd + ex_pkt.imm;
+  logic [1:0] eff_priv_d;
+  always_comb begin
+    eff_priv_d = priv;
+    if (priv == PRIV_M && csr_mstatus[17]) begin // MPRV
+      if (csr_mstatus[12:11] == 2'b11)      eff_priv_d = PRIV_M;
+      else if (csr_mstatus[12:11] == 2'b01) eff_priv_d = PRIV_S;
+      else                                 eff_priv_d = PRIV_U;
+    end
+  end
+  logic        ex_mem_valid;
+  logic        ex_mem_rd, ex_mem_wr;
+  assign ex_mem_valid = ex_pkt.valid &
+      (mem_is_load_x | mem_is_store_x | ex_is_amo |
+       (ex_pkt.ctrl.lsu_op == LSU_SC));
+  assign ex_mem_rd = mem_is_load_x;
+  assign ex_mem_wr = mem_is_store_x | ex_is_amo |
+                     ((ex_pkt.ctrl.lsu_op == LSU_SC) & ex_sc_success);
+  logic        mmu_hit_d, mmu_miss_d, mmu_fault_d;
+  logic [47:0] mmu_pa_d;
+  logic [4:0]  mmu_cause_d;
+
+  mmu #(.ADDR_W(48), .TLB_ENTRIES(32)) u_mmu (
+    .clk(clk), .rst_n(rst_n),
+    .satp_i(csr_satp), .mstatus_i(csr_mstatus), .priv_i(priv),
+    .flush_i(sfence_o | satp_we_o),
+    .va_f_i(fetch_va), .priv_f_i(priv),
+    .hit_f_o(mmu_hit_f), .pa_f_o(mmu_pa_f), .miss_f_o(mmu_miss_f),
+    .fault_f_o(mmu_fault_f), .cause_f_o(mmu_cause_f),
+    .va_d_i(ex_va_full), .priv_d_i(eff_priv_d),
+    .rd_d_i(ex_mem_rd), .wr_d_i(ex_mem_wr),
+    .valid_d_i(ex_mem_valid),
+    .hit_d_o(mmu_hit_d), .pa_d_o(mmu_pa_d), .miss_d_o(mmu_miss_d),
+    .fault_d_o(mmu_fault_d), .cause_d_o(mmu_cause_d),
+    .req_o(ptw_req), .we_o(ptw_we), .addr_o(ptw_addr), .be_o(ptw_be),
+    .wdata_o(ptw_wdata), .lock_o(),
+    .rdata_i(ptw_rdata), .ack_i(ptw_ack), .ready_i(ptw_ready)
+  );
+
   // SC success checked at EX->MEM entry: reservation must be valid and match.
   // Safe: entry only advances when !stall, i.e. no older LR/AMO still in MEM.
   logic [47:0] ex_mem_addr;
   assign ex_mem_addr = rs1_fwd + ex_pkt.imm;
   logic        ex_sc_success;
+  // Reservation compare in PA space (identical to VA in Bare mode).
   assign ex_sc_success = (ex_pkt.ctrl.lsu_op == LSU_SC) &
-                         lr_valid_q & (lr_addr_q == ex_mem_addr);
+                         lr_valid_q & (lr_addr_q == mmu_pa_d);
   logic        ex_is_amo;
   assign ex_is_amo = (ex_pkt.ctrl.lsu_op == LSU_AMO);
   logic        ex_amo_is_d;
@@ -920,7 +1083,9 @@ module rv64gch_core #(
     // CSR write operand: rs1 for register forms, the 5-bit zimm
     // zero-extended for CSRRWI/CSRRSI/CSRRCI (funct3[2]).
     mem_pkt_n.csr_wdata = (ex_pkt.ctrl.funct3[2]) ? {59'd0, ex_pkt.ctrl.rs1} : rs1_fwd;
-    mem_pkt_n.mem_addr = rs1_fwd + ex_pkt.imm;
+    // Physical address from the MMU (PIPT). In Bare mode this equals the
+    // VA low 48 bits, identical to the old direct assignment.
+    mem_pkt_n.mem_addr = {16'd0, mmu_pa_d};
     // SC writes memory only on reservation success; AMO always reads then
     // writes (phased in the MEM FSM below).
     mem_pkt_n.is_store = mem_is_store_x | ex_is_amo |
@@ -1137,6 +1302,19 @@ module rv64gch_core #(
   // FENCE.I retires in order at WB; the pulse may stretch across a stall
   // (WB holds), which is harmless for the idempotent L1I invalidate.
   assign fence_i_o = wb_pkt.valid & wb_pkt.ctrl.fence_i;
+  assign sfence_o = wb_pkt.valid & wb_pkt.ctrl.is_sfence;
+  assign satp_we_o = wb_pkt.valid & wb_pkt.ctrl.writes_csr &
+                     (wb_pkt.ctrl.csr_addr == CSR_SATP);
+  `ifdef CORE_DEBUG
+  always @(posedge clk) begin
+    if (fence_i_o | sfence_o | satp_we_o)
+      $display("[core %0t] FENCERET fi=%b sf=%b satp=%b pc=%h instr=%h",
+               $time, fence_i_o, sfence_o, satp_we_o, wb_pkt.pc, wb_pkt.ctrl);
+    if (trap)
+      $display("[core %0t] TRAP cause=%0d tval=%h epc=%h priv=%b",
+               $time, cause, trap_tval, ex_pkt.pc, priv);
+  end
+  `endif
 
   assign rd_w = wb_pkt.rd;
   assign rd_w_fp = wb_pkt.rd;
@@ -1157,9 +1335,9 @@ module rv64gch_core #(
     .csr_op(wb_pkt.ctrl.csr_op),
     .csr_rs1(wb_pkt.ctrl.rs1),
     .csr_rdata(csr_rdata),
-    .pc(wb_pkt.pc),
+    .trap_pc(ex_pkt.pc),
     .cause(cause), .trap(trap),
-    .tval_valid(1'b0), .tval('0),
+    .tval_valid(trap_is_fault), .tval(trap_tval),
     .mret(wb_pkt.ctrl.is_mret), .sret(wb_pkt.ctrl.is_sret),
     .epc(epc), .tvec(tvec),
     .new_priv(new_priv),
@@ -1169,19 +1347,37 @@ module rv64gch_core #(
     .fcsr_fflags_we(fcsr_fflags_we),
     .fcsr_fflags_in(wb_pkt.fflags),
     .fflags(fcsr_fflags),
-    .frm(frm)
+    .frm(frm),
+    .mstatus_o(csr_mstatus),
+    .satp_o(csr_satp)
   );
+
+  // Fault plumbing for mtval: fetch bubble carries its VA, data faults
+  // use the faulting EX virtual address.
+  logic       trap_is_fault;
+  logic [63:0] trap_tval;
+  assign trap_is_fault = (ex_pkt.valid & ex_pkt.fault_f) | data_fault;
+  assign trap_tval     = (ex_pkt.valid & ex_pkt.fault_f) ? ex_pkt.fva : ex_va_full;
+
+  logic       data_fault;
+  logic [4:0] data_cause;
+  assign data_fault = ex_mem_valid & mmu_fault_d;
+  assign data_cause = mmu_cause_d;
 
   always_comb begin
     trap = 1'b0; cause = 4'd0;
     if (ex_pkt.valid) begin
-      if (ex_pkt.ctrl.illegal) begin
+      if (ex_pkt.fault_f) begin
+        trap = 1'b1; cause = ex_pkt.fcause;
+      end else if (ex_pkt.ctrl.illegal) begin
         trap = 1'b1; cause = CAUSE_ILLEGAL_INSN;
       end else if (ex_pkt.ctrl.is_ecall) begin
         trap = 1'b1; cause = (priv == PRIV_M) ? CAUSE_M_ECALL :
                               (priv == PRIV_S) ? CAUSE_SUP_ECALL : CAUSE_USER_ECALL;
       end else if (ex_pkt.ctrl.is_ebreak) begin
         trap = 1'b1; cause = CAUSE_BREAKPOINT;
+      end else if (data_fault) begin
+        trap = 1'b1; cause = data_cause;
       end
     end
   end

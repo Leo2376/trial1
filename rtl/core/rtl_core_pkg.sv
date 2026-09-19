@@ -117,6 +117,7 @@ package rtl_core_pkg;
     logic [11:0] csr_addr;
     logic [1:0]  csr_op;
     logic        fence_i;
+    logic        is_sfence;
     logic        is_ebreak;
     logic        is_ecall;
     logic        is_mret;
@@ -145,7 +146,12 @@ package rtl_core_pkg;
     CSR_SSTATUS=12'h100, CSR_SIE=12'h104, CSR_STVEC=12'h105, CSR_SSCRATCH=12'h140,
     CSR_SEPC=12'h141, CSR_SCAUSE=12'h142, CSR_STVAL=12'h143, CSR_SIP=12'h144,
     CSR_UTVEC=12'h005, CSR_USCRATCH=12'h040, CSR_UEPC=12'h041, CSR_UCAUSE=12'h042,
-    CSR_UTVAL=12'h043;
+    CSR_UTVAL=12'h043, CSR_SATP=12'h180;
+
+  // satp MODE values (WARL: unsupported modes read back as Bare).
+  localparam logic [3:0] SATP_BARE = 4'd0, SATP_SV39 = 4'd8, SATP_SV48 = 4'd9;
+  // Sv39 virtual address: VPN2/VPN1/VPN0 + 12-bit page offset.
+  localparam int SV39_VPN_BITS = 27, SV39_PN_BITS = 9, SV39_LEVELS = 3;
 
   function automatic logic is_mdu_op(alu_op_e op);
     case (op)

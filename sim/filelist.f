@@ -14,6 +14,7 @@
 ../../rtl/cache/l1i/l1i.sv
 ../../rtl/cache/l1d/l1d.sv
 ../../rtl/cache/l2/l2.sv
+../../rtl/mmu/mmu.sv
 ../../rtl/core/rv64gch_core.sv
 ../../rtl/soc/fabric/axi4_decoder.sv
 ../../rtl/soc/top/rv64gch_top.sv

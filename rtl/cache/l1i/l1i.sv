@@ -136,6 +136,9 @@ module l1i #(
   // Reset sweep index (one set cleared per cycle; avoids an array-clear
   // loop unsupported by the simulator).
   logic [INDEX_BITS-1:0] rst_idx;
+  // Flush is edge-detected: the retire pulse stretches across stalls
+  // (WB holds the fencing insn), which must toggle the epoch exactly once.
+  logic flush_d_q;
 
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
@@ -148,8 +151,10 @@ module l1i #(
       fill_ok_q <= 1'b0;
       cur_epoch <= 1'b0;
       rst_idx   <= '0;
+      flush_d_q <= 1'b0;
     end else begin
-      if (flush_i) begin
+      flush_d_q <= flush_i;
+      if (flush_i && !flush_d_q) begin
         cur_epoch <= ~cur_epoch;
         fill_ok_q <= 1'b0;
       end
@@ -161,7 +166,11 @@ module l1i #(
           else rst_idx <= rst_idx + 1'b1;
         end
         S_IDLE: begin
-          if (!flush_i && req_i) begin
+          // NOTE: no flush gate here on purpose. The core commits on
+          // req&ready, so refusing while ready would strand its fetch_busy
+          // with no ack coming. Accept-then-lookup is safe: the epoch
+          // toggled this same cycle, so the lookup misses and fills fresh.
+          if (req_i) begin
             req_q <= addr_i;
             st    <= S_LOOKUP;
             `ifdef L1I_DEBUG

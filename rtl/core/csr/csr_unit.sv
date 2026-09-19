@@ -13,7 +13,8 @@ module csr_unit #(
   input  logic [1:0]        csr_op,
   input  logic [4:0]        csr_rs1,
   output logic [XLEN-1:0]   csr_rdata,
-  input  logic [XLEN-1:0]   pc,
+  // Trap record (EX-stage faulting instruction; sampled with trap).
+  input  logic [XLEN-1:0]   trap_pc,
   input  logic [4:0]        cause,
   input  logic              trap,
   input  logic              tval_valid,
@@ -32,7 +33,10 @@ module csr_unit #(
   output logic [4:0]        fcsr_fflags_we,
   input  logic [4:0]        fcsr_fflags_in,
   output logic [4:0]        fflags,
-  output logic [2:0]        frm
+  output logic [2:0]        frm,
+  // VM/privilege state for the MMU (Sv39 stage).
+  output logic [XLEN-1:0]   mstatus_o,
+  output logic [XLEN-1:0]   satp_o
 );
   import rtl_core_pkg::*;
 
@@ -40,6 +44,7 @@ module csr_unit #(
   logic [XLEN-1:0] sstatus, sie, stvec, sepc, scause, stval, sip, sscratch;
   logic [XLEN-1:0] mcycle, minstret;
   logic [XLEN-1:0] fcsr;
+  logic [XLEN-1:0] satp;
   logic [XLEN-1:0] csr_rdata_q;
 
   // CSR write semantics: CSRRW writes the operand; CSRRS sets (OR) the bits,
@@ -93,7 +98,12 @@ module csr_unit #(
       CSR_MARCHID:  v = '0;
       CSR_MIMPID:   v = '0;
       CSR_MHARTID:  v = hartid;
-      CSR_SSTATUS:  v = sstatus;
+      // SSTATUS is a restricted view: FS[14:13]/XS[16:15]/SUM[18]/MXR[19]
+      // live in mstatus and are overlaid here (sstatus flop holds the
+      // S-only bits: SIE/SPIE/UBE/SPP/VS).
+      CSR_SSTATUS:  v = (sstatus & ~64'h0000_0000_000F_6000) |
+                        (mstatus & 64'h0000_0000_000F_6000);
+      CSR_SATP:     v = satp;
       CSR_SIE:      v = sie;
       CSR_STVEC:    v = stvec;
       CSR_SEPC:     v = sepc;
@@ -120,25 +130,37 @@ module csr_unit #(
       sstatus  <= '0; sie <= '0; stvec <= '0; sepc <= '0; scause <= '0;
       stval    <= '0; sip <= '0; sscratch <= '0;
       mcycle   <= '0; minstret <= '0; fcsr <= '0;
-    end else if (!flush) begin
+      satp <= '0;
+    end else begin
       mcycle   <= mcycle + 64'd1;
       minstret <= minstret + 64'd1;
       mip[7]  <= timer_irq;
       mip[3]  <= soft_irq;
       mip[11] <= ext_irq;
 
+      // Trap entry is exempt from the flush gate (trap implies flush):
+      // without this ordering no trap is ever recorded. No delegation in
+      // this stage: all traps enter M-mode.
       if (trap) begin
-        mepc   <= pc;
-        mcause <= {51'd0, cause};
+        mepc   <= trap_pc;
+        mcause <= {59'd0, cause};
         mtval  <= tval_valid ? tval : '0;
-        mstatus <= {mstatus[XLEN-1:12], 2'b00, mstatus[3:0]};
+        mstatus[7]     <= mstatus[3];  // MPIE = MIE
+        mstatus[3]     <= 1'b0;        // MIE = 0
+        mstatus[12:11] <= priv;        // MPP = previous priv
         new_priv <= PRIV_M;
       end else if (mret) begin
-        mstatus[3:0] <= mstatus[7:4];
-        new_priv <= mstatus[7:4];
+        // MPP==2 is reserved; treat as U (WARL-ish).
+        new_priv <= (mstatus[12:11] == 2'b10) ? PRIV_U : priv_e'(mstatus[12:11]);
+        mstatus[3] <= mstatus[7];            // MIE = MPIE
+        mstatus[7] <= 1'b1;                  // MPIE = 1
+        if (mstatus[12:11] != PRIV_M) mstatus[12:11] <= PRIV_U;
       end else if (sret) begin
-        new_priv <= PRIV_S;
-      end else if (csr_op_we) begin
+        new_priv <= sstatus[8] ? PRIV_S : PRIV_U; // SPP ? S : U
+        sie        <= (sie & ~64'd2) | {62'd0, sstatus[5], 1'b0}; // SIE = SPIE
+        sstatus[5] <= 1'b1;  // SPIE = 1
+        sstatus[8] <= 1'b0;  // SPP = U
+      end else if (!flush && csr_op_we) begin
         case (csr_addr)
           CSR_MSTATUS:  mstatus  <= csr_wval;
           CSR_MIE:      mie      <= csr_wval;
@@ -148,7 +170,14 @@ module csr_unit #(
           CSR_MTVAL:    mtval    <= csr_wval;
           CSR_MIP:      mip      <= csr_wval;
           CSR_MSCRATCH: mscratch <= csr_wval;
-          CSR_SSTATUS:  sstatus  <= csr_wval;
+          CSR_SSTATUS: begin
+            sstatus <= csr_wval;
+            // FS/XS/SUM/MXR alias mstatus; route them through.
+            mstatus[14:13] <= csr_wval[14:13];
+            mstatus[16:15] <= csr_wval[16:15];
+            mstatus[18]    <= csr_wval[18];
+            mstatus[19]    <= csr_wval[19];
+          end
           CSR_SIE:      sie      <= csr_wval;
           CSR_STVEC:    stvec    <= csr_wval;
           CSR_SEPC:     sepc     <= csr_wval;
@@ -156,6 +185,13 @@ module csr_unit #(
           CSR_STVAL:    stval    <= csr_wval;
           CSR_SIP:      sip      <= csr_wval;
           CSR_SSCRATCH: sscratch <= csr_wval;
+          CSR_SATP: begin
+            // WARL MODE: only Bare and Sv39 legal here.
+            satp[59:0]  <= csr_wval[59:0];
+            satp[63:60] <= ((csr_wval[63:60] == SATP_BARE) ||
+                            (csr_wval[63:60] == SATP_SV39)) ? csr_wval[63:60]
+                                                           : SATP_BARE;
+          end
           CSR_FCSR:     fcsr     <= {56'd0, csr_wval[7:0]};
           CSR_FFLAGS:   fcsr[4:0]<= csr_wval[4:0];
           CSR_FRM:      fcsr[7:5] <= csr_wval[2:0];
@@ -163,7 +199,7 @@ module csr_unit #(
         endcase
       end
 
-      if (fcsr_fflags_we) fcsr[4:0] <= fcsr[4:0] | fcsr_fflags_in;
+      if (!flush && fcsr_fflags_we) fcsr[4:0] <= fcsr[4:0] | fcsr_fflags_in;
     end
   end
 
@@ -198,11 +234,16 @@ module csr_unit #(
 
   assign csr_rdata = csr_rdata_q;
   assign epc = (priv == PRIV_M) ? mepc : sepc;
-  assign tvec = (priv == PRIV_M) ? mtvec : stvec;
+  // No delegation in this stage: all traps enter M-mode regardless of the
+  // pre-trap privilege (a pre-delegation stvec would send S-mode traps to
+  // a zero vector). Revisit with medeleg/mideleg.
+  assign tvec = mtvec;
   assign irq_pending = (mip[7] & mie[7]) | (mip[3] & mie[3]) | (mip[11] & mie[11]);
   assign fi_we = 1'b0;
   assign fs_mstatus = mstatus[14:13];
   assign fflags = fcsr[4:0];
   assign frm = fcsr[7:5];
+  assign mstatus_o = mstatus;
+  assign satp_o = satp;
 
 endmodule

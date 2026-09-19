@@ -44,6 +44,18 @@ module l2 #(
   output logic              ack_b_o,
   output logic              ready_b_o,
 
+  // Port C (page-table walker): read + write (A/D updates). Highest
+  // priority: the pipeline is stalled on a TLB miss while it is active.
+  input  logic              req_c_i,
+  input  logic              we_c_i,
+  input  logic [ADDR_W-1:0] addr_c_i,
+  input  logic [7:0]        be_c_i,
+  input  logic [DATA_W-1:0] wdata_c_i,
+  input  logic              lock_c_i,
+  output logic [DATA_W-1:0] rdata_c_o,
+  output logic              ack_c_o,
+  output logic              ready_c_o,
+
   // Memory side (toward the AXI master): single beat.
   output logic              req_o,
   output logic              we_o,
@@ -89,8 +101,8 @@ module l2 #(
   // touching way w sets them AWAY from w (bit <= ~w[bitpos]).
   logic [6:0]          plru  [NUM_SETS];
 
-  // Latched request under service (port selected in IDLE; B has priority).
-  logic                sel_q; // 0 = port A, 1 = port B
+  // Latched request under service (port selected in IDLE; C > B > A).
+  logic [1:0]          sel_q; // 0 = port A, 1 = port B, 2 = port C
   logic [ADDR_W-1:0] req_addr_q;
   logic              req_we_q;
   logic [7:0]        req_be_q;
@@ -153,13 +165,16 @@ module l2 #(
       if (req_be_q[b]) merged_word[8*b +: 8] = req_wdata_q[8*b +: 8];
   end
 
-  // Port readiness: only IDLE accepts, B wins when both ask.
-  assign ready_a_o = (st == S_IDLE) & ~req_b_i;
-  assign ready_b_o = (st == S_IDLE);
-  assign ack_a_o   = (st == S_RESP) & ~sel_q;
-  assign ack_b_o   = (st == S_RESP) & sel_q;
+  // Port readiness: only IDLE accepts, C > B > A priority.
+  assign ready_a_o = (st == S_IDLE) & ~req_b_i & ~req_c_i;
+  assign ready_b_o = (st == S_IDLE) & ~req_c_i;
+  assign ready_c_o = (st == S_IDLE);
+  assign ack_a_o   = (st == S_RESP) & (sel_q == 2'd0);
+  assign ack_b_o   = (st == S_RESP) & (sel_q == 2'd1);
+  assign ack_c_o   = (st == S_RESP) & (sel_q == 2'd2);
   assign rdata_a_o = resp_q;
   assign rdata_b_o = resp_q;
+  assign rdata_c_o = resp_q;
 
   // Memory side. Uncached passes the latched beat through; fills and
   // writebacks walk the 4 beats of their line in order.
@@ -178,7 +193,7 @@ module l2 #(
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       st          <= S_RESET;
-      sel_q       <= 1'b0;
+      sel_q       <= 2'd0;
       req_addr_q  <= '0;
       req_we_q    <= 1'b0;
       req_be_q    <= '0;
@@ -200,8 +215,19 @@ module l2 #(
           else rst_idx <= rst_idx + 1'b1;
         end
         S_IDLE: begin
-          if (req_b_i) begin
-            sel_q       <= 1'b1;
+          if (req_c_i) begin
+            sel_q       <= 2'd2;
+            req_addr_q  <= addr_c_i;
+            req_we_q    <= we_c_i;
+            req_be_q    <= be_c_i;
+            req_wdata_q <= wdata_c_i;
+            req_lock_q  <= lock_c_i;
+            st          <= S_LOOKUP;
+            `ifdef L2_DEBUG
+            $display("[l2 %0t] ACCEPT-C we=%b addr=%h", $time, we_c_i, addr_c_i);
+            `endif
+          end else if (req_b_i) begin
+            sel_q       <= 2'd1;
             req_addr_q  <= addr_b_i;
             req_we_q    <= we_b_i;
             req_be_q    <= be_b_i;
@@ -212,7 +238,7 @@ module l2 #(
             $display("[l2 %0t] ACCEPT-B we=%b addr=%h", $time, we_b_i, addr_b_i);
             `endif
           end else if (req_a_i) begin
-            sel_q       <= 1'b0;
+            sel_q       <= 2'd0;
             req_addr_q  <= addr_a_i;
             req_we_q    <= 1'b0;
             req_be_q    <= 8'hFF;

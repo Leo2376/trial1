@@ -63,7 +63,13 @@ module l1d #(
   input  logic              ready_i,
 
   // Invalidate all lines (reserved for future coherence use; tie off).
-  input  logic              flush_i
+  input  logic              flush_i,
+
+  // Drain: write back all dirty lines and invalidate (PTE/code visibility
+  // on SFENCE.VMA / SATP write / FENCE.I retire). Level; edge-triggered
+  // internally. drain_busy_o stalls the core while pending or running.
+  input  logic              drain_i,
+  output logic              drain_busy_o
 );
 
   localparam int OFFSET_BITS     = $clog2(LINE_BYTES);                // 5
@@ -86,8 +92,9 @@ module l1d #(
     return a >= MMIO_BASE;
   endfunction
 
-  typedef enum logic [2:0] {
-    S_RESET, S_IDLE, S_LOOKUP, S_RESP, S_WRITEBACK, S_FILL, S_UNCACHED
+  typedef enum logic [3:0] {
+    S_RESET, S_IDLE, S_LOOKUP, S_RESP, S_WRITEBACK, S_FILL,
+    S_UNCACHED, S_DRAIN, S_DRAINWB
   } state_e;
   state_e st;
 
@@ -163,20 +170,30 @@ module l1d #(
       if (req_be_q[b]) merged_word[8*b +: 8] = req_wdata_q[8*b +: 8];
   end
 
+  // Drain sweep position (set/way under visit).
+  logic [INDEX_BITS-1:0] drain_set_q;
+  logic [WAY_BITS-1:0]   drain_way_q;
+  logic                  drain_pend_q, drain_i_d;
+
   // Moore outputs. Uncached (MMIO) passes the latched request straight
-  // through as a single beat; fills/writebacks walk miss_q's line.
-  assign ready_o = (st == S_IDLE);
+  // through as a single beat; fills/writebacks walk miss_q's line; drain
+  // writebacks walk the swept line (tag rebuilt like a victim writeback).
+  assign ready_o = (st == S_IDLE) & ~drain_pend_q;
   assign ack_o   = (st == S_RESP);
   assign rdata_o = resp_q;
-  assign req_o   = (st == S_WRITEBACK) | (st == S_FILL) | (st == S_UNCACHED);
-  assign we_o    = (st == S_WRITEBACK) | ((st == S_UNCACHED) & req_we_q);
+  assign drain_busy_o = drain_pend_q | (st == S_DRAIN) | (st == S_DRAINWB);
+  assign req_o   = (st == S_WRITEBACK) | (st == S_FILL) | (st == S_UNCACHED) |
+                   (st == S_DRAINWB);
+  assign we_o    = (st == S_WRITEBACK) | (st == S_DRAINWB) |
+                   ((st == S_UNCACHED) & req_we_q);
   assign be_o    = (st == S_UNCACHED) ? req_be_q : 8'hFF;
-  // Fills walk the missing line; writebacks walk the VICTIM's line
-  // (rebuilt from its latched tag + the shared set index).
   assign addr_o  = (st == S_UNCACHED) ? req_addr_q :
+                   (st == S_DRAINWB) ? {wb_tag_q, drain_set_q, cnt_q, 3'b000} :
                    (st == S_WRITEBACK) ? {wb_tag_q, miss_set, cnt_q, 3'b000} :
                                          {miss_q[ADDR_W-1:INDEX_LSB], cnt_q, 3'b000};
-  assign wdata_o = (st == S_UNCACHED) ? req_wdata_q : data[miss_set][way_q][cnt_q];
+  assign wdata_o = (st == S_UNCACHED) ? req_wdata_q :
+                   (st == S_DRAINWB) ? data[drain_set_q][drain_way_q][cnt_q] :
+                                       data[miss_set][way_q][cnt_q];
   assign lock_o  = req_lock_q & ((st == S_FILL) | (st == S_WRITEBACK) | (st == S_UNCACHED));
 
   // PLRU touch helper (inline): point away from the given way.
@@ -199,10 +216,23 @@ module l1d #(
       fill_ok_q   <= 1'b0;
       cur_epoch   <= 1'b0;
       rst_idx     <= '0;
+      drain_set_q <= '0;
+      drain_way_q <= '0;
+      drain_pend_q <= 1'b0;
+      drain_i_d   <= 1'b0;
     end else begin
       if (flush_i) begin
         cur_epoch <= ~cur_epoch;
         fill_ok_q <= 1'b0;
+      end
+      // Drain trigger is edge-detected: the retire pulse stretches across
+      // the drain stall (WB holds the fencing insn), which must not retrig.
+      drain_i_d <= drain_i;
+      if (drain_i & ~drain_i_d) begin
+        drain_pend_q <= 1'b1;
+        `ifdef L1D_DEBUG
+        $display("[l1d %0t] DRAIN-REQ", $time);
+        `endif
       end
       case (st)
         S_RESET: begin
@@ -213,7 +243,19 @@ module l1d #(
           else rst_idx <= rst_idx + 1'b1;
         end
         S_IDLE: begin
-          if (!flush_i && req_i) begin
+          if (drain_pend_q) begin
+            // Drain wins over a held request; the core is stalled anyway.
+            drain_set_q <= '0;
+            drain_way_q <= '0;
+            cnt_q       <= '0;
+            st          <= S_DRAIN;
+            `ifdef L1D_DEBUG
+            $display("[l1d %0t] DRAIN-START", $time);
+            `endif
+          // NOTE: no flush gate on accept (same reason as L1I: the core
+          // commits on req&ready and a refusal would strand it with no
+          // ack). The toggled epoch forces a post-flush miss + refill.
+          end else if (req_i) begin
             req_addr_q  <= addr_i;
             req_we_q    <= we_i;
             req_be_q    <= be_i;
@@ -223,6 +265,60 @@ module l1d #(
             `ifdef L1D_DEBUG
             $display("[l1d %0t] ACCEPT we=%b addr=%h be=%h", $time, we_i, addr_i, be_i);
             `endif
+          end
+        end
+        S_DRAIN: begin
+          // Visit every line: dirty ones are written back (next state),
+          // all are invalidated so post-fence accesses refill.
+          if (valid[drain_set_q][drain_way_q] &
+              dirty[drain_set_q][drain_way_q] &
+              (lep[drain_set_q][drain_way_q] == cur_epoch)) begin
+            wb_tag_q <= tags[drain_set_q][drain_way_q];
+            cnt_q    <= '0;
+            st       <= S_DRAINWB;
+          end else begin
+            valid[drain_set_q][drain_way_q] <= 1'b0;
+            if (drain_way_q == NUM_WAYS - 1) begin
+              drain_way_q <= '0;
+              if (drain_set_q == NUM_SETS - 1) begin
+                drain_pend_q <= 1'b0;
+                st <= S_IDLE;
+                `ifdef L1D_DEBUG
+                $display("[l1d %0t] DRAIN-DONE", $time);
+                `endif
+              end else begin
+                drain_set_q <= drain_set_q + 1'b1;
+              end
+            end else begin
+              drain_way_q <= drain_way_q + 1'b1;
+            end
+          end
+        end
+        S_DRAINWB: begin
+          if (ack_i) begin
+            if (cnt_q == WORDS_PER_LINE - 1) begin
+              valid[drain_set_q][drain_way_q] <= 1'b0;
+              dirty[drain_set_q][drain_way_q] <= 1'b0;
+              st <= S_DRAIN;
+              // Advance past the written line (shared with the S_DRAIN
+              // stepper below to keep one traversal).
+              if (drain_way_q == NUM_WAYS - 1) begin
+                drain_way_q <= '0;
+                if (drain_set_q == NUM_SETS - 1) begin
+                  drain_pend_q <= 1'b0;
+                  st <= S_IDLE;
+                  `ifdef L1D_DEBUG
+                  $display("[l1d %0t] DRAIN-DONE", $time);
+                  `endif
+                end else begin
+                  drain_set_q <= drain_set_q + 1'b1;
+                end
+              end else begin
+                drain_way_q <= drain_way_q + 1'b1;
+              end
+            end else begin
+              cnt_q <= cnt_q + 1'b1;
+            end
           end
         end
         S_LOOKUP: begin
