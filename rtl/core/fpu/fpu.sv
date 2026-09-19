@@ -106,10 +106,38 @@ module fpu #(
            is_unsigned ? {32'h0, a[31:0]} : {{32{a[31]}}, a[31:0]};
       return {{32{1'b1}}, fcvt_int_s(iv, is_unsigned, rm, ff)};
     end else if (is_double) begin
-      return compute_result_s(a[63:0], b[63:0], c[63:0], op, rm, ff);
+      return compute_result_d(a[63:0], b[63:0], c[63:0], op, rm, ff);
     end else begin
       return compute_result_s(a[31:0], b[31:0], c[31:0], op, rm, ff);
     end
+  endfunction
+
+  // Double-precision arithmetic dispatch (RV64D). Mirrors
+  // compute_result_s with 64-bit operands and full (non-boxed) results.
+  // Ops are implemented instruction-by-instruction; unhandled ops return
+  // zero so unfinished paths fail loudly in the ISA suite, not silently.
+  function automatic logic [63:0] compute_result_d(
+    input logic [63:0] a,
+    input logic [63:0] b,
+    input logic [63:0] c,
+    input rtl_core_pkg::fpu_op_e op,
+    input logic [2:0] rm,
+    output logic [4:0] ff
+  );
+    ff = '0;
+    unique case (op)
+      rtl_core_pkg::FPU_FADD: return faddsub_d(a, b, 1'b0, rm, ff);
+      rtl_core_pkg::FPU_FSUB: return faddsub_d(a, b, 1'b1, rm, ff);
+      rtl_core_pkg::FPU_FMUL: return fmul_d(a, b, rm, ff);
+      rtl_core_pkg::FPU_FDIV: return fdiv_d(a, b, rm, ff);
+      rtl_core_pkg::FPU_FSQRT: return fsqrt_d(a, rm, ff);
+      rtl_core_pkg::FPU_FMIN: return fmin_d(a, b, ff);
+      rtl_core_pkg::FPU_FMAX: return fmax_d(a, b, ff);
+      // Double moves copy the full 64-bit pattern (no NaN-boxing).
+      rtl_core_pkg::FPU_MV_F2X: return a;
+      rtl_core_pkg::FPU_MV_X2F: return a;
+      default: return 64'd0;
+    endcase
   endfunction
 
   // Single-precision arithmetic dispatch
@@ -364,22 +392,22 @@ module fpu #(
     lsb = frac[0];
     round_up = 1'b0;
     case (rmode)
-      RM_RNE: round_up = r & (s_bit | lsb);
+      RM_RNE: round_up = g & (r | s_bit | lsb);
       RM_RTZ: round_up = 1'b0;
-      RM_RDN: round_up = r & (s_bit | ~sgn);
-      RM_RUP: round_up = r & (s_bit | sgn);
-      RM_RMM: round_up = r;
-      default: round_up = r & (s_bit | lsb);
+      RM_RDN: round_up = sgn & (g | r | s_bit);
+      RM_RUP: round_up = ~sgn & (g | r | s_bit);
+      RM_RMM: round_up = g;
+      default: round_up = g & (r | s_bit | lsb);
     endcase
-    if (round_up) Fp = F + 59'd1;
+    if (round_up) Fp = F + 59'd8;
     frac = Fp[54:3]; g = Fp[2]; r = Fp[1]; s_bit = Fp[0];
-    if (round_up & Fp[55]) begin
+    if (round_up & Fp[56]) begin
       Fp = {Fp[58:1], 1'b0};
       e = e + 12'd1;
       frac = Fp[54:3];
     end
-    if (g | r | s_bit) f = f | FF_NX;
-    if (e >= 12'h7FE) begin
+    if (F[2] | F[1] | F[0]) f = f | FF_NX;
+    if (e >= 12'h7FF) begin
       f = f | FF_OF | FF_NX;
       case (rmode)
         RM_RNE, RM_RMM: begin e = 12'h7FF; frac = 52'd0; end
@@ -421,6 +449,15 @@ module fpu #(
     msb_pos25 = 0;
     for (i = 24; i >= 0; i = i - 1)
       if (v[i] && (msb_pos25 == 0)) msb_pos25 = i;
+  endfunction
+
+  // MSB position within a 59-bit slice, counting from bit lo.
+  function automatic integer msb_pos59(input logic [58:0] v, input integer lo);
+    integer i; integer p;
+    p = -1;
+    for (i = 58; i >= lo; i = i - 1)
+      if (v[i] && p < 0) p = i;
+    return p;
   endfunction
 
   // =========================================================================
@@ -515,6 +552,144 @@ module fpu #(
   endfunction
 
   // =========================================================================
+  // FADD/FSUB double: same algorithm as faddsub_s scaled to 11-bit
+  // exponents and 53-bit significands. The 59-bit working field matches
+  // round_pack_d (leading bit at 55, frac at [54:3], g/r/s at [2:0]).
+  // Subnormal inputs are flushed to zero, like the single path.
+  // =========================================================================
+  function automatic logic [63:0] faddsub_d(input logic [63:0] dxa, input logic [63:0] dxb,
+                                            input logic sub, input logic [2:0] rmode,
+                                            output logic [4:0] ff);
+    logic sga, sgb, eff_sub;
+    logic [10:0] ea, eb, ebig, esmall;
+    logic [52:0] ma, mb, mbig, msmall;
+    logic swap;
+    logic [11:0] diff;
+    logic [58:0] bigF, smallF, sumF;
+    logic stk;
+    logic signed [12:0] eout;
+    logic sgout;
+    logic [4:0] f;
+    integer lead_bit; integer sh;
+    logic dropped_bit0;
+    f = 5'd0;
+    if (is_nan_d(dxa) | is_nan_d(dxb)) begin
+      if (is_snan_d(dxa) | is_snan_d(dxb)) f = f | FF_NV;
+      ff = f; return CANON_D_NAN;
+    end
+    sga = dxa[63]; sgb = dxb[63];
+    eff_sub = sga ^ sgb ^ sub;
+    if (is_inf_d(dxa) & is_inf_d(dxb) & eff_sub) begin
+      f = f | FF_NV; ff = f; return CANON_D_NAN;
+    end
+    if (is_inf_d(dxa)) begin ff = f; return dxa; end
+    if (is_inf_d(dxb)) begin ff = f; return sub ? {~sgb, dxb[62:0]} : dxb; end
+    // Zero + zero: exact signed zero. Same-sign zeros keep the sign;
+    // opposite-sign zeros give +0 (-0 under round-down).
+    if (is_zero_d(dxa) & is_zero_d(dxb)) begin
+      logic zs; logic sgb_eff;
+      sgb_eff = sgb ^ sub;
+      zs = (sga == sgb_eff) ? sga : (rmode == RM_RDN);
+      ff = f; return {zs, 63'd0};
+    end
+    ea = dxa[62:52]; eb = dxb[62:52];
+    ma = (ea==11'd0) ? {1'b0, dxa[51:0]} : {1'b1, dxa[51:0]};
+    mb = (eb==11'd0) ? {1'b0, dxb[51:0]} : {1'b1, dxb[51:0]};
+    if (ea==11'd0) begin ma = 53'd0; ea = 11'd1; end
+    if (eb==11'd0) begin mb = 53'd0; eb = 11'd1; end
+    swap = (ea < eb) | ((ea == eb) & (ma < mb));
+    if (swap) begin
+      ebig = eb; esmall = ea; mbig = mb; msmall = ma;
+      sgout = sgb ^ sub;
+    end else begin
+      ebig = ea; esmall = eb; mbig = ma; msmall = mb; sgout = sga;
+    end
+    diff = ebig - esmall;
+    bigF = {3'b0, mbig, 3'b0};
+    smallF = {3'b0, msmall, 3'b0};
+    stk = 1'b0;
+    if (diff >= 12'd59) begin
+      stk = |msmall;
+      smallF = 59'd0;
+    end else begin
+      stk = |(smallF & ({59{1'b1}} >> (59 - diff)));
+      smallF = smallF >> diff;
+    end
+    if (!eff_sub) begin
+      sumF = bigF + smallF;
+      eout = $signed({1'b0, ebig});
+      if (sumF[56]) begin
+        dropped_bit0 = sumF[0];
+        sumF = {1'b0, sumF[58:1]};
+        sumF[0] = sumF[0] | dropped_bit0 | stk;
+        eout = eout + 13'sd1;
+      end else begin
+        sumF[0] = sumF[0] | stk;
+      end
+    end else begin
+      smallF[0] = smallF[0] | stk;
+      sumF = bigF - smallF;
+      eout = $signed({1'b0, ebig});
+      if (sumF[58:3] == 56'd0) begin
+        ff = f; return {(sgout & (|{sumF, stk})), 63'd0};
+      end
+      lead_bit = msb_pos59(sumF, 3);
+      sh = 55 - lead_bit;
+      if (sh > 0) begin
+        sumF = sumF << sh;
+        eout = eout - sh;
+      end
+      sumF[0] = sumF[0] | stk;
+    end
+    ff = f;
+    return round_pack_d(sgout, eout[11:0], sumF, rmode, ff);
+  endfunction
+
+  // =========================================================================
+  // FMUL double: multiply mantissas, add exponents, XOR signs.
+  // ma,mb are 1.x (53-bit, implicit at bit 52), so the 106-bit product
+  // leads at bit 105 (value in [2.0,4.0)) or 104 (value in [1.0,2.0)).
+  // =========================================================================
+  function automatic logic [63:0] fmul_d(input logic [63:0] dxa, input logic [63:0] dxb,
+                                         input logic [2:0] rmode, output logic [4:0] ff);
+    logic sga, sgb; logic [10:0] ea, eb; logic [52:0] ma, mb;
+    logic [105:0] prod; logic [58:0] F; logic signed [12:0] eout; logic [4:0] f;
+    logic stk;
+    f = 5'd0;
+    if (is_nan_d(dxa) | is_nan_d(dxb)) begin
+      if (is_snan_d(dxa) | is_snan_d(dxb)) f = f | FF_NV;
+      ff = f; return CANON_D_NAN;
+    end
+    sga = dxa[63]; sgb = dxb[63];
+    if (is_inf_d(dxa) & is_zero_d(dxb)) begin f = f | FF_NV; ff = f; return CANON_D_NAN; end
+    if (is_zero_d(dxa) & is_inf_d(dxb)) begin f = f | FF_NV; ff = f; return CANON_D_NAN; end
+    if (is_inf_d(dxa) | is_inf_d(dxb)) begin ff = f; return {(sga ^ sgb), 11'h7FF, 52'd0}; end
+    // Zero x finite = signed zero (IEEE: exact, no flags).
+    if (is_zero_d(dxa) | is_zero_d(dxb)) begin ff = f; return {sga ^ sgb, 63'd0}; end
+    ea = dxa[62:52]; eb = dxb[62:52];
+    ma = (ea==11'd0) ? {1'b0, dxa[51:0]} : {1'b1, dxa[51:0]};
+    mb = (eb==11'd0) ? {1'b0, dxb[51:0]} : {1'b1, dxb[51:0]};
+    if (ea==11'd0) ea = 11'd1;
+    if (eb==11'd0) eb = 11'd1;
+    eout = $signed({2'b00, ea} + {2'b00, eb} - 13'd1023);
+    prod = ma * mb;   // 106-bit
+    if (prod[105]) begin
+      // value in [2.0,4.0): bit 105 -> field bit 55 (shift right 50).
+      F = (prod >> 50) & {59{1'b1}};
+      stk = |(prod & (((106'b1) << 50) - 106'b1));
+      F[0] = F[0] | stk;
+      eout = eout + 13'sd1;
+    end else begin
+      // value in [1.0,2.0): bit 104 -> field bit 55 (shift right 49).
+      F = (prod >> 49) & {59{1'b1}};
+      stk = |(prod & (((106'b1) << 49) - 106'b1));
+      F[0] = F[0] | stk;
+    end
+    ff = f;
+    return round_pack_d(sga ^ sgb, eout[11:0], F, rmode, ff);
+  endfunction
+
+  // =========================================================================
   // FMUL single: multiply mantissas, add exponents, XOR signs.
   // =========================================================================
   function automatic logic [31:0] fmul_s(input logic [31:0] sxa, input logic [31:0] sxb,
@@ -560,9 +735,59 @@ module fpu #(
   endfunction
 
   // =========================================================================
-  // FDIV single (iterative restoring division, but here pure-combinational for
-  // validation since 24-bit quotient is feasible). Multi-cycle in real HW.
+  // FDIV double (iterative restoring division, pure-combinational here).
+  // Quotient q = (ma << 55) / mb is 56 bits: q[55] set means value in
+  // [1.0,2.0) with the 52-bit mantissa in q[54:3] and g/r/s in q[2:0];
+  // otherwise shift left 1 and decrement the exponent. Remainder = sticky.
   // =========================================================================
+  function automatic logic [63:0] fdiv_d(input logic [63:0] dxa, input logic [63:0] dxb,
+                                         input logic [2:0] rmode, output logic [4:0] ff);
+    logic sga, sgb; logic [10:0] ea, eb; logic [52:0] ma, mb;
+    logic [55:0] q; logic [107:0] rem, dividend, qprod; integer i;
+    logic [58:0] F; logic signed [12:0] eout; logic [4:0] f;
+    logic stk;
+    f = 5'd0;
+    if (is_nan_d(dxa) | is_nan_d(dxb)) begin
+      if (is_snan_d(dxa) | is_snan_d(dxb)) f = f | FF_NV;
+      ff = f; return CANON_D_NAN;
+    end
+    sga = dxa[63]; sgb = dxb[63];
+    if (is_inf_d(dxa) & is_inf_d(dxb)) begin f = f | FF_NV; ff=f; return CANON_D_NAN; end
+    if (is_zero_d(dxa) & is_zero_d(dxb)) begin f = f | FF_NV; ff=f; return CANON_D_NAN; end
+    if (is_inf_d(dxa)) begin ff=f; return {(sga^sgb), 11'h7FF, 52'd0}; end
+    if (is_inf_d(dxb)) begin ff=f; return {(sga^sgb), 63'd0}; end
+    if (is_zero_d(dxb)) begin
+      f = f | FF_DZ; ff=f; return {(sga^sgb), 11'h7FF, 52'd0};
+    end
+    // 0 / finite = signed zero (exact, no flags).
+    if (is_zero_d(dxa)) begin ff=f; return {(sga^sgb), 63'd0}; end
+    ea = dxa[62:52]; eb = dxb[62:52];
+    ma = (ea==11'd0) ? {1'b0, dxa[51:0]} : {1'b1, dxa[51:0]};
+    mb = (eb==11'd0) ? {1'b0, dxb[51:0]} : {1'b1, dxb[51:0]};
+    if (ea==11'd0) ea = 11'd1;
+    if (eb==11'd0) eb = 11'd1;
+    eout = $signed({2'b00, ea}) - $signed({2'b00, eb}) + 13'sd1023;
+    // Compute a 56-bit quotient q = (ma << 55) / mb so that the 53-bit
+    // mantissa sits in q[55:3] with guard/round/sticky in q[2:0];
+    // the remainder supplies the sticky.
+    dividend = {55'd0, ma} << 55;   // 108-bit
+    q        = dividend[107:0] / {3'd0, mb};
+    qprod    = {52'd0, q} * {52'd0, mb};
+    rem      = dividend - qprod;
+    stk      = (rem != 108'd0);
+    if (q[55]) begin
+      // value in [1.0,2.0): mantissa = q[55:3], guard=q[2], round=q[1], sticky=q[0].
+      F    = {3'b0, q[55:0]};
+      F[0] = F[0] | stk;
+    end else begin
+      // value in [0.5,1.0): shift left 1, exp--.
+      F    = {2'b0, q[54:0], 1'b0};
+      F[0] = F[0] | stk;
+      eout = eout - 13'sd1;
+    end
+    ff = f;
+    return round_pack_d(sga ^ sgb, eout[11:0], F, rmode, ff);
+  endfunction
   function automatic logic [31:0] fdiv_s(input logic [31:0] sxa, input logic [31:0] sxb,
                                          input logic [2:0] rmode, output logic [4:0] ff);
     logic sga, sgb; logic [7:0] ea, eb; logic [23:0] ma, mb;
@@ -615,6 +840,74 @@ module fpu #(
     end
     ff = f;
     return round_pack_s(sga ^ sgb, eout, F, rmode, ff);
+  endfunction
+
+  // =========================================================================
+  // FSQRT double: digit-by-digit (non-restoring) integer sqrt, scaled from
+  // fsqrt_s: 54-bit mantissa, 110-bit radicand, 55 root iterations. The
+  // 55-bit root has its leading 1 at res[54]; F maps it to field bit 55.
+  // =========================================================================
+  function automatic logic [63:0] fsqrt_d(input logic [63:0] dxa,
+                                          input logic [2:0] rmode, output logic [4:0] ff);
+    logic [10:0] ea; logic [53:0] mant; logic [51:0] fracf;
+    logic [111:0] res, rem, term; integer i, k; integer L; integer bi;
+    logic [109:0] radicand;
+    logic [58:0] F; logic signed [12:0] eout; logic [4:0] f;
+    logic stk; logic odd_exp;
+    f = 5'd0;
+    if (is_nan_d(dxa)) begin
+      if (is_snan_d(dxa)) f = f | FF_NV;
+      ff = f; return CANON_D_NAN;
+    end
+    if (is_inf_d(dxa)) begin ff = f; return dxa; end
+    if (dxa[63]) begin
+      if (is_zero_d(dxa)) begin ff = f; return 64'h8000000000000000; end
+      f = f | FF_NV; ff = f; return CANON_D_NAN;
+    end
+    if (is_zero_d(dxa)) begin ff = f; return 64'h0000000000000000; end
+    ea = dxa[62:52];
+    fracf = dxa[51:0];
+    // Normalize denormal inputs (ea==0, fracf!=0): L is the leading-1 bit
+    // position in the 52-bit fraction field; E = L - 1075.
+    if (ea == 11'd0) begin
+      L = -1;
+      for (k = 51; k >= 0; k = k - 1)
+        if (fracf[k] && L < 0) L = k;
+      mant = {1'b1, fracf << (52 - L)};
+      eout = $signed(13'(L)) - 13'sd1075;
+    end else begin
+      mant = {1'b1, fracf};
+      eout = $signed({2'b00, ea}) - 13'sd1023;
+    end
+    // For an odd unbiased exponent, fold the factor of 2 into the mantissa
+    // and use E (already even after floor div).
+    odd_exp = eout[0];
+    if (odd_exp) begin
+      radicand = {57'd0, mant} << 57;
+    end else begin
+      radicand = {57'd0, mant} << 56;
+    end
+    // Classic non-restoring sqrt: 55 iterations, two radicand bits per step,
+    // extracted by absolute index from the MSB down.
+    rem = 112'd0; res = 112'd0;
+    for (i = 54; i >= 0; i = i - 1) begin
+      bi = 2*i + 1;
+      rem = (rem << 2) | radicand[bi -: 2];
+      term = (res << 2) | 112'd1;
+      if (rem >= term) begin
+        rem = rem - term;
+        res = (res << 1) | 112'd1;
+      end else begin
+        res = res << 1;
+      end
+    end
+    stk = (rem != 112'd0);
+    // res is 55-bit: res[54]=leading 1, res[53:2]=52 frac bits, res[1]=guard,
+    // res[0]=round. Map into the 59-bit round_pack field (leading 1 at bit 55).
+    F = (res << 1) | {58'd0, stk};
+    eout = (eout >>> 1) + 13'sd1023;
+    ff = f;
+    return round_pack_d(1'b0, eout[11:0], F, rmode, ff);
   endfunction
 
   // =========================================================================
@@ -689,6 +982,49 @@ module fpu #(
   // =========================================================================
   // Non-arithmetic operations
   // =========================================================================
+
+  // FMIN/FMAX double. Same selection rules as the single versions;
+  // sNaN inputs set NV even when the result is not NaN.
+  function automatic logic [63:0] fmin_d(input logic [63:0] a, input logic [63:0] b,
+                                         output logic [4:0] ff);
+    ff = 5'd0;
+    if (is_snan_d(a) | is_snan_d(b)) ff = FF_NV;
+    if (is_nan_d(a) & is_nan_d(b)) return CANON_D_NAN;
+    if (is_nan_d(a)) return b;
+    if (is_nan_d(b)) return a;
+    if (a[63] & ~b[63]) return a;  // a negative, b positive
+    if (~a[63] & b[63]) return b;  // a positive, b negative
+    if (a[63]) begin
+      // both negative: larger magnitude is smaller; -0 < +0 handled since
+      // the zero with sign 1 has the same magnitude but must win.
+      if (a[62:0] > b[62:0]) return a;
+      return b;
+    end
+    // both positive: smaller magnitude is smaller; +0 vs -0 returns -0
+    if (a[62:0] < b[62:0]) return a;
+    if (a[62:0] > b[62:0]) return b;
+    return a;  // equal: identical bits
+  endfunction
+
+  function automatic logic [63:0] fmax_d(input logic [63:0] a, input logic [63:0] b,
+                                         output logic [4:0] ff);
+    ff = 5'd0;
+    if (is_snan_d(a) | is_snan_d(b)) ff = FF_NV;
+    if (is_nan_d(a) & is_nan_d(b)) return CANON_D_NAN;
+    if (is_nan_d(a)) return b;
+    if (is_nan_d(b)) return a;
+    if (a[63] & ~b[63]) return b;  // a negative, b positive
+    if (~a[63] & b[63]) return a;  // a positive, b negative
+    if (a[63]) begin
+      // both negative: smaller magnitude is larger
+      if (a[62:0] < b[62:0]) return a;
+      return b;
+    end
+    // both positive: larger magnitude is larger
+    if (a[62:0] > b[62:0]) return a;
+    if (a[62:0] < b[62:0]) return b;
+    return a;
+  endfunction
 
   // FMIN - smaller of two values; -0 < +0 for min/max purposes.
   // Both NaN -> canonical NaN; one NaN -> the non-NaN operand.
