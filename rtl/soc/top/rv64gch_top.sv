@@ -30,6 +30,7 @@ module rv64gch_top #(
 
   logic [31:0] dbg_pc;
   logic        timer_irq, soft_irq, ext_irq;
+  logic        fence_i_retire;
 
   assign timer_irq = 1'b0;
   assign soft_irq  = 1'b0;
@@ -48,12 +49,27 @@ module rv64gch_top #(
     .mem_wdata(dmem_wdata), .mem_lock(dmem_lock),
     .mem_rdata(dmem_rdata), .mem_ack(dmem_ack),
     .mem_ready(dmem_ready), .mem_err(dmem_err),
-    .dbg_pc(dbg_pc)
+    .dbg_pc(dbg_pc), .fence_i_o(fence_i_retire)
+  );
+
+  // L1 instruction cache (blocking, read-only) between the core fetch port
+  // and the shared AXI arbiter below. The arbiter now sees the cache's
+  // fill port (l1_*); the core fetch contract is served from cache lines.
+  logic        l1_req, l1_ack, l1_ready;
+  logic [47:0] l1_addr;
+  logic [63:0] l1_rdata;
+  l1i #(.ADDR_W(ADDR_W), .DATA_W(DATA_W)) u_l1i (
+    .clk(clk), .rst_n(rst_n),
+    .req_i(fetch_req), .addr_i(fetch_addr),
+    .rdata_o(fetch_rdata), .ack_o(fetch_ack), .ready_o(fetch_ready),
+    .req_o(l1_req), .addr_o(l1_addr),
+    .rdata_i(l1_rdata), .ack_i(l1_ack), .ready_i(l1_ready),
+    .flush_i(fence_i_retire)
   );
 
   assign core_active_o = (dbg_pc != 32'd0);
 
-  logic        axi_req, axi_we, axi_ack, axi_ready, axi_err;
+  logic        axi_req, axi_we, axi_ack, axi_ready, axi_err, axi_idle;
   logic [47:0] axi_addr;
   logic [7:0]  axi_be;
   logic [63:0] axi_wdata, axi_rdata;
@@ -68,37 +84,48 @@ module rv64gch_top #(
   // fetch request).
   assign sel_dmem = dmem_req;
 
-  assign axi_req   = sel_dmem ? dmem_req   : (fetch_req & fetch_ready);
+  assign axi_req   = sel_dmem ? dmem_req   : (l1_req & l1_ready);
   assign axi_we    = sel_dmem ? dmem_we    : 1'b0;
-  assign axi_addr  = sel_dmem ? dmem_addr  : fetch_addr;
-  assign axi_be    = sel_dmem ? dmem_be    : fetch_be;
-  assign axi_wdata = sel_dmem ? dmem_wdata : fetch_wdata;
+  assign axi_addr  = sel_dmem ? dmem_addr  : l1_addr;
+  assign axi_be    = sel_dmem ? dmem_be    : 8'hFF;
+  assign axi_wdata = sel_dmem ? dmem_wdata : 64'd0;
 
-  assign dmem_rdata  = axi_rdata;
-  assign fetch_rdata = axi_rdata;
+  assign dmem_rdata = axi_rdata;
+  assign l1_rdata   = axi_rdata;
 
-  // The owner is latched at the moment the AXI master accepts a new
-  // request (st==A_IDLE && req), i.e. the cycle it leaves idle. When a
-  // transaction completes (axi_ack) the master returns to idle in the same
-  // cycle, so a new request can be accepted simultaneously; the new owner
-  // must take precedence over clearing the previous one.
+  // The owner is latched exactly when the AXI master accepts a new
+  // request (its A_IDLE && req sampling). Gated by the master's
+  // combinational idle_o, not the registered ready: after an accept, ready
+  // stays high for one more cycle while the master is already in A_AR/A_AW,
+  // and a request present in that window (held fill req, or a data request
+  // racing a just-accepted fill beat) must NOT re-latch ownership, or the
+  // in-flight transaction's ack would be misrouted. When a transaction
+  // completes (axi_ack) the master returns to idle in the same cycle, so a
+  // new request can be accepted simultaneously; the new owner must take
+  // precedence over clearing the previous one.
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       axi_owner_dmem <= 1'b0;
-    end else if (axi_ready && axi_req) begin
+    end else if (axi_idle && axi_req) begin
       axi_owner_dmem <= sel_dmem;
+      `ifdef L1I_DEBUG
+      $display("[top %0t] ACCEPT sel_dmem=%b addr=%h", $time, sel_dmem, axi_addr);
+      `endif
     end else if (axi_ack) begin
       axi_owner_dmem <= 1'b0;
+      `ifdef L1I_DEBUG
+      $display("[top %0t] ACK owner_dmem=%b rdata=%h", $time, axi_owner_dmem, axi_rdata);
+      `endif
     end
   end
 
-  assign dmem_ack   = axi_ack &  axi_owner_dmem;
-  assign fetch_ack  = axi_ack & ~axi_owner_dmem;
+  assign dmem_ack = axi_ack &  axi_owner_dmem;
+  assign l1_ack   = axi_ack & ~axi_owner_dmem;
 
-  // Fetch can issue when the master is idle and no data request is pending.
-  // Data memory can issue when the master is idle.
-  assign fetch_ready = axi_ready & ~sel_dmem;
-  assign dmem_ready  = axi_ready;
+  // Fill requests can issue when the master is idle and no data request
+  // is pending. Data memory can issue when the master is idle.
+  assign l1_ready   = axi_ready & ~sel_dmem;
+  assign dmem_ready = axi_ready;
 
   axi4_master #(.ADDR_W(ADDR_W), .DATA_W(DATA_W), .ID_W(ID_W)) u_axi (
     .clk(clk), .rst_n(rst_n),
@@ -106,6 +133,7 @@ module rv64gch_top #(
     .addr(axi_addr), .be(axi_be), .wdata(axi_wdata),
     .size(4'd3), .lock(dmem_lock & sel_dmem),
     .rdata(axi_rdata), .ack(axi_ack), .ready(axi_ready), .err(axi_err),
+    .idle_o(axi_idle),
     .bus(mem)
   );
 

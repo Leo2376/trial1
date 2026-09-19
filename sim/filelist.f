@@ -11,6 +11,7 @@
 ../../rtl/core/ctrl/forwarding_unit.sv
 ../../rtl/core/ctrl/hazard_unit.sv
 ../../rtl/soc/fabric/axi4_master.sv
+../../rtl/cache/l1i/l1i.sv
 ../../rtl/core/rv64gch_core.sv
 ../../rtl/soc/fabric/axi4_decoder.sv
 ../../rtl/soc/top/rv64gch_top.sv

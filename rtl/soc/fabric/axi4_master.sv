@@ -17,6 +17,10 @@ module axi4_master #(
   output logic              ack,
   output logic              ready,
   output logic              err,
+  // Combinational: master will accept a request presented this cycle.
+  // (ready is registered and stays high for a cycle after the master
+  // leaves IDLE, so it cannot gate ownership.)
+  output logic              idle_o,
 
   axi4_if.m                bus
 );
@@ -142,6 +146,8 @@ module axi4_master #(
       rdata <= rdata_n; ack <= ack_n; ready <= ready_n; err <= err_n;
     end
   end
+
+  assign idle_o = (st == A_IDLE);
 
   always_comb begin
     bus.awid    = '0;

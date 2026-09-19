@@ -26,7 +26,9 @@ module rv64gch_core #(
   input  logic             mem_ack,
   input  logic             mem_ready,
   input  logic             mem_err,
-  output logic [31:0]      dbg_pc
+  output logic [31:0]      dbg_pc,
+  // Single-cycle pulse when a FENCE.I retires at WB (for L1I invalidation).
+  output logic             fence_i_o
 );
   import rtl_core_pkg::*;
   import rv64gch_memmap_pkg::RESET_PC;
@@ -1131,6 +1133,10 @@ module rv64gch_core #(
     if (!rst_n) wb_pkt <= '0;
     else if (!stall) wb_pkt <= wb_pkt_n;
   end
+
+  // FENCE.I retires in order at WB; the pulse may stretch across a stall
+  // (WB holds), which is harmless for the idempotent L1I invalidate.
+  assign fence_i_o = wb_pkt.valid & wb_pkt.ctrl.fence_i;
 
   assign rd_w = wb_pkt.rd;
   assign rd_w_fp = wb_pkt.rd;
