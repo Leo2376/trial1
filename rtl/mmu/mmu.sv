@@ -79,19 +79,23 @@ module mmu #(
   assign satp_ppn  = satp_i[43:0];
 
   logic vm_enable_f, vm_enable_d;
-  assign vm_enable_f = (satp_mode == SATP_SV39) && (priv_f_i != PRIV_M);
-  assign vm_enable_d = (satp_mode == SATP_SV39) && (priv_d_i != PRIV_M);
+  logic is_sv48;
+  assign is_sv48 = (satp_mode == SATP_SV48);
+  assign vm_enable_f = ((satp_mode == SATP_SV39) || is_sv48) && (priv_f_i != PRIV_M);
+  assign vm_enable_d = ((satp_mode == SATP_SV39) || is_sv48) && (priv_d_i != PRIV_M);
 
   logic mstatus_sum, mstatus_mxr;
   assign mstatus_sum = mstatus_i[18];
   assign mstatus_mxr = mstatus_i[19];
 
   // ---------------------------------------------------------------- TLB --
-  localparam int VPN_BITS = 27;
+  // Sv39: VPN 27 bits (VPN2/1/0), levels 2/1/0 = 1G/2M/4K.
+  // Sv48: VPN 36 bits (VPN3/2/1/0), levels 3/2/1/0 = 512G/1G/2M/4K.
+  localparam int VPN_BITS = 36;
   // Valid as a packed vector so a flush clears (masked) in one shot.
   logic [TLB_ENTRIES-1:0] tlb_valid;
   logic [VPN_BITS-1:0] tlb_vpn   [TLB_ENTRIES];
-  logic [1:0]          tlb_level [TLB_ENTRIES]; // 2=1G, 1=2M, 0=4K
+  logic [1:0]          tlb_level [TLB_ENTRIES]; // 3=512G, 2=1G, 1=2M, 0=4K
   logic [43:0]         tlb_ppn   [TLB_ENTRIES];
   logic                tlb_u     [TLB_ENTRIES];
   logic                tlb_r     [TLB_ENTRIES];
@@ -128,17 +132,20 @@ module mmu #(
   endfunction
 
   // VPN match mask per page size (superpages ignore low VPN bits).
+  // VPN layout [35:0] = VPN3[35:27] VPN2[26:18] VPN1[17:9] VPN0[8:0].
   function automatic logic [VPN_BITS-1:0] level_mask(input logic [1:0] lvl);
-    if (lvl == 2'd2)      level_mask = 27'h7FC0000; // keep VPN2
-    else if (lvl == 2'd1) level_mask = 27'h7FFFE00; // keep VPN2/1
-    else                  level_mask = 27'h7FFFFFF; // keep all
+    if (lvl == 2'd3)      level_mask = 36'hFF8000000; // keep VPN3 (512G)
+    else if (lvl == 2'd2) level_mask = 36'hFFFFC0000; // keep VPN3/2 (1G)
+    else if (lvl == 2'd1) level_mask = 36'hFFFFFFE00; // keep VPN3/2/1 (2M)
+    else                  level_mask = 36'hFFFFFFFFF; // keep all (4K)
   endfunction
 
   // PA assembly per page size (PPN range vetted by the walker at install:
   // ppn[43:36]==0 always; superpage low-PPN alignment page-faults).
   function automatic logic [ADDR_W-1:0] make_pa(
     input logic [43:0] ppn, input logic [1:0] lvl, input logic [63:0] va);
-    if (lvl == 2'd2)      make_pa = {ppn[35:18], va[29:0]};
+    if (lvl == 2'd3)      make_pa = {ppn[35:27], va[38:0]};
+    else if (lvl == 2'd2) make_pa = {ppn[35:18], va[29:0]};
     else if (lvl == 2'd1) make_pa = {ppn[35:9], va[20:0]};
     else                  make_pa = {ppn[35:0], va[11:0]};
   endfunction
@@ -154,7 +161,7 @@ module mmu #(
     integer e;
     tlb_lookup = 6'd32;
     pa = '0; need_d = 1'b0;
-    vpn = va[38:12];
+    vpn = va[47:12];
     for (e = 0; e < TLB_ENTRIES; e = e + 1) begin
       if (tlb_valid[e] && (tlb_asid[e] == asid) &&
           ((vpn & level_mask(tlb_level[e])) ==
@@ -168,8 +175,9 @@ module mmu #(
     end
   endfunction
 
-  function automatic logic canonical(input logic [63:0] va);
-    return (va[63:39] == {25{va[38]}});
+  function automatic logic canonical(input logic [63:0] va, input logic sv48);
+    if (sv48) return (va[63:48] == {16{va[47]}});
+    else      return (va[63:39] == {25{va[38]}});
   endfunction
 
   // Fetch-port lookup (exec; never needs D).
@@ -177,7 +185,7 @@ module mmu #(
   logic [ADDR_W-1:0]    f_pa;
   logic                 f_need_d;
   logic                 f_canon;
-  assign f_canon = canonical(va_f_i);
+  assign f_canon = canonical(va_f_i, is_sv48);
   assign f_way = tlb_lookup(va_f_i, priv_f_i, 1'b0, 1'b0, 1'b1,
                             mstatus_sum, mstatus_mxr, satp_asid, f_pa, f_need_d);
 
@@ -186,7 +194,7 @@ module mmu #(
   logic [ADDR_W-1:0]    d_pa;
   logic                 d_need_d;
   logic                 d_canon;
-  assign d_canon = canonical(va_d_i);
+  assign d_canon = canonical(va_d_i, is_sv48);
   assign d_way = tlb_lookup(va_d_i, priv_d_i, rd_d_i, wr_d_i, 1'b0,
                             mstatus_sum, mstatus_mxr, satp_asid, d_pa, d_need_d);
 
@@ -218,7 +226,7 @@ module mmu #(
       if (tlb_valid[e] &&
           (!flush_has_asid_i || (tlb_asid[e] == flush_asid_i)) &&
           (!flush_has_va_i ||
-           (((flush_va_i[38:12] & level_mask(tlb_level[e])) ==
+           (((flush_va_i[47:12] & level_mask(tlb_level[e])) ==
              (tlb_vpn[e] & level_mask(tlb_level[e]))))))
         flush_mask[e] = 1'b1;
     end
@@ -264,6 +272,7 @@ module mmu #(
   // PTE address: {table_ppn[35:0], vpn[level], 3'b0}. Table bases are
   // range-checked before descending, so the top PPN bits are zero here.
   assign addr_o  = {walk_ppn_q[35:0],
+                    walk_level_q == 2'd3 ? walk_va_q[47:39] :
                     walk_level_q == 2'd2 ? walk_va_q[38:30] :
                     walk_level_q == 2'd1 ? walk_va_q[29:21] : walk_va_q[20:12],
                     3'b000};
@@ -311,7 +320,7 @@ module mmu #(
               walk_va_q    <= va_d_i;
               walk_wr_q    <= wr_d_i;
               walk_priv_q  <= priv_d_i;
-              walk_level_q <= 2'd2;
+              walk_level_q <= is_sv48 ? 2'd3 : 2'd2;
               walk_ppn_q   <= satp_ppn;
               fault_q      <= 1'b0;
               // Root table base must fit 48-bit PA space.
@@ -328,7 +337,7 @@ module mmu #(
               walk_va_q    <= va_f_i;
               walk_wr_q    <= 1'b0;
               walk_priv_q  <= priv_f_i;
-              walk_level_q <= 2'd2;
+              walk_level_q <= is_sv48 ? 2'd3 : 2'd2;
               walk_ppn_q   <= satp_ppn;
               fault_q      <= 1'b0;
               if (satp_ppn[43:36] != 8'd0) begin
@@ -376,7 +385,10 @@ module mmu #(
             end else if (is_leaf) begin
               // Superpage alignment + 48-bit PA range.
               logic misaligned, oor;
-              if (walk_level_q == 2'd2) begin
+              if (walk_level_q == 2'd3) begin
+                misaligned = (ppn[26:0] != 27'd0);
+                oor = (ppn[43:36] != 8'd0);
+              end else if (walk_level_q == 2'd2) begin
                 misaligned = (ppn[17:0] != 18'd0);
                 oor = (ppn[43:36] != 8'd0);
               end else if (walk_level_q == 2'd1) begin
@@ -406,7 +418,7 @@ module mmu #(
                 `endif
                 tlb_valid[tlb_rr_q] <= 1'b1;
                 tlb_asid[tlb_rr_q]  <= satp_asid;
-                tlb_vpn[tlb_rr_q]   <= walk_va_q[38:12];
+                tlb_vpn[tlb_rr_q]   <= walk_va_q[47:12];
                 tlb_level[tlb_rr_q] <= walk_level_q;
                 tlb_ppn[tlb_rr_q]   <= ppn;
                 tlb_u[tlb_rr_q]     <= u;
@@ -450,7 +462,7 @@ module mmu #(
               // PTE updated in memory; install with A/D set.
               tlb_valid[tlb_rr_q] <= 1'b1;
               tlb_asid[tlb_rr_q]  <= satp_asid;
-              tlb_vpn[tlb_rr_q]   <= walk_va_q[38:12];
+              tlb_vpn[tlb_rr_q]   <= walk_va_q[47:12];
               tlb_level[tlb_rr_q] <= walk_level_q;
               tlb_ppn[tlb_rr_q]   <= walk_pte_q[53:10];
               tlb_u[tlb_rr_q]     <= walk_pte_q[4];

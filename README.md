@@ -27,7 +27,7 @@ synthesis), not FPGA.
 | MMU Sv39 (shared 32-e TLB + HW walker, 4K/2M/1G, A/D) | **DONE** | sv39_basic/fault/sfence PASS |
 | Trap delegation (medeleg/mideleg, S-trap entry, vectored tvec) | **DONE** | deleg_basic PASS |
 | ASID tags + selective SFENCE.VMA | **DONE** | asid_test PASS |
-| MMU Sv48 | Not started | — |
+| MMU Sv48 (4-level walk, 512G/1G/2M/4K) | **DONE** | sv48_basic PASS |
 | Dual-issue frontend | Not started | — |
 | RVV 1.0 vector engine | Not started | — |
 | IME 1.0 matrix extension | Not started | — |
@@ -90,7 +90,10 @@ single-cycle, FDIV/FSQRT iterative); fflags accumulate to CSR via WB.
    means all) with a fence-window freeze instead of drop
    (`asid_test` proves isolation + VA-selective survival).
    Remaining: **Sv48** (mode 9 currently WARLs to Bare).
-6. **MMU (Sv48)** — 4-level walk extension of the same engine.
+6. **MMU (Sv48)** — **DONE**. Same engine parameterized: 36-bit VPN,
+   level-3 start, 512G leaves (PPN[26:0] alignment), Sv48 canonical rule,
+   mode-9 WARL accept. `sv48_basic` proves a 4-level data remap + PA
+   alias, fetch remap, 2M-page read, and A/D at depth 3.
 7. **Dual-issue frontend** — 8B/cycle fetch, dual decode, ALU+MDU/FPU pairing,
    wider hazard/forwarding.
 8. **RVV 1.0 (VLEN=256) + IME 1.0** — no separate VPU memory interface:
@@ -128,8 +131,10 @@ Three levels, all driven by the upstream riscv-tests ISA suites:
    cases with (cause,tval) matching + handler resume), and
    `software/tests/sv39_sfence.S` (remap visible after SFENCE.VMA),
    `software/tests/deleg_basic.S` (delegated S-ecall handling + sret
-   return + second ecall), and `software/tests/asid_test.S` (two-ASID
-   isolation + VA-selective sfence proven by survival + fault).
+   return + second ecall), `software/tests/asid_test.S` (two-ASID
+   isolation + VA-selective sfence proven by survival + fault), and
+   `software/tests/sv48_basic.S` (4-level remap + alias + fetch + 2M
+   page + A/D under Sv48).
    Build per the header comments, run with
    `Vtb_rv64gch_core +hex=<test>.hex`, expect `TEST PASSED`.
 
@@ -165,9 +170,10 @@ cd sim/verilator && make decomp   # 44/44 PASS
 ./sim/verilator/obj_dir/Vtb_rv64gch_core +hex=/tmp/sv39_sfence.hex     # TEST PASSED
 ./sim/verilator/obj_dir/Vtb_rv64gch_core +hex=/tmp/deleg_basic.hex     # TEST PASSED
 ./sim/verilator/obj_dir/Vtb_rv64gch_core +hex=/tmp/asid_test.hex       # TEST PASSED
+./sim/verilator/obj_dir/Vtb_rv64gch_core +hex=/tmp/sv48_basic.hex      # TEST PASSED
 ```
 
-Last full regression (L1I + L1D + L2 + Sv39 MMU + delegation + ASID in path): rv64ui 50/50, rv64um 13/13, rv64uf 11/11, rv64uc 1/1 (rvc), rv64ua 19/19, rv64ud 12/12, tb_fpu 79/79, tb_decompressor 44/44, dyn_rm PASS, l1i_conflict PASS, l1d_wb PASS, l2_wb PASS, sv39_basic/fault/sfence PASS, deleg_basic PASS, asid_test PASS.
+Last full regression (caches + Sv39/48 MMU + delegation + ASID in path): rv64ui 50/50, rv64um 13/13, rv64uf 11/11, rv64uc 1/1 (rvc), rv64ua 19/19, rv64ud 12/12, tb_fpu 79/79, tb_decompressor 44/44, dyn_rm PASS, l1i_conflict PASS, l1d_wb PASS, l2_wb PASS, sv39_basic/fault/sfence PASS, deleg_basic PASS, asid_test PASS, sv48_basic PASS.
 
 ## RTL Directory Structure & Module Relationships
 

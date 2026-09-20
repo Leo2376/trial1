@@ -212,10 +212,11 @@ module csr_unit #(
           CSR_SIP:      sip      <= csr_wval;
           CSR_SSCRATCH: sscratch <= csr_wval;
           CSR_SATP: begin
-            // WARL MODE: only Bare and Sv39 legal here.
+            // WARL MODE: Bare, Sv39 and Sv48 legal here.
             satp[59:0]  <= csr_wval[59:0];
             satp[63:60] <= ((csr_wval[63:60] == SATP_BARE) ||
-                            (csr_wval[63:60] == SATP_SV39)) ? csr_wval[63:60]
+                            (csr_wval[63:60] == SATP_SV39) ||
+                            (csr_wval[63:60] == SATP_SV48)) ? csr_wval[63:60]
                                                            : SATP_BARE;
           end
           CSR_FCSR:     fcsr     <= {56'd0, csr_wval[7:0]};
