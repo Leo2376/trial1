@@ -31,7 +31,7 @@ _start:
     li t1, 0x20004401            # PPN 0x80011, V
     sd t1, 16(t0)               # index 2
     # --- root[64]: 1G leaf -> tohost PA 0x100000000 ---
-    li t1, 0x4000000C7          # PPN 0x1000000, V|R|W|A|D
+    li t1, 0x400000C7          # PPN 0x100000, V|R|W|A|D
     sd t1, 512(t0)              # index 64
     # --- L1[0] -> L0a, L1[1] -> L0b ---
     li t0, 0x80011000
@@ -114,6 +114,7 @@ func_tpl:
     addi a0, zero, 0x5A5
     jalr x0, 0(ra)
 
+.balign 4
 m_trap:                         # M-mode: expect S-ecall (cause 9)
     csrr t0, mcause
     li t1, 9

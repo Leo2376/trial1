@@ -41,6 +41,19 @@ module csr_unit #(
   import rtl_core_pkg::*;
 
   logic [XLEN-1:0] mstatus, mie, mtvec, mepc, mcause, mtval, mip, mscratch;
+  logic [XLEN-1:0] medeleg, mideleg;
+  // Delegation for the live trap input (sync via medeleg; only sub-M priv).
+  logic trap_deleg;
+  assign trap_deleg = (priv != PRIV_M) && medeleg[cause];
+  // Next privilege, combinational so the core tracks transitions (trap,
+  // mret, sret) on the committing edge; the redirect/trap flushes cover
+  // the single in-flight cycle. Held otherwise.
+  logic [1:0] new_priv_comb;
+  assign new_priv_comb =
+    trap ? (trap_deleg ? PRIV_S : PRIV_M) :
+    mret ? ((mstatus[12:11] == 2'b10) ? PRIV_U : priv_e'(mstatus[12:11])) :
+    sret ? (sstatus[8] ? PRIV_S : PRIV_U) : new_priv;
+  // new_priv output driven below (flop holding new_priv_comb).
   logic [XLEN-1:0] sstatus, sie, stvec, sepc, scause, stval, sip, sscratch;
   logic [XLEN-1:0] mcycle, minstret;
   logic [XLEN-1:0] fcsr;
@@ -89,6 +102,8 @@ module csr_unit #(
       CSR_MCAUSE:   v = mcause;
       CSR_MTVAL:    v = mtval;
       CSR_MIP:      v = mip;
+      CSR_MEDELEG:  v = medeleg;
+      CSR_MIDELEG:  v = mideleg;
       CSR_MSCRATCH: v = mscratch;
       CSR_MCYCLE:   v = mcycle;
       CSR_CYCLE:    v = mcycle;
@@ -125,6 +140,8 @@ module csr_unit #(
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       mstatus  <= {64'h0000000A00000000};
+      medeleg <= '0; mideleg <= '0;
+      new_priv <= PRIV_M;
       mie      <= '0; mtvec <= '0; mepc <= '0; mcause <= '0; mtval <= '0;
       mip      <= '0; mscratch <= '0;
       sstatus  <= '0; sie <= '0; stvec <= '0; sepc <= '0; scause <= '0;
@@ -139,30 +156,39 @@ module csr_unit #(
       mip[11] <= ext_irq;
 
       // Trap entry is exempt from the flush gate (trap implies flush):
-      // without this ordering no trap is ever recorded. No delegation in
-      // this stage: all traps enter M-mode.
+      // without this ordering no trap is ever recorded. Sync traps from
+      // S/U delegate to S-mode when medeleg[cause] is set (interrupts:
+      // none can fire yet; mideleg stored for later).
+      new_priv <= new_priv_comb;
       if (trap) begin
-        mepc   <= trap_pc;
-        mcause <= {59'd0, cause};
-        mtval  <= tval_valid ? tval : '0;
-        mstatus[7]     <= mstatus[3];  // MPIE = MIE
-        mstatus[3]     <= 1'b0;        // MIE = 0
-        mstatus[12:11] <= priv;        // MPP = previous priv
-        new_priv <= PRIV_M;
+        if (trap_deleg) begin
+          sepc   <= trap_pc;
+          scause <= {59'd0, cause};
+          stval  <= tval_valid ? tval : '0;
+          sstatus[8] <= priv[0];      // SPP = previous priv (U->0, S->1)
+          sstatus[5] <= sie[1];       // SPIE = SIE
+          sie        <= sie & ~64'd2; // SIE = 0
+        end else begin
+          mepc   <= trap_pc;
+          mcause <= {59'd0, cause};
+          mtval  <= tval_valid ? tval : '0;
+          mstatus[7]     <= mstatus[3];  // MPIE = MIE
+          mstatus[3]     <= 1'b0;        // MIE = 0
+          mstatus[12:11] <= priv;        // MPP = previous priv
+        end
       end else if (mret) begin
-        // MPP==2 is reserved; treat as U (WARL-ish).
-        new_priv <= (mstatus[12:11] == 2'b10) ? PRIV_U : priv_e'(mstatus[12:11]);
         mstatus[3] <= mstatus[7];            // MIE = MPIE
         mstatus[7] <= 1'b1;                  // MPIE = 1
         if (mstatus[12:11] != PRIV_M) mstatus[12:11] <= PRIV_U;
       end else if (sret) begin
-        new_priv <= sstatus[8] ? PRIV_S : PRIV_U; // SPP ? S : U
         sie        <= (sie & ~64'd2) | {62'd0, sstatus[5], 1'b0}; // SIE = SPIE
         sstatus[5] <= 1'b1;  // SPIE = 1
         sstatus[8] <= 1'b0;  // SPP = U
       end else if (!flush && csr_op_we) begin
         case (csr_addr)
           CSR_MSTATUS:  mstatus  <= csr_wval;
+          CSR_MEDELEG:  medeleg  <= csr_wval;
+          CSR_MIDELEG:  mideleg  <= csr_wval;
           CSR_MIE:      mie      <= csr_wval;
           CSR_MTVEC:    mtvec    <= csr_wval;
           CSR_MEPC:     mepc     <= csr_wval;
@@ -234,10 +260,15 @@ module csr_unit #(
 
   assign csr_rdata = csr_rdata_q;
   assign epc = (priv == PRIV_M) ? mepc : sepc;
-  // No delegation in this stage: all traps enter M-mode regardless of the
-  // pre-trap privilege (a pre-delegation stvec would send S-mode traps to
-  // a zero vector). Revisit with medeleg/mideleg.
-  assign tvec = mtvec;
+  // Trap vector follows the delegated target. Vectored mode adds
+  // 4*cause to the 4-aligned base; direct mode uses the value exactly
+  // (masking unconditionally would corrupt a direct vector whose low bits
+  // are nonzero, e.g. mtvec=0x182 -> 0x180).
+  logic [XLEN-1:0] tvec_base;
+  assign tvec_base = trap_deleg ? stvec : mtvec;
+  assign tvec = (tvec_base[1:0] == 2'b01) ?
+                ({tvec_base[XLEN-1:2], 2'b0} + {57'd0, cause, 2'b00}) :
+                tvec_base;
   assign irq_pending = (mip[7] & mie[7]) | (mip[3] & mie[3]) | (mip[11] & mie[11]);
   assign fi_we = 1'b0;
   assign fs_mstatus = mstatus[14:13];

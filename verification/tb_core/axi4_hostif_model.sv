@@ -58,6 +58,9 @@ module axi4_hostif_model #(
             w_id   <= bus.awid;
             bus.awready <= 1'b0;
             wst <= W_DATA;
+            `ifdef SLAVE_DEBUG
+            $display("[hostif %0t] AW addr=%h", $time, bus.awaddr);
+            `endif
           end
         end
         W_DATA: begin

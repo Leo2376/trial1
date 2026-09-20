@@ -243,8 +243,12 @@ module l1d #(
           else rst_idx <= rst_idx + 1'b1;
         end
         S_IDLE: begin
-          if (drain_pend_q) begin
-            // Drain wins over a held request; the core is stalled anyway.
+          // Drain starts only from a true idle (no request accepted and
+          // none present): an accepted transaction always runs to its ack
+          // first, so the core is never stranded. A held req wins and the
+          // drain slips in on the next gap (cores always gap between
+          // transactions once the ack clears their issue latch).
+          if (drain_pend_q && !req_i) begin
             drain_set_q <= '0;
             drain_way_q <= '0;
             cnt_q       <= '0;

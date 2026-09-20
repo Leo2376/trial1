@@ -17,6 +17,10 @@ module axi4_decoder #(
   always_comb begin
     aw_sel = (m.awaddr >= BASE1) && (m.awaddr < (BASE1 + SIZE1));
     ar_sel = (m.araddr >= BASE1) && (m.araddr < (BASE1 + SIZE1));
+    `ifdef SLAVE_DEBUG
+    if (m.awvalid) $display("[dec %0t] AW addr=%h base1=%h size1=%h sel=%b",
+                            $time, m.awaddr, BASE1, SIZE1, aw_sel);
+    `endif
   end
 
   always_comb begin

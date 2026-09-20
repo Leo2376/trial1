@@ -127,6 +127,15 @@ module rv64gch_top #(
 
   logic        axi_req, axi_we, axi_ack, axi_ready, axi_err, axi_idle;
   logic [47:0] axi_addr;
+  `ifdef TOP_DEBUG
+  always @(posedge clk) begin
+    if (axi_idle && axi_req)
+      $display("[top %0t] ACCEPT we=%b addr=%h be=%h data=%h", $time,
+               axi_we, axi_addr, axi_be, axi_wdata);
+    if (axi_ack)
+      $display("[top %0t] ACK rdata=%h", $time, axi_rdata);
+  end
+  `endif
   logic [7:0]  axi_be;
   logic [63:0] axi_wdata, axi_rdata;
 

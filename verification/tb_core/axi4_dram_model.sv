@@ -65,10 +65,14 @@ module axi4_dram_model #(
       bus.bid     <= '0;
     end else begin
       case (wst)
-        W_IDLE: begin
-          bus.bvalid <= 1'b0;
-          bus.awready <= 1'b1;
-          if (bus.awvalid && bus.awready) begin
+      W_IDLE: begin
+        bus.bvalid <= 1'b0;
+        bus.awready <= 1'b1;
+        `ifdef SLAVE_DEBUG
+        if (bus.awvalid && bus.awready)
+          $display("[dram %0t] AW addr=%h", $time, bus.awaddr);
+        `endif
+        if (bus.awvalid && bus.awready) begin
             w_addr  <= bus.awaddr;
             w_len   <= bus.awlen;
             w_id    <= bus.awid;

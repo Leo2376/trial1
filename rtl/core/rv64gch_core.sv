@@ -52,7 +52,7 @@ module rv64gch_core #(
   logic [31:0]     instr_f, instr_d;
   logic            valid_f, valid_d, valid_x, valid_m, valid_w;
   logic            is_c_f, is_c_d;
-  logic            flush_all, flush_id, flush_ex;
+  logic            flush_all, flush_id, flush_id_raw, flush_ex;
   logic            stall, stall_raw, frm_stall;
   logic [2:0]      frm;
   logic [2:0]      fpu_rm_eff;
@@ -132,6 +132,7 @@ module rv64gch_core #(
     ctrl_t       ctrl;
     logic [63:0] data;
     logic [63:0] csr_wdata;
+    logic [63:0] rs2v; // rs2 value (SFENCE.VMA asid lives here at retire)
     logic [4:0]  rd;
     logic        we;
     logic        fp_we;
@@ -141,21 +142,15 @@ module rv64gch_core #(
 
   assign dbg_pc = pc_d;
 
-  // Real privilege state (was hardwired M). mret/sret retire at WB while
-  // the CSR unit computes new_priv a cycle later, so the update is picked
-  // up delayed by one cycle; traps go to M immediately. No test changes
-  // priv yet (Bare M-mode), so this is behavior-neutral for now.
-  logic priv_upd_d;
+  // Real privilege state (was hardwired M). Tracks the CSR unit's
+  // combinational next-priv every cycle, so trap/mret/sret transitions
+  // commit on the exact edge; the accompanying redirect/trap flushes cover
+  // the single in-flight cycle (stale-priv fetches never consume).
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       priv <= PRIV_M;
-      priv_upd_d <= 1'b0;
-    end else if (trap) begin
-      priv <= PRIV_M;
-      priv_upd_d <= 1'b0;
     end else begin
-      priv_upd_d <= wb_pkt.ctrl.is_mret | wb_pkt.ctrl.is_sret;
-      if (priv_upd_d) priv <= new_priv;
+      priv <= new_priv;
     end
   end
 
@@ -241,7 +236,7 @@ module rv64gch_core #(
   // otherwise deadlock the core, while a stale result from a flushed pc is
   // ignored. For a 32-bit instruction at byte offset 6 the window straddles
   // two 64-bit words, so fetch_res_valid waits for the second word.
-  assign fetch_done    = fetch_res_valid & ~stall;
+  assign fetch_done    = fetch_res_valid & ~stall & ~vm_fence_active;
   // Fetch virtual address: the straddling second word is translated
   // independently (it can sit on another page).
   logic [63:0] fetch_va;
@@ -287,6 +282,13 @@ module rv64gch_core #(
       fetch_hi_valid <= 1'b0;
       valid_f        <= 1'b1;
       fault_f_q      <= 1'b0;
+    end else if (vm_fence_active) begin
+      // Freeze the skid clear (see above): drop any buffered/in-flight
+      // fetch so post-window fetches re-translate fresh. valid_d/pc_d and
+      // the rest of the pipe are untouched: nothing is lost.
+      fetch_busy     <= 1'b0;
+      fetch_complete <= 1'b0;
+      fetch_hi_valid <= 1'b0;
     end else begin
       // Grab a translation fault once per faulting pc (bubble path);
       // release it once the F->D stage consumes the bubble. A lingering
@@ -737,7 +739,7 @@ module rv64gch_core #(
     .mem_lsu_busy(lsu_busy),
     .branch_taken(redirect), .trap(trap),
     .is_csr_op(dc.writes_csr), .csr_hazard(load_use_hazard_csr),
-    .stall(stall_raw), .flush_id(flush_id), .flush_ex(flush_ex)
+    .stall(stall_raw), .flush_id(flush_id_raw), .flush_ex(flush_ex)
   );
   // A data-TLB miss stalls the whole pipe for the walker (fetch only
   // waits for its own translation at issue; it needs no stall term).
@@ -762,7 +764,18 @@ module rv64gch_core #(
 
   logic flush_redirect;
   assign flush_redirect = redirect | trap;
+  // Fence window: from a FENCE.I/SFENCE/SATP retire until the L1D drain
+  // sweep ends. During it: no new fetch consume, no new data issue, and
+  // the fetch skid is kept clear (in-flight L1I acks land on busy=0 and
+  // are ignored). Retirement itself is untouched, so nothing is lost or
+  // duplicated -- the window simply delays. Covers through drain_busy so
+  // there is no gap between retire-edge and sweep-start/end.
+  logic vm_fence_active;
+  assign vm_fence_active = fence_i_o | sfence_o | satp_we_o | drain_busy_i;
+  assign flush_id = flush_id_raw;
   assign flush_all = flush_id | flush_ex;
+  logic flush_all_no_refetch;
+  assign flush_all_no_refetch = flush_id_raw | flush_ex;
 
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
@@ -1037,10 +1050,18 @@ module rv64gch_core #(
   logic [47:0] mmu_pa_d;
   logic [4:0]  mmu_cause_d;
 
+  // SFENCE.VMA retires with rs1 (VA) in csr_wdata and rs2 (ASID) in
+  // rs2v; x0 on either side means "all". The selective TLB flush fires at
+  // retire (ordered with the L1D drain); F/D refetch below re-translates.
   mmu #(.ADDR_W(48), .TLB_ENTRIES(32)) u_mmu (
     .clk(clk), .rst_n(rst_n),
     .satp_i(csr_satp), .mstatus_i(csr_mstatus), .priv_i(priv),
-    .flush_i(sfence_o | satp_we_o),
+    .flush_all_i(satp_we_o),
+    .flush_sel_i(sfence_o),
+    .flush_va_i(wb_pkt.csr_wdata),
+    .flush_asid_i(wb_pkt.rs2v[15:0]),
+    .flush_has_va_i(wb_pkt.ctrl.rs1 != 5'd0),
+    .flush_has_asid_i(wb_pkt.ctrl.rs2 != 5'd0),
     .va_f_i(fetch_va), .priv_f_i(priv),
     .hit_f_o(mmu_hit_f), .pa_f_o(mmu_pa_f), .miss_f_o(mmu_miss_f),
     .fault_f_o(mmu_fault_f), .cause_f_o(mmu_cause_f),
@@ -1216,7 +1237,10 @@ module rv64gch_core #(
   logic [63:0] amo_new;
   assign amo_new = amo_compute(amo_old_aligned, mem_pkt.rs2, mem_pkt.ctrl.amo_op,
                                (mem_pkt.ctrl.funct3 == 3'b011));
-  assign mem_req   = mem_pkt.valid & (mem_pkt.is_store | mem_pkt.is_load) & ~axi_issued;
+  // No new data issue inside the fence window (a younger MEM op waits;
+  // lsu_busy already stalls the pipe, and the drain needs no competition).
+  assign mem_req   = mem_pkt.valid & (mem_pkt.is_store | mem_pkt.is_load) & ~axi_issued &
+                     ~vm_fence_active;
   // AMO read phase must issue with we=0 (the entry is_store bit is 1, so it
   // cannot be used directly); write phase uses the computed amo_new.
   assign mem_we    = (mem_pkt.ctrl.lsu_op == LSU_AMO) ? amo_wr_q : mem_pkt.is_store;
@@ -1291,6 +1315,9 @@ module rv64gch_core #(
     // operand (rs1) travels separately in csr_wdata so the CSR unit writes
     // the new value, not the old one.
     wb_pkt_n.csr_wdata = mem_pkt.csr_wdata;
+    // SFENCE rs1 (VA) rides csr_wdata (funct3[2]==0 gives rs1_fwd) and rs2
+    // (ASID) rides a dedicated field, so retire has both operands.
+    wb_pkt_n.rs2v = mem_pkt.rs2;
     if (mem_pkt.ctrl.reads_csr) wb_pkt_n.data = csr_rdata;
   end
 
@@ -1326,7 +1353,7 @@ module rv64gch_core #(
   logic [4:0] fcsr_fflags;
   assign fcsr_fflags_we = wb_pkt.valid & wb_pkt.ctrl.is_fp & (wb_pkt.ctrl.fpu_op != FPU_NONE);
   csr_unit u_csr (
-    .clk(clk), .rst_n(rst_n), .flush(flush_all),
+    .clk(clk), .rst_n(rst_n), .flush(flush_all_no_refetch),
     .priv(priv), .hartid(hartid_i),
     .csr_we(wb_pkt.ctrl.writes_csr & wb_pkt.valid),
     .csr_addr(wb_pkt.ctrl.csr_addr),

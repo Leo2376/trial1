@@ -22,7 +22,7 @@ _start:
     li t0, 0x80010000
     li t1, 0x20004401            # root[2] -> L1
     sd t1, 16(t0)
-    li t1, 0x4000000C7          # root[4] 1G leaf -> tohost (VPN2 of 2^32 = 4)
+    li t1, 0x400000C7          # root[4] 1G leaf -> tohost (VPN2 of 2^32 = 4)
     sd t1, 32(t0)
     li t0, 0x80011000
     li t1, 0x20004801            # L1[0] -> L0a
@@ -98,6 +98,7 @@ failS:
     j failS
 .option rvc
 
+.balign 4
 m_trap:
     csrr t0, mcause
     li t1, 9

@@ -71,12 +71,19 @@ module tb_rv64gch_core;
       @(negedge clk);
       cycle_cnt = cycle_cnt + 1;
       if (cycle_cnt % 100000 == 0)
-        $display("[tb] cycle=%0d pc=%0h core_active=%b trap=%b cause=%0d ex_valid=%b id_valid=%b is_c=%b ill_c=%b stall=%b fpu_busy=%b fetch_done=%b fetch_complete=%b hi_valid=%b need_hi=%b fetch_res_valid=%b valid_f=%b pc_f=%0h fetch_req=%b fetch_ready=%b fetch_ack=%b axi_req=%b axi_ready=%b axi_ack=%b", 
+        $display("[tb] cycle=%0d pc=%0h core_active=%b trap=%b cause=%0d ex_valid=%b id_valid=%b is_c=%b ill_c=%b stall=%b fpu_busy=%b fetch_done=%b fetch_complete=%b hi_valid=%b need_hi=%b fetch_res_valid=%b valid_f=%b pc_f=%0h fetch_req=%b fetch_ready=%b fetch_ack=%b axi_req=%b axi_ready=%b axi_ack=%b busy=%b hit=%b fault=%b fltq=%b l1ist=%0d priv=%b satp=%h wbpc=%h flAll=%b flId=%b sf=%b satpwe=%b exsf=%b rs1f=%h exva=%h mmpa=%h expc=%h mmpc=%h rdm=%0d malu=%h fwda=%b",
                  cycle_cnt, u_cpu.dbg_pc, core_active, u_cpu.u_core.trap, u_cpu.u_core.cause,
                  u_cpu.u_core.ex_pkt.valid, u_cpu.u_core.valid_d, u_cpu.u_core.is_c_d, u_cpu.u_core.illegal_c_d, u_cpu.u_core.stall, u_cpu.u_core.fpu_busy,
                  u_cpu.u_core.fetch_done, u_cpu.u_core.fetch_complete, u_cpu.u_core.fetch_hi_valid, u_cpu.u_core.fetch_need_hi, u_cpu.u_core.fetch_res_valid, u_cpu.u_core.valid_f, u_cpu.u_core.pc_f,
                  u_cpu.u_core.fetch_req, u_cpu.fetch_ready, u_cpu.fetch_ack,
-                 u_cpu.axi_req, u_cpu.axi_ready, u_cpu.axi_ack);
+                 u_cpu.axi_req, u_cpu.axi_ready, u_cpu.axi_ack,
+                 u_cpu.u_core.fetch_busy, u_cpu.u_core.mmu_hit_f, u_cpu.u_core.mmu_fault_f,
+                 u_cpu.u_core.fault_f_q, u_cpu.u_l1i.st, u_cpu.u_core.priv, u_cpu.u_core.csr_satp,
+                 u_cpu.u_core.wb_pkt.pc, u_cpu.u_core.flush_all, u_cpu.u_core.flush_id,
+                 u_cpu.u_core.sfence_o, u_cpu.u_core.satp_we_o, u_cpu.u_core.ex_pkt.ctrl.is_sfence,
+                 u_cpu.u_core.rs1_fwd, u_cpu.u_core.ex_va_full, u_cpu.u_core.mem_pkt.mem_addr,
+                 u_cpu.u_core.ex_pkt.pc, u_cpu.u_core.mem_pkt.pc, u_cpu.u_core.rd_m,
+                 u_cpu.u_core.mem_alu_y, u_cpu.u_core.fwd_a);
     end
 
     if (test_done) begin

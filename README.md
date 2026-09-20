@@ -25,6 +25,8 @@ synthesis), not FPGA.
 | L1D (32 KiB, 4-way, blocking, write-back) | **DONE** | all ISA suites (incl. rv64ua) + l1d_wb PASS |
 | L2 (256 KiB, 8-way, blocking, write-back) | **DONE** | all ISA suites + l2_wb PASS |
 | MMU Sv39 (shared 32-e TLB + HW walker, 4K/2M/1G, A/D) | **DONE** | sv39_basic/fault/sfence PASS |
+| Trap delegation (medeleg/mideleg, S-trap entry, vectored tvec) | **DONE** | deleg_basic PASS |
+| ASID tags + selective SFENCE.VMA | **DONE** | asid_test PASS |
 | MMU Sv48 | Not started | — |
 | Dual-issue frontend | Not started | — |
 | RVV 1.0 vector engine | Not started | — |
@@ -78,8 +80,16 @@ single-cycle, FDIV/FSQRT iterative); fflags accumulate to CSR via WB.
    lines); SFENCE/SATP/FENCE.I retire drains L1D. Bring-up fixed three
    latent core bugs: 63-bit B-type immediate (backward branches wild),
    mret/sret never redirecting to epc, and traps recording nothing (flush
-   gate) / S-traps vectoring to zero stvec. Remaining: **Sv48** (mode 9
-   currently WARLs to Bare), trap delegation, ASID tagging.
+   gate) / S-traps vectoring to zero stvec.
+   **Delegation DONE**: medeleg/mideleg CSRs, S-mode trap entry
+   (sepc/scause/stval/SPP/SPIE), vectored mtvec/stvec, combinational
+   next-priv tracking (`deleg_basic` proves ecall->S-trap->sret->ecall).
+   Fix round 2: direct-mode tvec must not mask low bits; core priv must
+   follow delegation (not hard M on trap). **ASID DONE**: per-entry tags,
+   retire-time selective SFENCE (VA and/or ASID qualified, rs1/rs2==x0
+   means all) with a fence-window freeze instead of drop
+   (`asid_test` proves isolation + VA-selective survival).
+   Remaining: **Sv48** (mode 9 currently WARLs to Bare).
 6. **MMU (Sv48)** — 4-level walk extension of the same engine.
 7. **Dual-issue frontend** — 8B/cycle fetch, dual decode, ALU+MDU/FPU pairing,
    wider hazard/forwarding.
@@ -116,7 +126,10 @@ Three levels, all driven by the upstream riscv-tests ISA suites:
    `software/tests/sv39_basic.S` (M setup + S load/store/fetch through a
    remap, walker A/D, ecall), `software/tests/sv39_fault.S` (5 fault
    cases with (cause,tval) matching + handler resume), and
-   `software/tests/sv39_sfence.S` (remap visible after SFENCE.VMA).
+   `software/tests/sv39_sfence.S` (remap visible after SFENCE.VMA),
+   `software/tests/deleg_basic.S` (delegated S-ecall handling + sret
+   return + second ecall), and `software/tests/asid_test.S` (two-ASID
+   isolation + VA-selective sfence proven by survival + fault).
    Build per the header comments, run with
    `Vtb_rv64gch_core +hex=<test>.hex`, expect `TEST PASSED`.
 
@@ -150,9 +163,11 @@ cd sim/verilator && make decomp   # 44/44 PASS
 ./sim/verilator/obj_dir/Vtb_rv64gch_core +hex=/tmp/sv39_basic.hex      # TEST PASSED
 ./sim/verilator/obj_dir/Vtb_rv64gch_core +hex=/tmp/sv39_fault.hex      # TEST PASSED
 ./sim/verilator/obj_dir/Vtb_rv64gch_core +hex=/tmp/sv39_sfence.hex     # TEST PASSED
+./sim/verilator/obj_dir/Vtb_rv64gch_core +hex=/tmp/deleg_basic.hex     # TEST PASSED
+./sim/verilator/obj_dir/Vtb_rv64gch_core +hex=/tmp/asid_test.hex       # TEST PASSED
 ```
 
-Last full regression (L1I + L1D + L2 + Sv39 MMU in path): rv64ui 50/50, rv64um 13/13, rv64uf 11/11, rv64uc 1/1 (rvc), rv64ua 19/19, rv64ud 12/12, tb_fpu 79/79, tb_decompressor 44/44, dyn_rm PASS, l1i_conflict PASS, l1d_wb PASS, l2_wb PASS, sv39_basic/fault/sfence PASS.
+Last full regression (L1I + L1D + L2 + Sv39 MMU + delegation + ASID in path): rv64ui 50/50, rv64um 13/13, rv64uf 11/11, rv64uc 1/1 (rvc), rv64ua 19/19, rv64ud 12/12, tb_fpu 79/79, tb_decompressor 44/44, dyn_rm PASS, l1i_conflict PASS, l1d_wb PASS, l2_wb PASS, sv39_basic/fault/sfence PASS, deleg_basic PASS, asid_test PASS.
 
 ## RTL Directory Structure & Module Relationships
 

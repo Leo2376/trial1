@@ -28,7 +28,14 @@ module mmu #(
   input  logic [63:0]       satp_i,      // MODE/ASID/PPN
   input  logic [63:0]       mstatus_i,   // SUM/MXR/MPRV/MPP
   input  logic [1:0]        priv_i,      // current privilege
-  input  logic              flush_i,     // sfence.vma | satp-write retire
+  input  logic              flush_all_i, // satp-write retire: clear all
+  // Selective SFENCE.VMA (single-cycle pulse from EX): clear entries
+  // matching (va iff has_va, asid iff has_asid); neither set = all.
+  input  logic              flush_sel_i,
+  input  logic [63:0]       flush_va_i,
+  input  logic [15:0]       flush_asid_i,
+  input  logic              flush_has_va_i,
+  input  logic              flush_has_asid_i,
 
   // Fetch translate (exec; MPRV never applies to fetches).
   input  logic [63:0]       va_f_i,
@@ -81,7 +88,8 @@ module mmu #(
 
   // ---------------------------------------------------------------- TLB --
   localparam int VPN_BITS = 27;
-  logic                tlb_valid [TLB_ENTRIES];
+  // Valid as a packed vector so a flush clears (masked) in one shot.
+  logic [TLB_ENTRIES-1:0] tlb_valid;
   logic [VPN_BITS-1:0] tlb_vpn   [TLB_ENTRIES];
   logic [1:0]          tlb_level [TLB_ENTRIES]; // 2=1G, 1=2M, 0=4K
   logic [43:0]         tlb_ppn   [TLB_ENTRIES];
@@ -90,8 +98,11 @@ module mmu #(
   logic                tlb_w     [TLB_ENTRIES];
   logic                tlb_x     [TLB_ENTRIES];
   logic                tlb_d     [TLB_ENTRIES];
+  logic [15:0]         tlb_asid  [TLB_ENTRIES];
   // Round-robin victim cursor (translation misses are rare; no LRU).
   logic [$clog2(TLB_ENTRIES)-1:0] tlb_rr_q;
+  logic [15:0] satp_asid;
+  assign satp_asid = satp_i[59:44];
 
   // Effective permission check (M-mode bypassed by the caller).
   function automatic logic perm_ok(
@@ -137,7 +148,7 @@ module mmu #(
   function automatic logic [5:0] tlb_lookup(
     input logic [63:0] va, input logic [1:0] priv,
     input logic rd, input logic wr, input logic exec,
-    input logic sum, input logic mxr,
+    input logic sum, input logic mxr, input logic [15:0] asid,
     output logic [ADDR_W-1:0] pa, output logic need_d);
     logic [VPN_BITS-1:0] vpn;
     integer e;
@@ -145,7 +156,7 @@ module mmu #(
     pa = '0; need_d = 1'b0;
     vpn = va[38:12];
     for (e = 0; e < TLB_ENTRIES; e = e + 1) begin
-      if (tlb_valid[e] &&
+      if (tlb_valid[e] && (tlb_asid[e] == asid) &&
           ((vpn & level_mask(tlb_level[e])) ==
            (tlb_vpn[e] & level_mask(tlb_level[e]))) &&
           perm_ok(priv, tlb_u[e], tlb_r[e], tlb_w[e], tlb_x[e],
@@ -168,7 +179,7 @@ module mmu #(
   logic                 f_canon;
   assign f_canon = canonical(va_f_i);
   assign f_way = tlb_lookup(va_f_i, priv_f_i, 1'b0, 1'b0, 1'b1,
-                            mstatus_sum, mstatus_mxr, f_pa, f_need_d);
+                            mstatus_sum, mstatus_mxr, satp_asid, f_pa, f_need_d);
 
   // Data-port lookup.
   logic [5:0]           d_way;
@@ -177,11 +188,11 @@ module mmu #(
   logic                 d_canon;
   assign d_canon = canonical(va_d_i);
   assign d_way = tlb_lookup(va_d_i, priv_d_i, rd_d_i, wr_d_i, 1'b0,
-                            mstatus_sum, mstatus_mxr, d_pa, d_need_d);
+                            mstatus_sum, mstatus_mxr, satp_asid, d_pa, d_need_d);
 
   // Walker state (serves one miss at a time; data port first).
   typedef enum logic [2:0] {
-    W_IDLE, W_READ, W_WAIT, W_EVAL, W_WRITE, W_WWAIT, W_CLEAR
+    W_IDLE, W_READ, W_WAIT, W_EVAL, W_WRITE, W_WWAIT
   } walk_e;
   walk_e wst;
   logic        walk_which_q; // 0 = fetch, 1 = data
@@ -196,9 +207,22 @@ module mmu #(
   logic        fault_which_q;
   logic [4:0]  fault_cause_q;
   logic [63:0] fault_va_q;
-  // Clear sweep (reset + flush edge) and flush edge detector.
-  logic [4:0]  clr_idx_q;
-  logic        flush_d_q;
+  // Flush edges (retire pulses stretch across stalls; apply once).
+  logic flush_all_d_q, flush_sel_d_q;
+  // Selective clear mask (blocking): entries matching (va iff has_va,
+  // asid iff has_asid). Superpage lines match when covering the VA.
+  logic [TLB_ENTRIES-1:0] flush_mask;
+  always_comb begin
+    flush_mask = '0;
+    for (integer e = 0; e < TLB_ENTRIES; e = e + 1) begin
+      if (tlb_valid[e] &&
+          (!flush_has_asid_i || (tlb_asid[e] == flush_asid_i)) &&
+          (!flush_has_va_i ||
+           (((flush_va_i[38:12] & level_mask(tlb_level[e])) ==
+             (tlb_vpn[e] & level_mask(tlb_level[e]))))))
+        flush_mask[e] = 1'b1;
+    end
+  end
 
   // Walker fault applies only to the VA it was raised for.
   logic fault_f_match, fault_d_match;
@@ -248,29 +272,32 @@ module mmu #(
 
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-      wst <= W_CLEAR;
+      wst <= W_IDLE;
       walk_which_q <= 1'b0;
       walk_va_q <= '0; walk_wr_q <= 1'b0; walk_priv_q <= PRIV_M;
       walk_level_q <= 2'd2; walk_ppn_q <= '0; walk_pte_q <= '0;
       fault_q <= 1'b0; fault_which_q <= 1'b0;
       fault_cause_q <= '0; fault_va_q <= '0;
       tlb_rr_q <= '0;
-      clr_idx_q <= '0;
-      flush_d_q <= 1'b0;
+      tlb_valid <= '0;
+      flush_all_d_q <= 1'b0;
+      flush_sel_d_q <= 1'b0;
     end else begin
-      flush_d_q <= flush_i;
-      // Flush edge: abort any walk, drop the latched fault, sweep-clear.
-      if (flush_i && !flush_d_q) begin
-        wst <= W_CLEAR;
-        clr_idx_q <= '0;
+      flush_all_d_q <= flush_all_i;
+      flush_sel_d_q <= flush_sel_i;
+      // Flush edges apply instantly (single nonblocking clear) and abort
+      // any walk + drop the latched fault. Instant application keeps
+      // younger lookups exact with no stall or sweep.
+      if (flush_all_i && !flush_all_d_q) begin
+        tlb_valid <= '0;
+        if (wst != W_IDLE) wst <= W_IDLE;
+        fault_q <= 1'b0;
+      end else if (flush_sel_i && !flush_sel_d_q) begin
+        tlb_valid <= tlb_valid & ~flush_mask;
+        if (wst != W_IDLE) wst <= W_IDLE;
         fault_q <= 1'b0;
       end else begin
         case (wst)
-          W_CLEAR: begin
-            tlb_valid[clr_idx_q] <= 1'b0;
-            if (clr_idx_q == TLB_ENTRIES - 1) wst <= W_IDLE;
-            else clr_idx_q <= clr_idx_q + 1'b1;
-          end
           W_IDLE: begin
             // Data port first (older), then fetch.
             `ifdef MMU_DEBUG
@@ -378,6 +405,7 @@ module mmu #(
                          walk_va_q, walk_level_q, ppn, tlb_rr_q);
                 `endif
                 tlb_valid[tlb_rr_q] <= 1'b1;
+                tlb_asid[tlb_rr_q]  <= satp_asid;
                 tlb_vpn[tlb_rr_q]   <= walk_va_q[38:12];
                 tlb_level[tlb_rr_q] <= walk_level_q;
                 tlb_ppn[tlb_rr_q]   <= ppn;
@@ -421,6 +449,7 @@ module mmu #(
             if (ack_i) begin
               // PTE updated in memory; install with A/D set.
               tlb_valid[tlb_rr_q] <= 1'b1;
+              tlb_asid[tlb_rr_q]  <= satp_asid;
               tlb_vpn[tlb_rr_q]   <= walk_va_q[38:12];
               tlb_level[tlb_rr_q] <= walk_level_q;
               tlb_ppn[tlb_rr_q]   <= walk_pte_q[53:10];
@@ -433,7 +462,7 @@ module mmu #(
               wst <= W_IDLE;
             end
           end
-          default: wst <= W_CLEAR;
+          default: wst <= W_IDLE;
         endcase
       end
     end
