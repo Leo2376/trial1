@@ -70,7 +70,7 @@ module tb_rv64gch_core;
     while (!test_done && cycle_cnt < MAX_CYCLES) begin
       @(negedge clk);
       cycle_cnt = cycle_cnt + 1;
-      if (cycle_cnt % 100000 == 0)
+      if (cycle_cnt % 500 == 0)
         $display("[tb] cycle=%0d pc=%0h core_active=%b trap=%b cause=%0d ex_valid=%b id_valid=%b is_c=%b ill_c=%b stall=%b fpu_busy=%b fetch_done=%b fetch_complete=%b hi_valid=%b need_hi=%b fetch_res_valid=%b valid_f=%b pc_f=%0h fetch_req=%b fetch_ready=%b fetch_ack=%b axi_req=%b axi_ready=%b axi_ack=%b busy=%b hit=%b fault=%b fltq=%b l1ist=%0d priv=%b satp=%h wbpc=%h flAll=%b flId=%b sf=%b satpwe=%b exsf=%b rs1f=%h exva=%h mmpa=%h expc=%h mmpc=%h rdm=%0d malu=%h fwda=%b",
                  cycle_cnt, u_cpu.dbg_pc, core_active, u_cpu.u_core.trap, u_cpu.u_core.cause,
                  u_cpu.u_core.ex_pkt.valid, u_cpu.u_core.valid_d, u_cpu.u_core.is_c_d, u_cpu.u_core.illegal_c_d, u_cpu.u_core.stall, u_cpu.u_core.fpu_busy,
@@ -94,6 +94,12 @@ module tb_rv64gch_core;
     end else begin
       $display("[tb] TIMEOUT after %0d cycles (tohost=0x%016h)", MAX_CYCLES, tohost_val);
     end
+    // Let in-flight transactions (notably the final tohost write's ack
+    // chain) unwind so tracers/dumps observe a quiescent machine.
+    repeat (100) @(negedge clk);
+    `ifdef COSIM_TRACE
+    $writememh("cosim_dram_rtl.hex", u_dram.mem);
+    `endif
     $finish;
   end
 

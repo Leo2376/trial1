@@ -51,6 +51,11 @@ $(EXE): $(FILELIST) $(shell cat $(FILELIST))
 run: $(HEX_FILE) $(EXE)
 	./$(EXE)
 
+# Co-simulation build (lock-step tracer + DRAM dump, separate obj dir)
+COSIM_EXE := obj_dir_cosim/V$(TOP)
+cosim-build:
+	verilator $(VFLAGS) +define+COSIM_TRACE --Mdir obj_dir_cosim -f $(FILELIST)
+
 # Run a specific FPU test: make TEST=fadd
 # Run FPU unit testbench: make fpu
 # Run decompressor unit testbench: make decomp

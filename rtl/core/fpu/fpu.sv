@@ -112,17 +112,30 @@ module fpu #(
       return compute_result_d(a[63:0], b[63:0], c[63:0], op, rm, is_unsigned, is_word, ff);
     end else begin
       // RV64D NaN-boxing: a single-precision FP source whose upper 32 bits
-      // are not all 1s reads as the canonical NaN. Moves are exempt:
-      // FMV.X.W copies raw FP bits out, FMV.W.X copies raw integer bits in
-      // (integer sources are never boxed).
+      // are not all 1s reads as the canonical NaN. Exempt are the bitwise
+      // ops that inspect raw patterns: moves (FMV.X.W copies raw FP bits
+      // out, FMV.W.X copies raw integer bits in -- integer sources are
+      // never boxed), sign-injection, and classify (riscv-tests move.S
+      // and fclass.S feed these unboxed FMV.W.X results and expects
+      // bit-exact output).
+      logic is_bitwise;
+      logic a_raw_ok, b_raw_ok;
+      is_bitwise = (op == rtl_core_pkg::FPU_FSGNJ) ||
+                   (op == rtl_core_pkg::FPU_FSGNJN) ||
+                   (op == rtl_core_pkg::FPU_FSGNJX) ||
+                   (op == rtl_core_pkg::FPU_CLASS);
+      // Per-operand raw check for the bitwise ops (upper==0 or all-ones).
+      a_raw_ok = (a[63:32] == 32'd0) || (a[63:32] == 32'hFFFFFFFF);
+      b_raw_ok = (b[63:32] == 32'd0) || (b[63:32] == 32'hFFFFFFFF);
       if (op == rtl_core_pkg::FPU_MV_F2X)
         return {{32{a[31]}}, a[31:0]};
+      // FMV.W.X is a full XLEN-bit copy (never NaN-boxes), like FMV.D.X.
       if (op == rtl_core_pkg::FPU_MV_X2F)
-        return {{32{1'b1}}, a[31:0]};
-      return compute_result_s((a[63:32] == 32'hFFFFFFFF) ? a[31:0] : CANON_S_NAN,
-                              (b[63:32] == 32'hFFFFFFFF) ? b[31:0] : CANON_S_NAN,
-                              (c[63:32] == 32'hFFFFFFFF) ? c[31:0] : CANON_S_NAN,
-                              op, rm, ff);
+        return a;
+      return compute_result_s(((is_bitwise && a_raw_ok) || (a[63:32] == 32'hFFFFFFFF)) ? a[31:0] : CANON_S_NAN,
+                              ((is_bitwise && b_raw_ok) || (b[63:32] == 32'hFFFFFFFF)) ? b[31:0] : CANON_S_NAN,
+                               (c[63:32] == 32'hFFFFFFFF) ? c[31:0] : CANON_S_NAN,
+                               op, rm, ff);
     end
   endfunction
 
@@ -235,8 +248,10 @@ module fpu #(
       // Move ops. FMV.X.W sign-extends the single value into the integer
       // register (bits preserved, upper bits = copies of bit 31).
       rtl_core_pkg::FPU_MV_F2X: return {{32{a[31]}}, a[31:0]};
-      // FMV.W.X: NaN-box the single-precision bit pattern.
-      rtl_core_pkg::FPU_MV_X2F: return {{32{1'b1}}, a[31:0]};
+      // FMV.W.X: full XLEN-bit copy, unmodified (like FMV.D.X; only
+      // true arithmetic single results are NaN-boxed). Found by Unicorn
+      // lock-step: boxing here corrupts roundtrips of unboxed patterns.
+      rtl_core_pkg::FPU_MV_X2F: return a;
       // FCLASS - classify float
       rtl_core_pkg::FPU_CLASS: return {54'd0, fclass_s(a[31:0])};
       default:   return a + b;

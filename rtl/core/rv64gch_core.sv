@@ -78,6 +78,8 @@ module rv64gch_core #(
   logic [63:0]     redirect_target;
   logic [63:0]     csr_rdata;
   logic [63:0]     csr_mstatus, csr_satp; // consumed by the MMU stage
+  logic [63:0]     csr_sstatus;
+  logic            csr_trap_deleg;
   logic            csr_we, trap, mret_x, sret_x;
   logic [4:0]      cause;
   logic [63:0]     epc, tvec;
@@ -142,15 +144,23 @@ module rv64gch_core #(
 
   assign dbg_pc = pc_d;
 
-  // Real privilege state (was hardwired M). Tracks the CSR unit's
-  // combinational next-priv every cycle, so trap/mret/sret transitions
-  // commit on the exact edge; the accompanying redirect/trap flushes cover
-  // the single in-flight cycle (stale-priv fetches never consume).
+  // Real privilege state (was hardwired M). Switches on the committing
+  // edge itself -- trap target, or MPP/SPP on xret redirect -- so no fetch
+  // or translation ever uses a stale mode (the old WB-retire lag let
+  // post-mret fetches run under the previous priv, fatal for non-identity
+  // targets). The same-edge redirect/trap flushes discard in-flight work.
+  logic [1:0] xret_priv;
+  assign xret_priv = ex_pkt.ctrl.is_mret ?
+                     ((csr_mstatus[12:11] == 2'b10) ? PRIV_U :
+                      priv_e'(csr_mstatus[12:11])) :
+                     (csr_sstatus[8] ? PRIV_S : PRIV_U);
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       priv <= PRIV_M;
-    end else begin
-      priv <= new_priv;
+    end else if (trap) begin
+      priv <= csr_trap_deleg ? PRIV_S : PRIV_M;
+    end else if (redirect & is_xret) begin
+      priv <= xret_priv;
     end
   end
 
@@ -772,7 +782,10 @@ module rv64gch_core #(
   // there is no gap between retire-edge and sweep-start/end.
   logic vm_fence_active;
   assign vm_fence_active = fence_i_o | sfence_o | satp_we_o | drain_busy_i;
-  assign flush_id = flush_id_raw;
+  // xret redirects like a taken branch: squash F/D and reload pc from
+  // epc deterministically (no next_pc race), while the insn itself flows
+  // on to retire its CSR effects at WB.
+  assign flush_id = flush_id_raw | (ex_pkt.valid & is_xret);
   assign flush_all = flush_id | flush_ex;
   logic flush_all_no_refetch;
   assign flush_all_no_refetch = flush_id_raw | flush_ex;
@@ -783,7 +796,10 @@ module rv64gch_core #(
     end else if (trap) begin
       ex_pkt <= '0;
     end else if (!stall) begin
-      if (flush_redirect) begin
+      // xret is NOT killed here (unlike branches/jumps): it must retire at
+      // WB for its CSR effects (MPIE/MPP/SPIE/SPP). It is harmless downstream
+      // (no mem op, rd=x0) while pc/F/D already redirected around it.
+      if (flush_redirect & ~(redirect & is_xret)) begin
         ex_pkt <= '0;
       end else begin
         ex_pkt.valid <= valid_d;
@@ -1326,6 +1342,32 @@ module rv64gch_core #(
     else if (!stall) wb_pkt <= wb_pkt_n;
   end
 
+  // Commit tracer for lock-step co-simulation with Unicorn (Phase A:
+  // offline trace compare). Logs retired instructions (pc, int/fp dest +
+  // data, priv), trap events (pc, cause), and completed stores (we-gated
+  // so AMO read phases don't log). Off unless +define+COSIM_TRACE.
+  `ifdef COSIM_TRACE
+  integer cosim_f;
+  initial cosim_f = $fopen("cosim_rtl.log", "w");
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+    end else begin
+      if (!stall && wb_pkt_n.valid)
+        $fwrite(cosim_f, "C %h %0d %h %b %b %0d %h %0d\n",
+                wb_pkt_n.pc, wb_pkt_n.rd, wb_pkt_n.data, wb_pkt_n.we,
+                wb_pkt_n.fp_we, wb_pkt_n.rd, wb_pkt_n.data, priv);
+      if (trap)
+        $fwrite(cosim_f, "T %h %0d\n", ex_pkt.pc, cause);
+      // Completed memory writes only (mem_we excludes AMO read phases
+      // and failed SCs, matching what actually reaches memory).
+      if (axi_pending & mem_ack & mem_pkt.valid & mem_we)
+        $fwrite(cosim_f, "M %h %h %h %h\n",
+                mem_pkt.pc, mem_pkt.mem_addr[47:0], mem_pkt.be, mem_wdata);
+      $fflush(cosim_f);
+    end
+  end
+  `endif
+
   // FENCE.I retires in order at WB; the pulse may stretch across a stall
   // (WB holds), which is harmless for the idempotent L1I invalidate.
   assign fence_i_o = wb_pkt.valid & wb_pkt.ctrl.fence_i;
@@ -1376,7 +1418,9 @@ module rv64gch_core #(
     .fflags(fcsr_fflags),
     .frm(frm),
     .mstatus_o(csr_mstatus),
-    .satp_o(csr_satp)
+    .satp_o(csr_satp),
+    .sstatus_o(csr_sstatus),
+    .trap_deleg_o(csr_trap_deleg)
   );
 
   // Fault plumbing for mtval: fetch bubble carries its VA, data faults

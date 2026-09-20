@@ -36,7 +36,11 @@ module csr_unit #(
   output logic [2:0]        frm,
   // VM/privilege state for the MMU (Sv39 stage).
   output logic [XLEN-1:0]   mstatus_o,
-  output logic [XLEN-1:0]   satp_o
+  output logic [XLEN-1:0]   satp_o,
+  // SSTATUS for SRET privilege (SPP bit 8); composed view not needed here.
+  output logic [XLEN-1:0]   sstatus_o,
+  // Whether the live trap input delegates (for the core priv switch).
+  output logic              trap_deleg_o
 );
   import rtl_core_pkg::*;
 
@@ -45,6 +49,7 @@ module csr_unit #(
   // Delegation for the live trap input (sync via medeleg; only sub-M priv).
   logic trap_deleg;
   assign trap_deleg = (priv != PRIV_M) && medeleg[cause];
+  assign trap_deleg_o = trap_deleg;
   // Next privilege, combinational so the core tracks transitions (trap,
   // mret, sret) on the committing edge; the redirect/trap flushes cover
   // the single in-flight cycle. Held otherwise.
@@ -115,9 +120,10 @@ module csr_unit #(
       CSR_MHARTID:  v = hartid;
       // SSTATUS is a restricted view: FS[14:13]/XS[16:15]/SUM[18]/MXR[19]
       // live in mstatus and are overlaid here (sstatus flop holds the
-      // S-only bits: SIE/SPIE/UBE/SPP/VS).
-      CSR_SSTATUS:  v = (sstatus & ~64'h0000_0000_000F_6000) |
-                        (mstatus & 64'h0000_0000_000F_6000);
+      // S-only bits: SIE/SPIE/UBE/SPP/VS). UXL[33:32] hardwires to 2 (RV64).
+      CSR_SSTATUS:  v = ((sstatus & ~64'h0000_0003_000F_6000) |
+                         (mstatus & 64'h0000_0000_000F_6000)) |
+                        64'h0000_0002_0000_0000;
       CSR_SATP:     v = satp;
       CSR_SIE:      v = sie;
       CSR_STVEC:    v = stvec;
@@ -277,5 +283,6 @@ module csr_unit #(
   assign frm = fcsr[7:5];
   assign mstatus_o = mstatus;
   assign satp_o = satp;
+  assign sstatus_o = sstatus;
 
 endmodule

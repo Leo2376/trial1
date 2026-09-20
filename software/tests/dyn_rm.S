@@ -24,12 +24,13 @@ _start:
     li sp, 0x8000fffff8
     li t0, (1 << 13)
     csrs mstatus, t0          # enable FP
+    la t0, f_one
+    flw ft0, 0(t0)
+    la t0, f_three
+    flw ft1, 0(t0)
 
-    # --- single: ft0=1.0, ft1=3.0 ---
-    li t0, 0x3F800000
-    fmv.w.x ft0, t0
-    li t0, 0x40400000
-    fmv.w.x ft1, t0
+    # --- single: ft0=1.0, ft1=3.0 (FLW-boxed; FMV.W.X leaves raw bits
+    # which arithmetic correctly reads as canonical NaN) ---
 
     # frm=RTZ (1), back-to-back DYN (tests frm hazard stall path)
     li t0, 1
@@ -96,6 +97,9 @@ fail:
     j fail
 
 .section .data
+.align 2
+f_one:   .word 0x3F800000
+f_three: .word 0x40400000
 .align 3
 d_one:   .dword 0x3FF0000000000000
 d_ten:   .dword 0x4024000000000000

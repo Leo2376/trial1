@@ -263,8 +263,12 @@ module tb_fpu;
     is_unsigned = 0; is_word = 0;
 
     // ---------------- FMV ----------------
+    // FMV.W.X is a full XLEN-bit copy (never NaN-boxes): unboxed patterns
+    // round-trip exactly (Unicorn lock-step caught the old boxing here).
     do_op(FPU_MV_X2F, 32'hDEADBEEF, 64'd0, RM_RNE, got, gff);
-    chk64({32'hFFFFFFFF, 32'hDEADBEEF}, 5'd0);
+    chk64(64'h00000000DEADBEEF, 5'd0);
+    do_op(FPU_MV_X2F, 64'hFFFFFFFFDEADBEEF, 64'd0, RM_RNE, got, gff);
+    chk64(64'hFFFFFFFFDEADBEEF, 5'd0);
     do_op(FPU_MV_F2X, 32'hCAFEBABE, 64'd0, RM_RNE, got, gff);
     chk64({32'hFFFFFFFF, 32'hCAFEBABE}, 5'd0);
 

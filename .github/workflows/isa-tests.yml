@@ -5,37 +5,12 @@ on:
   pull_request:
 
 jobs:
-  rv64ui:
+  isa:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Verilator & RISC-V toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y verilator
-          verilator --version
-          # Install the GNU RISC-V cross toolchain (provides riscv64-unknown-elf-gcc)
-          sudo apt-get install -y gcc-riscv64-unknown-elf
-          riscv64-unknown-elf-gcc --version
-
-      - name: Fetch riscv-tests ISA sources
-        run: |
-          git clone --depth 1 https://github.com/riscv-software-src/riscv-tests.git /tmp/riscv-tests
-          ls /tmp/riscv-tests/isa/rv64ui | head
-
-      - name: Build Verilator simulator
-        run: |
-          cd sim/verilator
-          make
-
-      - name: Run rv64ui ISA regression
-        run: |
-          cd sim/riscv-tests
-          make isa RISCV_SRC=/tmp/riscv-tests/isa
-
-  rv64um:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ext: [rv64ui, rv64um, rv64uf, rv64ud, rv64uc, rv64ua]
     steps:
       - uses: actions/checkout@v4
 
@@ -49,13 +24,58 @@ jobs:
       - name: Fetch riscv-tests ISA sources
         run: |
           git clone --depth 1 https://github.com/riscv-software-src/riscv-tests.git /tmp/riscv-tests
-          ls /tmp/riscv-tests/isa/rv64um | head
+          ls /tmp/riscv-tests/isa/${{ matrix.ext }} | head
 
       - name: Build Verilator simulator
         run: |
           cd sim/verilator
           make
 
-      - name: Run rv64um (M-extension) ISA regression
+      - name: Run ${{ matrix.ext }} ISA regression
         run: |
-          EXT=rv64um RISCV_SRC=/tmp/riscv-tests/isa ./tools/scripts/run_isa_tests.sh
+          EXT=${{ matrix.ext }} RISCV_SRC=/tmp/riscv-tests/isa ./tools/scripts/run_isa_tests.sh
+
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Verilator & RISC-V toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y verilator gcc-riscv64-unknown-elf
+          verilator --version
+
+      - name: Build Verilator simulator
+        run: |
+          cd sim/verilator
+          make
+
+      - name: Run FPU unit testbench
+        run: |
+          cd sim/verilator && make fpu      # 79/79 PASS
+
+      - name: Run decompressor unit testbench
+        run: |
+          cd sim/verilator && make decomp   # 44/44 PASS
+
+  directed:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Verilator & RISC-V toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y verilator gcc-riscv64-unknown-elf
+          verilator --version
+          riscv64-unknown-elf-gcc --version
+
+      - name: Build Verilator simulator
+        run: |
+          cd sim/verilator
+          make
+
+      - name: Run directed core tests
+        run: |
+          ./tools/scripts/run_directed_tests.sh   # 10/10 PASS
