@@ -72,7 +72,7 @@ module rv64gch_core #(
   logic            mdu_busy_q, fpu_busy_q;
   logic [63:0]     mem_rdata_aligned;
   logic            mem_is_load_x, mem_is_store_x;
-  logic            branch_taken, branch_resolved;
+  logic            branch_resolved;
   logic [63:0]     branch_target;
   logic            redirect;
   logic [63:0]     redirect_target;
@@ -108,6 +108,7 @@ module rv64gch_core #(
     logic [63:0] fb;
     logic [63:0] fc;
     logic [63:0] imm;
+    logic        pred_taken; // D predicted taken (static BTFN); EX verifies
   } ex_pkt_t;
   ex_pkt_t ex_pkt, ex_pkt_n;
 
@@ -201,6 +202,8 @@ module rv64gch_core #(
       pc_f <= (trap) ? tvec : (redirect ? redirect_target : next_pc);
     end else if (!stall && fetch_done) begin
       pc_f <= next_pc;
+    end else if (pred_fire) begin
+      pc_f <= pred_target;
     end
   end
 
@@ -312,7 +315,25 @@ module rv64gch_core #(
   // otherwise deadlock the core, while a stale result from a flushed pc is
   // ignored. For a 32-bit instruction at byte offset 6 the window straddles
   // two 64-bit words, so fetch_res_valid waits for the second word.
-  assign fetch_done    = fetch_res_valid & ~stall & ~vm_fence_active;
+  // Static branch prediction (stage a: backward-taken / forward-not-taken).
+  // Predicted in Decode from the B-type sign bit; verified in EX via
+  // ex_pkt.pred_taken (redirect iff taken XOR predicted). A taken
+  // prediction redirects fetch immediately and squashes only younger
+  // Decode state; the predicting instruction itself still issues to EX to
+  // verify (it can never pair, so it always issues single).
+  logic pred0, pred1, pred_any, pred_fire;
+  logic [63:0] pred_target;
+  assign pred0 = valid_d & dc.is_branch & dc.imm[63] &
+                 ~dc.illegal & ~illegal_c_d & ~fault_d & ~fault_f_q;
+  assign pred1 = has_d1 & dc1.is_branch & dc1.imm[63] &
+                 ~dc1.illegal & ~illegal_c_d1 & ~fault_d1 & ~fault_f_q & ~pred0;
+  assign pred_any = pred0 | pred1;
+  assign pred_target = pred0 ? (pc_d + imm) : (pc_d1 + imm1);
+  // Fire only when the frontend can act (no stall/fence; real redirects or
+  // traps override by priority in each consumer). Firing implies D0 issues
+  // this cycle, so the D shift/refill stays consistent.
+  assign pred_fire = pred_any & ~stall & ~vm_fence_active;
+  assign fetch_done    = fetch_res_valid & ~stall & ~vm_fence_active & ~pred_fire;
   // Fetch virtual address: the straddling second word is translated
   // independently (it can sit on another page).
   logic [63:0] fetch_va;
@@ -353,6 +374,16 @@ module rv64gch_core #(
       fcause_q       <= '0;
       fva_q          <= '0;
     end else if (flush_all) begin
+      fetch_busy     <= 1'b0;
+      fetch_complete <= 1'b0;
+      fetch_hi_valid <= 1'b0;
+      valid_f        <= 1'b1;
+      fault_f_q      <= 1'b0;
+    end else if (pred_fire) begin
+      // Prediction redirected fetch: drop the stale buffered word (its pc
+      // no longer matches) so the refill at the target is treated as a
+      // fresh word, not a straddle continuation. Decode state is handled
+      // in D (D0 issued, D1 squashed); EX/MEM/WB continue undisturbed.
       fetch_busy     <= 1'b0;
       fetch_complete <= 1'b0;
       fetch_hi_valid <= 1'b0;
@@ -506,6 +537,28 @@ module rv64gch_core #(
           is_c_d1 <= fetch_is_c1;
           instr_d1 <= instr1_d_use;
           illegal_c_d1 <= illegal1_d_use;
+          fault_d1 <= 1'b0;
+        end
+      end else if (pred_fire) begin
+        // Prediction redirected fetch (fetch consume suppressed above):
+        // the predicting head issued single, so drain/shift with no fill.
+        if (pred0) begin
+          // Predicting D0 issued; squash younger D1.
+          valid_d <= 1'b0;
+          fault_d <= 1'b0;
+          has_d1 <= 1'b0;
+          fault_d1 <= 1'b0;
+        end else begin
+          // Predicting D1: D0 issued single; shift predictor to the head.
+          valid_d <= 1'b1;
+          pc_d    <= pc_d1;
+          is_c_d  <= is_c_d1;
+          instr_d <= instr_d1;
+          illegal_c_d <= illegal_c_d1;
+          fault_d <= fault_d1;
+          fcause_d <= fcause_d1;
+          fva_d   <= fva_d1;
+          has_d1  <= 1'b0;
           fault_d1 <= 1'b0;
         end
       end else if (fault_f_q) begin
@@ -1106,6 +1159,8 @@ module rv64gch_core #(
     d_entry.fb    = fp_rf2;
     d_entry.fc    = fp_rf3;
     d_entry.imm   = imm;
+    // Latch this head's prediction (lane B never holds a branch).
+    d_entry.pred_taken = pred0;
   end
 
   // Slot 1 entry (younger), fault flags included like the head.
@@ -1329,7 +1384,6 @@ module rv64gch_core #(
     endcase
   end
 
-  assign branch_taken = ex_pkt.valid & ex_pkt.ctrl.is_branch & branch_resolved;
   assign branch_target = (ex_pkt.ctrl.is_jal | ex_pkt.ctrl.is_jalr) ?
                          (alu_a + alu_b) : (ex_pkt.pc + ex_pkt.imm);
 
@@ -1337,10 +1391,16 @@ module rv64gch_core #(
   // worked when the target happened to be adjacent).
   logic is_xret;
   assign is_xret = ex_pkt.ctrl.is_mret | ex_pkt.ctrl.is_sret;
-  assign redirect = ex_pkt.valid & (ex_pkt.ctrl.is_branch & branch_resolved |
+  // A predicted branch redirects only on mispredict (taken XOR predicted).
+  // Mispredicted-taken-not-taken resumes at the fall-through pc.
+  logic [63:0] branch_fallthrough;
+  assign branch_fallthrough = ex_pkt.pc + (ex_pkt.is_c ? 64'd2 : 64'd4);
+  assign redirect = ex_pkt.valid & ((ex_pkt.ctrl.is_branch & (branch_resolved ^ ex_pkt.pred_taken)) |
                                     ex_pkt.ctrl.is_jal | ex_pkt.ctrl.is_jalr |
                                     is_xret);
-  assign redirect_target = is_xret ? epc : branch_target;
+  assign redirect_target = is_xret ? epc :
+                           ((ex_pkt.ctrl.is_branch & ~branch_resolved & ex_pkt.pred_taken) ?
+                            branch_fallthrough : branch_target);
 
   assign mem_is_load_x = ((ex_pkt.ctrl.lsu_op >= LSU_LB) & (ex_pkt.ctrl.lsu_op <= LSU_LWU)) |
                          (ex_pkt.ctrl.lsu_op == LSU_LR) | (ex_pkt.ctrl.lsu_op == LSU_AMO);

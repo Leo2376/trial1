@@ -263,10 +263,12 @@ module tb_fpu;
     is_unsigned = 0; is_word = 0;
 
     // ---------------- FMV ----------------
-    // FMV.W.X is a full XLEN-bit copy (never NaN-boxes): unboxed patterns
-    // round-trip exactly (Unicorn lock-step caught the old boxing here).
+    // FMV.W.X takes rs1[31:0] and NaN-boxes (upper ones), per the RV64F
+    // NaN-boxing rule. riscv-tests rv64ud move.S TEST_FSGNJS requires
+    // strict single-source boxing: fmv.d.x double-NaN patterns must read
+    // as canonical NaN in fsgnj.s (only all-ones upper is raw).
     do_op(FPU_MV_X2F, 32'hDEADBEEF, 64'd0, RM_RNE, got, gff);
-    chk64(64'h00000000DEADBEEF, 5'd0);
+    chk64(64'hFFFFFFFFDEADBEEF, 5'd0);
     do_op(FPU_MV_X2F, 64'hFFFFFFFFDEADBEEF, 64'd0, RM_RNE, got, gff);
     chk64(64'hFFFFFFFFDEADBEEF, 5'd0);
     do_op(FPU_MV_F2X, 32'hCAFEBABE, 64'd0, RM_RNE, got, gff);
