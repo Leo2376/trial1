@@ -1026,7 +1026,17 @@ module rv64gch_core #(
                          ((ex_pkt.valid & ex_pkt.ctrl.writes_csr) |
                           (mem_pkt.valid & mem_pkt.ctrl.writes_csr) |
                           (wb_pkt.valid & wb_pkt.ctrl.writes_csr));
-  assign stall = stall_raw | frm_stall | xret_csr_wait |
+  // CSR read-after-write: a csrr samples the CSR into its WB packet the
+  // same edge an older in-flight csrw applies, so it must wait in D until
+  // older CSR writes drain. (Dense dual-fetch delivers the reader
+  // back-to-back; single-issue fetch gaps used to mask this.)
+  // Frontend-only hold like load-use/frm (backend drains to resolve).
+  logic csr_raw_wait;
+  assign csr_raw_wait = chk0_valid & chk0_ctrl.reads_csr &
+                        ((ex_pkt.valid & ex_pkt.ctrl.writes_csr) |
+                         (mem_pkt.valid & mem_pkt.ctrl.writes_csr) |
+                         (wb_pkt.valid & wb_pkt.ctrl.writes_csr));
+  assign stall = stall_raw | frm_stall | xret_csr_wait | csr_raw_wait |
                  drain_busy_i | dtlb_miss;
   // Backend drain gate: everything except a load-use / frm hold lets
   // EX/MEM/WB advance. Those holds freeze only the frontend (fetch/D/issue)
@@ -1125,12 +1135,13 @@ module rv64gch_core #(
     end else if (trap) begin
       ex_pkt <= '0; ex_pkt_b <= '0;
     end else if (!backend_stall) begin
-      // xret is NOT killed here (unlike branches/jumps): it must retire at
-      // WB for its CSR effects (MPIE/MPP/SPIE/SPP). It is harmless downstream
-      // (no mem op, rd=x0) while pc/F/D already redirected around it.
-      // Lane B is always wrong-path younger work on a redirect/trap, so it
-      // is dropped; xret itself can never pair (excluded from simple-ALU).
-      if (flush_redirect & ~(redirect & is_xret)) begin
+      // Any redirect (branch/jump/xret/trap) bubbles EX: the redirecting
+      // instruction itself already flowed EX->MEM this same edge (MEM takes
+      // the pre-edge EX packet), so it still retires (xret CSR effects
+      // happen at WB) while younger wrong-path work never issues. (Issuing
+      // D here on xret used to be harmless because single-fetch timing left
+      // D empty; dual-fill routinely holds the next sequential.)
+      if (flush_redirect) begin
         ex_pkt <= '0; ex_pkt_b <= '0;
       end else if (stall) begin
         // Frontend-only hold (load-use / frm / xret-CSR): the backend
@@ -1152,10 +1163,15 @@ module rv64gch_core #(
   assign rd_x = ex_pkt.ctrl.rd;
 
   // Forwarding source from the MEM stage: a load's result is its read data
-  // (latched in load_data_q once the AXI read completes), not its ALU address;
-  // any other instruction forwards its ALU/MDU/FPU result.
+  // (latched in load_data_q once the AXI read completes), a CSR read's
+  // result is the CSR read port (the ALU result is meaningless for CSR ops
+  // and would corrupt the consumer -- dense dual-fetch hits this window
+  // deterministically); any other instruction forwards its ALU/MDU/FPU
+  // result. (csr_raw_wait guarantees no older CSR write is still in flight
+  // when a CSR read sits in MEM, so csr_rdata is exact here.)
   logic [63:0] mem_fwd_data;
-  assign mem_fwd_data = mem_pkt.is_load ? mem_rdata_aligned : mem_alu_y;
+  assign mem_fwd_data = mem_pkt.is_load ? mem_rdata_aligned :
+                        (mem_pkt.ctrl.reads_csr ? csr_rdata : mem_alu_y);
   // FP forwarding from MEM: an FLW must forward its NaN-boxed single value;
   // an FP compute forwards the FPU result (alu_res).
   logic [63:0] fp_mem_fwd_data;
@@ -1827,8 +1843,9 @@ module rv64gch_core #(
     .cause(cause), .trap(trap),
     .tval_valid(trap_is_fault), .tval(trap_tval),
     .mret(wb_pkt.ctrl.is_mret), .sret(wb_pkt.ctrl.is_sret),
-    .epc(epc), .tvec(tvec),
-    .new_priv(new_priv),
+    .ex_mret_i(ex_pkt.valid & ex_pkt.ctrl.is_mret),
+    .ex_sret_i(ex_pkt.valid & ex_pkt.ctrl.is_sret),
+    .epc(epc), .tvec(tvec),    .new_priv(new_priv),
     .timer_irq(timer_irq), .soft_irq(soft_irq), .ext_irq(ext_irq),
     .irq_pending(irq_pending),
     .fi_we(), .fs_mstatus(),

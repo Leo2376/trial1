@@ -21,6 +21,12 @@ module csr_unit #(
   input  logic [XLEN-1:0]   tval,
   input  logic              mret,
   input  logic              sret,
+  // EX-stage xret kind for the redirect target: epc must follow the
+  // instruction (mret->mepc, sret->sepc), NOT ambient priv. A
+  // backend-stalled xret re-resolves after its own priv switch; muxing on
+  // priv would then redirect to the wrong epc (e.g. mret->sepc==0).
+  input  logic              ex_mret_i,
+  input  logic              ex_sret_i,
   output logic [XLEN-1:0]   epc,
   output logic [XLEN-1:0]   tvec,
   output logic [1:0]        new_priv,
@@ -266,7 +272,9 @@ module csr_unit #(
   end
 
   assign csr_rdata = csr_rdata_q;
-  assign epc = (priv == PRIV_M) ? mepc : sepc;
+  // Redirect target for the EX-stage xret (consumed only when an xret is
+  // resolving, so defaulting to mepc when neither is set is safe).
+  assign epc = ex_sret_i ? sepc : mepc;
   // Trap vector follows the delegated target. Vectored mode adds
   // 4*cause to the 4-aligned base; direct mode uses the value exactly
   // (masking unconditionally would corrupt a direct vector whose low bits
