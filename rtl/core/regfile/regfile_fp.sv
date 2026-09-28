@@ -11,7 +11,14 @@ module regfile_fp #(
   input  logic [4:0]       raddr3,
   output logic [XLEN-1:0]  rdata1,
   output logic [XLEN-1:0]  rdata2,
-  output logic [XLEN-1:0]  rdata3
+  output logic [XLEN-1:0]  rdata3,
+  // Extra read ports for dual-fetch slot 1 (Decode).
+  input  logic [4:0]       raddr4,
+  input  logic [4:0]       raddr5,
+  input  logic [4:0]       raddr6,
+  output logic [XLEN-1:0]  rdata4,
+  output logic [XLEN-1:0]  rdata5,
+  output logic [XLEN-1:0]  rdata6
 );
   logic [XLEN-1:0] regs [0:31];
 
@@ -26,5 +33,8 @@ module regfile_fp #(
   assign rdata1 = regs[raddr1];
   assign rdata2 = regs[raddr2];
   assign rdata3 = regs[raddr3];
+  assign rdata4 = regs[raddr4];
+  assign rdata5 = regs[raddr5];
+  assign rdata6 = regs[raddr6];
 
 endmodule

@@ -28,13 +28,19 @@ synthesis), not FPGA.
 | Trap delegation (medeleg/mideleg, S-trap entry, vectored tvec) | **DONE** | deleg_basic PASS |
 | ASID tags + selective SFENCE.VMA | **DONE** | asid_test PASS |
 | MMU Sv48 (4-level walk, 512G/1G/2M/4K) | **DONE** | sv48_basic PASS |
-| Dual-issue frontend | Not started | — |
+| Dual-issue frontend (8B fetch, dual decode/issue/retire, ALU+ALU) | **DONE (Phase 1)** | all ISA suites + directed PASS (see regression line) |
+| Branch prediction (static BTFN → tiny BTB + 2-bit + RAS) | Not started | — |
 | RVV 1.0 vector engine | Not started | — |
 | IME 1.0 matrix extension | Not started | — |
 
-Current pipeline: 5-stage (F/D, EX, MEM, WB) in-order single-issue with full
+Current pipeline: 5-stage (F/D, EX, MEM, WB) in-order dual-issue with full
 hazard/forwarding for INT, FP and MDU; multi-cycle FPU (FADD/FSUB/FMUL
 single-cycle, FDIV/FSQRT iterative); fflags accumulate to CSR via WB.
+Fetch serves up to 2 parcels/cycle from each buffered 8B word (retain +
+hi-promote, straddle-safe); D0/D1 pair when both are simple-ALU
+(ADD/SUB/SLL/SLT(U)/XOR/SRL/SRA/OR/AND, W-variants, LUI, AUIPC) on a
+second integer ALU lane with intra-pair bypass; dual retire via a
+2-write-port int regfile (younger lane-B wins).
 
 ## Next Steps (Roadmap)
 
@@ -94,9 +100,28 @@ single-cycle, FDIV/FSQRT iterative); fflags accumulate to CSR via WB.
    level-3 start, 512G leaves (PPN[26:0] alignment), Sv48 canonical rule,
    mode-9 WARL accept. `sv48_basic` proves a 4-level data remap + PA
    alias, fetch remap, 2M-page read, and A/D at depth 3.
-7. **Dual-issue frontend** — 8B/cycle fetch, dual decode, ALU+MDU/FPU pairing,
-   wider hazard/forwarding.
-8. **RVV 1.0 (VLEN=256) + IME 1.0** — no separate VPU memory interface:
+7. **Dual-issue frontend** — **DONE (Phase 1)**. 8B/cycle fetch (buffered
+   word retain + hi-promote, straddle-safe, zero extra transactions or
+   translations), dual decode into a 2-deep D queue with shift, pairing
+   via `rtl/core/issue/issue_unit.sv` (ALU+ALU only for now; MDU/FPU/LSU/
+   CSR/branch never pair and stay lane-A single), second integer ALU
+   (lane-B operand select mirrors lane A incl. shift-immediate-vs-R-type),
+   dual MEM/WB pass-through + dual retire. ~20-28% fewer cycles across
+   ISA suites (add 4069→2952, lw 3106→2405, sw 4874→3530, lb 2863→2232,
+   fcvt_w 6076→4794). Bring-up hardened four latent hazards (all
+   timing-masked in single-issue, all deterministic under dense fetch):
+   exact read-mask load-use (I-type imm bits in rs2 never stall),
+   backend-drain instead of freeze on load-use/FRM holds, FRM pending
+   narrowed to EX/MEM, FP-file load-use stall for FLW/FLD consumers,
+   xret drain-hold for back-to-back `csrw mepc/sepc → xret`.
+   Remaining: MDU/FPU second-lane pairing, then branch prediction (8).
+8. **Branch prediction** — not needed for correctness (current static
+   not-taken: `next_pc = pc+2/4`, EX-resolve + F/D flush). Needed to keep a
+   dual-issue frontend fed. Staged plan, ASIC-area aware: (a) static
+   backward-taken / forward-not-taken (0 area); (b) tiny BTB + 2-bit
+   saturating counters + small RAS for `jalr`/`ret`. No large
+   global-history / tournament predictor.
+9. **RVV 1.0 (VLEN=256) + IME 1.0** — no separate VPU memory interface:
    vector/matrix traffic arbitrates onto the same AXI4 bus/fabric as the
    CPU (alongside LSU/fetch in `rv64gch_top`) and shares the L2/LLC chain.
 
@@ -104,8 +129,8 @@ single-cycle, FDIV/FSQRT iterative); fflags accumulate to CSR via WB.
 
 Three levels, all driven by the upstream riscv-tests ISA suites:
 
-1. **Unit level** — `sim/verilator/tb_fpu.sv` (`make fpu`): 79 directed
-   vectors (61 single from rv64uf + 18 double from rv64ud: add/sub/mul/
+1. **Unit level** — `sim/verilator/tb_fpu.sv` (`make fpu`): 80 directed
+   vectors (single from rv64uf + double from rv64ud: add/sub/mul/
    div/sqrt/min/max/cmp/class/cvt/move/fmadd), checking result bits and
    exact fflags per op.
    `sim/verilator/tb_decompressor.sv` (`make decomp`): 44 directed vectors
@@ -173,7 +198,7 @@ cd sim/verilator && make decomp   # 44/44 PASS
 ./sim/verilator/obj_dir/Vtb_rv64gch_core +hex=/tmp/sv48_basic.hex      # TEST PASSED
 ```
 
-Last full regression (caches + Sv39/48 MMU + delegation + ASID in path): rv64ui 50/50, rv64um 13/13, rv64uf 11/11, rv64uc 1/1 (rvc), rv64ua 19/19, rv64ud 12/12, tb_fpu 79/79, tb_decompressor 44/44, dyn_rm PASS, l1i_conflict PASS, l1d_wb PASS, l2_wb PASS, sv39_basic/fault/sfence PASS, deleg_basic PASS, asid_test PASS, sv48_basic PASS.
+Last full regression (dual-issue Phase 1 in path): rv64ui 50/50, rv64um 13/13, rv64uf 11/11, rv64uc 1/1 (rvc), rv64ua 19/19, rv64ud 11/12 (move FAILs identically on clean HEAD — pre-existing FPU NaN-boxing corner, not a dual regression), tb_fpu 80/80, tb_decompressor 44/44, dyn_rm PASS, l1i_conflict PASS, l1d_wb PASS, l2_wb PASS, sv39_basic/fault/sfence PASS, deleg_basic PASS, asid_test PASS, sv48_basic PASS.
 
 ## RTL Directory Structure & Module Relationships
 
@@ -182,25 +207,26 @@ Implemented modules vs stubs/empty placeholders:
 ```
 rtl/
 ├── core/                          # RV64GCH Core (IMPLEMENTED)
-│   ├── rv64gch_core.sv           # Top-level core: 5-stage in-order pipeline
+│   ├── rv64gch_core.sv           # Top-level core: 5-stage dual-issue pipeline
 │   ├── rtl_core_pkg.sv           # Package: opcodes, enums (alu/fpu/mdu), ctrl struct
 │   ├── frontend/
-│   │   └── decompressor.sv       # C-extension decompressor (IMPLEMENTED)
+│   │   └── decompressor.sv       # C-extension decompressor (IMPLEMENTED, x2 instances)
 │   ├── ctrl/
-│   │   ├── hazard_unit.sv        # Stalls: load-use, MDU/FPU busy, LSU, CSR
-│   │   └── forwarding_unit.sv    # INT MEM/WB forwarding
+│   │   ├── hazard_unit.sv        # Stalls: exact load-use (int+FP), MDU/FPU busy, LSU, FRM/xret holds
+│   │   └── forwarding_unit.sv    # INT MEM/WB forwarding (lane-B sources inline in core)
 │   ├── regfile/
-│   │   ├── regfile_int.sv        # Integer regfile (32x64)
-│   │   └── regfile_fp.sv         # FP regfile (32x64, 3 read ports)
+│   │   ├── regfile_int.sv        # Integer regfile (32x64, 4R dual-decode, 2W dual-retire)
+│   │   └── regfile_fp.sv         # FP regfile (32x64, 6R dual-decode)
 │   ├── int_alu/
-│   │   └── alu.sv                # Integer ALU
+│   │   └── alu.sv                # Integer ALU (x2 instances: lane A + lane B)
 │   ├── mul_div/
-│   │   └── mdu.sv                # Multiply/Divide unit (iterative)
+│   │   └── mdu.sv                # Multiply/Divide unit (iterative, lane A only)
 │   ├── fpu/
-│   │   └── fpu.sv                # FPU: F + D verified (single + double)
+│   │   └── fpu.sv                # FPU: F + D verified (single + double, lane A only)
 │   ├── csr/
 │   │   └── csr_unit.sv           # CSRs: M/S-mode, fcsr, separate read port
-│   ├── issue/                    # Dual-issue logic (EMPTY, future)
+│   ├── issue/
+│   │   └── issue_unit.sv         # Dual-issue pairing predicate (simple-ALU only)
 │   └── lsu/                      # LSU logic lives in rv64gch_core.sv (MEM stage)
 ├── vpu/                           # Vector/Matrix Unit (EMPTY, future)
 │   ├── ctrl/  regfile/  vlane/  munit/  vsew_lmul/  ldst/
@@ -228,12 +254,13 @@ rtl/
 
 ```
 rv64gch_core.sv
-├── frontend/decompressor.sv
+├── frontend/decompressor.sv (x2: slot 0 + slot 1)
 ├── ctrl/hazard_unit.sv
 ├── ctrl/forwarding_unit.sv
+├── issue/issue_unit.sv
 ├── regfile/regfile_int.sv
 ├── regfile/regfile_fp.sv
-├── int_alu/alu.sv
+├── int_alu/alu.sv (x2: u_alu + u_alu_b)
 ├── mul_div/mdu.sv
 ├── fpu/fpu.sv
 ├── csr/csr_unit.sv

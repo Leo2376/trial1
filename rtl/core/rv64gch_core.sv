@@ -58,8 +58,8 @@ module rv64gch_core #(
   logic [2:0]      fpu_rm_eff;
   logic [1:0]      priv;
 
-  ctrl_t           dc;
-  logic [63:0]     imm;
+  ctrl_t           dc, dc1;
+  logic [63:0]     imm, imm1;
   logic [4:0]      rs1_d, rs2_d, rs3_d, rs1_x, rs2_x, rd_x, rd_m, rd_w;
   logic [63:0]     rdata1_d, rdata2_d, rdata1_x, rdata2_x, rs1_fwd, rs2_fwd;
   logic [63:0]     alu_a, alu_b, alu_y;
@@ -125,6 +125,13 @@ module rv64gch_core #(
     logic [7:0]  be;
     logic        lock;
     logic [4:0]  fflags;
+    // Dual-issue lane B (ALU-only younger slot) rides the same MEM/WB
+    // packets through: no memory access, just an ALU result + dest.
+    logic        b_valid;
+    logic [4:0]  b_rd;
+    logic        b_we;
+    logic [63:0] b_alu_res;
+    logic [63:0] b_pc;
   } mem_pkt_t;
   mem_pkt_t mem_pkt, mem_pkt_n;
 
@@ -139,10 +146,31 @@ module rv64gch_core #(
     logic        we;
     logic        fp_we;
     logic [4:0]  fflags;
+    // Dual-issue lane B retire slot (integer only, never FP/CSR).
+    logic        b_valid;
+    logic [4:0]  b_rd;
+    logic        b_we;
+    logic [63:0] b_data;
+    logic [63:0] b_pc;
   } wb_pkt_t;
   wb_pkt_t wb_pkt, wb_pkt_n;
 
   assign dbg_pc = pc_d;
+
+  // Dual-issue engagement counter (debug only, +define+DUAL_DEBUG).
+  `ifdef DUAL_DEBUG
+  longint unsigned dual_cnt = 0;
+  always @(posedge clk) if (rst_n && issue2 && !stall) dual_cnt <= dual_cnt + 1;
+  final $display("[dual] paired-issue cycles = %0d", dual_cnt);
+  `endif
+  // Dual-issue: lane A (ex_pkt) is the full pipe; lane B (ex_pkt_b) is
+  // ALU-only. D0/D1 (dual fetch) issue as a pair when pairable, else the
+  // head issues single and D1 shifts up. d_entry/d_entry1 carry
+  // issue-time operand values (fresh every cycle, never latched).
+  ex_pkt_t ex_pkt_b;
+  ex_pkt_t d_entry, d_entry1;
+  logic    dualDD;  // D0+D1 pairing decision (issue_unit)
+  logic    issue2;  // dual-issue this cycle (D0+D1 pair)
 
   // Real privilege state (was hardwired M). Switches on the committing
   // edge itself -- trap target, or MPP/SPP on xret redirect -- so no fetch
@@ -164,8 +192,7 @@ module rv64gch_core #(
     end
   end
 
-  assign next_pc = (redirect) ? redirect_target :
-                  (fetch_is_c) ? (pc_f + 16'd2) : (pc_f + 64'd4);
+  assign next_pc = (redirect) ? redirect_target : fetch_next_pc;
 
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
@@ -183,7 +210,7 @@ module rv64gch_core #(
   logic [31:0] fetch_instr;
   logic [15:0] fetch_low_half;
   logic [63:0] fetch_word_q;   // latched fetch word, held across stalls
-  logic [63:0] fetch_pc_q;     // pc the latched word was fetched for
+  logic [63:0] fetch_pc_q;     // 8B-aligned base of the latched word
   logic        fetch_complete;  // fetch read returned, awaiting consumption
   logic [63:0] fetch_hi_q;     // second word for 32-bit insn straddling 64-bit boundary
   logic        fetch_hi_valid;
@@ -238,6 +265,45 @@ module rv64gch_core #(
   logic        illegal_d_use;
   assign instr_d_use = fetch_is_c ? instr_expanded : fetch_instr;
   assign illegal_d_use = fetch_is_c & fetch_illegal_c;
+
+  // Dual-fetch slot 1: second parcel decoded from the same buffered 8B
+  // word (plus the hi word when already present). No extra bus transaction
+  // and no new translation: both chunks were translated when fetched, and
+  // any fault collapses to single-consume + clear (the existing bubble
+  // path), so slot 1 bytes are always known-good here.
+  logic [63:0] fetch_pc1;
+  logic [3:0]  fetch_len0, fetch_len1;
+  logic [3:0]  fetch_off1;
+  logic [127:0] fetch_win128;
+  logic [31:0] fetch_instr1, instr_expanded1, instr1_d_use;
+  logic [15:0] fetch_low_half1;
+  logic        fetch_is_c1, fetch_illegal_c1, illegal1_d_use;
+  logic        slot1_in_win, slot1_avail, fetch_done1;
+  logic [63:0] fetch_next_pc;
+  assign fetch_len0 = fetch_is_c ? 4'd2 : 4'd4;
+  assign fetch_pc1  = pc_f + {60'd0, fetch_len0};
+  // Byte offset of slot 1 within the {hi,word} window (both 2B-aligned).
+  assign fetch_off1 = fetch_pc1[3:0] - fetch_pc_q[3:0];
+  assign slot1_in_win = (fetch_pc1 >= fetch_pc_q) &
+                        (fetch_pc1 < (fetch_pc_q + 64'd16));
+  assign fetch_win128 = {fetch_hi_q, fetch_word_q} >> (fetch_off1*8);
+  assign fetch_low_half1 = fetch_win128[15:0];
+  assign fetch_instr1 = fetch_win128[31:0];
+  decompressor u_decomp1 (.cin(fetch_low_half1), .iout(instr_expanded1),
+                          .is_c(fetch_is_c1), .illegal(fetch_illegal_c1));
+  assign fetch_len1 = fetch_is_c1 ? 4'd2 : 4'd4;
+  assign instr1_d_use = fetch_is_c1 ? instr_expanded1 : fetch_instr1;
+  assign illegal1_d_use = fetch_is_c1 & fetch_illegal_c1;
+  // Slot 1 bytes must be buffered: within the 16B window, and hi bytes
+  // (offset >= 8) require the hi word to be present. Offset 14 holds only
+  // the low half, so a 32-bit slot 1 there is not servable.
+  assign slot1_avail = slot1_in_win &
+                       ((fetch_off1 + {1'b0, fetch_len1}) <=
+                        (fetch_hi_valid ? 5'd16 : 5'd8));
+  assign fetch_done1 = fetch_done & slot1_avail &
+                       ~fault_f_q & ~mmu_fault_f & ~dual_suppress;
+  assign fetch_next_pc = fetch_done1 ? (fetch_pc1 + {60'd0, fetch_len1}) :
+                                       (pc_f + {60'd0, fetch_len0});
 
   // fetch_done is a latched (level) signal gated by the result being valid
   // for the current pc and the pipeline being able to consume it. This
@@ -321,7 +387,9 @@ module rv64gch_core #(
         fetch_busy <= 1'b0;
         if (!fetch_complete) begin
           fetch_word_q   <= fetch_rdata;
-          fetch_pc_q     <= pc_f;
+          // Word-aligned base: the bus returns the 8B word containing pc_f;
+          // slot-1 offset math ((p1-base) mod 16) needs the aligned base.
+          fetch_pc_q     <= {pc_f[63:3], 3'b0};
           fetch_complete <= 1'b1;
         end else begin
           fetch_hi_q     <= fetch_rdata;
@@ -332,10 +400,30 @@ module rv64gch_core #(
         // wins arbitration.
         fetch_busy <= 1'b1;
       end
+      // Consume: advance pc_f (done by the caller). The buffered word is
+      // retained while it still covers the next pc, so back-to-back
+      // instructions in one 8B word serve without bus traffic (8B/cycle
+      // fetch). Advancing into the hi chunk promotes it to word; any
+      // translation fault drops the buffer so the refill re-faults into
+      // the existing bubble path (slot-1 bytes are always known-good).
       if (fetch_done) begin
-        fetch_busy     <= 1'b0;
-        fetch_complete <= 1'b0;
-        fetch_hi_valid <= 1'b0;
+        fetch_busy <= 1'b0;
+        if (fault_f_q | mmu_fault_f) begin
+          fetch_complete <= 1'b0;
+          fetch_hi_valid <= 1'b0;
+        end else if ((fetch_next_pc[47:3] != fetch_pc_q[47:3]) & fetch_hi_valid) begin
+          // A hi ack landing this same cycle is fresher than hi_q.
+          fetch_word_q   <= (fetch_ack & fetch_busy & fetch_complete) ?
+                            fetch_rdata : fetch_hi_q;
+          fetch_pc_q     <= fetch_pc_q + 64'd8;
+          fetch_hi_valid <= 1'b0;
+          fetch_complete <= 1'b1;
+        end else if (fetch_next_pc[47:3] == fetch_pc_q[47:3]) begin
+          // Still within the buffered word: keep serving it.
+        end else begin
+          fetch_complete <= 1'b0;
+          fetch_hi_valid <= 1'b0;
+        end
       end
     end
   end
@@ -346,35 +434,151 @@ module rv64gch_core #(
   logic fault_d;
   logic [4:0]  fcause_d;
   logic [63:0] fva_d;
+  // Dual-fetch slot 1 (younger): valid only when two parcels served together.
+  // D0/D1 form a 2-deep in-order queue: issue consumes from the head (one
+  // or two per cycle); a single issue shifts D1 to the head. Operands are
+  // read combinationally at issue time (always fresh); D holds only
+  // instr/pc so a waiting D1 can never go stale behind a retired producer.
+  logic        has_d1;
+  logic [63:0] pc_d1;
+  logic [31:0] instr_d1;
+  logic        is_c_d1, illegal_c_d1;
+  logic        fault_d1;
+  logic [4:0]  fcause_d1;
+  logic [63:0] fva_d1;
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       valid_d <= 1'b0; pc_d <= '0; instr_d <= '0; is_c_d <= 1'b0; illegal_c_d <= 1'b0;
       fault_d <= 1'b0; fcause_d <= '0; fva_d <= '0;
+      has_d1 <= 1'b0; pc_d1 <= '0; instr_d1 <= '0; is_c_d1 <= 1'b0; illegal_c_d1 <= 1'b0;
+      fault_d1 <= 1'b0; fcause_d1 <= '0; fva_d1 <= '0;
     end else if (flush_all) begin
       valid_d <= 1'b0;
       fault_d <= 1'b0;
+      has_d1 <= 1'b0;
+      fault_d1 <= 1'b0;
     end else if (!stall) begin
+      // Under !stall the head (D0) always issues, so overwriting D below
+      // never loses an instruction: D0 retires into EX while D shifts.
       if (fetch_done) begin
-        valid_d <= valid_f;
-        pc_d    <= pc_f;
-        is_c_d  <= fetch_is_c;
-        instr_d <= instr_d_use;
-        illegal_c_d <= illegal_d_use;
-        fault_d <= 1'b0;
+        if (dualDD) begin
+          // Both entries issued as a pair: refill head and tail from fetch.
+          valid_d <= valid_f;
+          pc_d    <= pc_f;
+          is_c_d  <= fetch_is_c;
+          instr_d <= instr_d_use;
+          illegal_c_d <= illegal_d_use;
+          fault_d <= 1'b0;
+          has_d1  <= fetch_done1;
+          pc_d1   <= fetch_pc1;
+          is_c_d1 <= fetch_is_c1;
+          instr_d1 <= instr1_d_use;
+          illegal_c_d1 <= illegal1_d_use;
+          fault_d1 <= 1'b0;
+        end else if (has_d1) begin
+          // D0 issued single: shift waiting D1 (with fault flags) to the
+          // head, new parcel to the tail. (Dual serve is suppressed while
+          // D1 waits, so fetch holds exactly one parcel.)
+          valid_d <= 1'b1;
+          pc_d    <= pc_d1;
+          is_c_d  <= is_c_d1;
+          instr_d <= instr_d1;
+          illegal_c_d <= illegal_c_d1;
+          fault_d <= fault_d1;
+          fcause_d <= fcause_d1;
+          fva_d   <= fva_d1;
+          has_d1  <= 1'b1;
+          pc_d1   <= pc_f;
+          is_c_d1 <= fetch_is_c;
+          instr_d1 <= instr_d_use;
+          illegal_c_d1 <= illegal_d_use;
+          fault_d1 <= 1'b0;
+        end else begin
+          // D0 issued single (or D was empty): refill from fetch.
+          valid_d <= valid_f;
+          pc_d    <= pc_f;
+          is_c_d  <= fetch_is_c;
+          instr_d <= instr_d_use;
+          illegal_c_d <= illegal_d_use;
+          fault_d <= 1'b0;
+          has_d1  <= fetch_done1;
+          pc_d1   <= fetch_pc1;
+          is_c_d1 <= fetch_is_c1;
+          instr_d1 <= instr1_d_use;
+          illegal_c_d1 <= illegal1_d_use;
+          fault_d1 <= 1'b0;
+        end
       end else if (fault_f_q) begin
-        // Translation-fault bubble: flows like an insn, traps from EX.
-        // pc_d carries the faulting VA; instr is a benign NOP.
-        valid_d <= 1'b1;
-        pc_d    <= fva_q;
-        is_c_d  <= 1'b1;
-        instr_d <= 32'h00000013;
-        illegal_c_d <= 1'b0;
-        fault_d <= 1'b1;
-        fcause_d <= fcause_q;
-        fva_d   <= fva_q;
+        // Translation-fault bubble (younger than any waiting D1). Both
+        // entries issued under dualDD (bubble to head); else D0 issued
+        // single: shift D1 (with fault flags) to the head, bubble to the
+        // tail; with no waiter the bubble takes the head.
+        // pc carries the faulting VA; instr is a benign NOP.
+        if (dualDD) begin
+          valid_d <= 1'b1;
+          pc_d    <= fva_q;
+          is_c_d  <= 1'b1;
+          instr_d <= 32'h00000013;
+          illegal_c_d <= 1'b0;
+          fault_d <= 1'b1;
+          fcause_d <= fcause_q;
+          fva_d   <= fva_q;
+          has_d1 <= 1'b0;
+          fault_d1 <= 1'b0;
+        end else if (has_d1) begin
+          valid_d <= 1'b1;
+          pc_d    <= pc_d1;
+          is_c_d  <= is_c_d1;
+          instr_d <= instr_d1;
+          illegal_c_d <= illegal_c_d1;
+          fault_d <= fault_d1;
+          fcause_d <= fcause_d1;
+          fva_d   <= fva_d1;
+          has_d1  <= 1'b1;
+          pc_d1   <= fva_q;
+          is_c_d1 <= 1'b1;
+          instr_d1 <= 32'h00000013;
+          illegal_c_d1 <= 1'b0;
+          fault_d1 <= 1'b1;
+          fcause_d1 <= fcause_q;
+          fva_d1   <= fva_q;
+        end else begin
+          valid_d <= 1'b1;
+          pc_d    <= fva_q;
+          is_c_d  <= 1'b1;
+          instr_d <= 32'h00000013;
+          illegal_c_d <= 1'b0;
+          fault_d <= 1'b1;
+          fcause_d <= fcause_q;
+          fva_d   <= fva_q;
+          has_d1 <= 1'b0;
+          fault_d1 <= 1'b0;
+        end
       end else begin
-        valid_d <= 1'b0;
-        fault_d <= 1'b0;
+        // No fetch (miss/inflight): both issued under dualDD (drain), else
+        // D0 issued single: shift any waiting D1 up.
+        if (dualDD) begin
+          valid_d <= 1'b0;
+          fault_d <= 1'b0;
+          has_d1 <= 1'b0;
+          fault_d1 <= 1'b0;
+        end else if (has_d1) begin
+          valid_d <= 1'b1;
+          pc_d    <= pc_d1;
+          is_c_d  <= is_c_d1;
+          instr_d <= instr_d1;
+          illegal_c_d <= illegal_c_d1;
+          fault_d <= fault_d1;
+          fcause_d <= fcause_d1;
+          fva_d   <= fva_d1;
+          has_d1  <= 1'b0;
+          fault_d1 <= 1'b0;
+        end else begin
+          valid_d <= 1'b0;
+          fault_d <= 1'b0;
+          has_d1 <= 1'b0;
+          fault_d1 <= 1'b0;
+        end
       end
     end
   end
@@ -672,17 +876,41 @@ module rv64gch_core #(
     end else begin
       dc = '0; imm = '0;
     end
+    if (has_d1) begin
+      dc1 = decode(instr_d1);
+      imm1 = gen_imm(instr_d1);
+    end else begin
+      dc1 = '0; imm1 = '0;
+    end
   end
 
   assign rs1_d = dc.rs1;
   assign rs2_d = dc.rs2;
   assign rs3_d = dc.rs3;
+  // Dual-fetch slot 1 register specifiers + read data (extra ports).
+  logic [63:0] rdata3_d, rdata4_d, fp_rdata4, fp_rdata5, fp_rdata6;
+  logic [4:0]  rs1_d1, rs2_d1, rs3_d1;
+  assign rs1_d1 = dc1.rs1;
+  assign rs2_d1 = dc1.rs2;
+  assign rs3_d1 = dc1.rs3;
+  // Slot 1 WB->ID bypass (dual retire: lane B younger wins).
+  logic [63:0] rf1_d1, rf2_d1, fp1_d1, fp2_d1, fp3_d1;
+  assign rf1_d1 = (wb_int_we_b & (rd_w_b == rs1_d1)) ? wb_data_w_b :
+                  (wb_int_we & (rd_w == rs1_d1)) ? wb_data_w : rdata3_d;
+  assign rf2_d1 = (wb_int_we_b & (rd_w_b == rs2_d1)) ? wb_data_w_b :
+                  (wb_int_we & (rd_w == rs2_d1)) ? wb_data_w : rdata4_d;
+  assign fp1_d1 = (wb_fp_we_byp & (rd_w_fp == rs1_d1)) ? wb_data_w : fp_rdata4;
+  assign fp2_d1 = (wb_fp_we_byp & (rd_w_fp == rs2_d1)) ? wb_data_w : fp_rdata5;
+  assign fp3_d1 = (wb_fp_we_byp & (rd_w_fp == rs3_d1)) ? wb_data_w : fp_rdata6;
 
   regfile_int u_rfint (
     .clk(clk), .rst_n(rst_n),
     .waddr(rd_w), .we(reg_we_w), .wdata(wb_data_w),
+    .waddr_b(rd_w_b), .we_b(reg_we_w_b), .wdata_b(wb_data_w_b),
     .raddr1(rs1_d), .raddr2(rs2_d),
-    .rdata1(rdata1_d), .rdata2(rdata2_d)
+    .rdata1(rdata1_d), .rdata2(rdata2_d),
+    .raddr3(rs1_d1), .raddr4(rs2_d1),
+    .rdata3(rdata3_d), .rdata4(rdata4_d)
   );
 
   // WB->ID bypass: the regfile is written at the WB posedge while the ID-stage
@@ -692,16 +920,22 @@ module rv64gch_core #(
   // a load retires into WB one cycle before its consumer leaves ID, so the
   // consumer must see the WB write data directly here.
   logic [63:0] rf_rdata1, rf_rdata2;
-  logic        wb_int_we;
+  logic        wb_int_we, wb_int_we_b;
   assign wb_int_we = reg_we_w & (rd_w != 5'd0);
-  assign rf_rdata1 = (wb_int_we & (rd_w == rs1_d)) ? wb_data_w : rdata1_d;
-  assign rf_rdata2 = (wb_int_we & (rd_w == rs2_d)) ? wb_data_w : rdata2_d;
+  assign wb_int_we_b = reg_we_w_b & (rd_w_b != 5'd0);
+  // Dual retire: lane B is younger, so it wins the bypass on a WAW match.
+  assign rf_rdata1 = (wb_int_we_b & (rd_w_b == rs1_d)) ? wb_data_w_b :
+                     (wb_int_we & (rd_w == rs1_d)) ? wb_data_w : rdata1_d;
+  assign rf_rdata2 = (wb_int_we_b & (rd_w_b == rs2_d)) ? wb_data_w_b :
+                     (wb_int_we & (rd_w == rs2_d)) ? wb_data_w : rdata2_d;
 
   regfile_fp u_rffp (
     .clk(clk), .rst_n(rst_n),
     .waddr(rd_w_fp), .we(fp_we_w), .wdata(wb_data_w),
     .raddr1(rs1_d), .raddr2(rs2_d), .raddr3(rs3_d),
-    .rdata1(fp_rdata1), .rdata2(fp_rdata2), .rdata3(fp_rdata3)
+    .rdata1(fp_rdata1), .rdata2(fp_rdata2), .rdata3(fp_rdata3),
+    .raddr4(rs1_d1), .raddr5(rs2_d1), .raddr6(rs3_d1),
+    .rdata4(fp_rdata4), .rdata5(fp_rdata5), .rdata6(fp_rdata6)
   );
 
   // FP WB->ID bypass: same race as the integer regfile (write at the WB
@@ -736,26 +970,72 @@ module rv64gch_core #(
     return c.writes_csr & (c.csr_addr == CSR_FRM || c.csr_addr == CSR_FCSR);
   endfunction
   logic id_needs_frm, frm_pending;
-  assign id_needs_frm = valid_d & (dc.fpu_op != FPU_NONE) & (dc.fp_rm == RM_DYN);
+  // Dual-issue pairing: D0+D1 pair when both simple-ALU (the unit excludes
+  // faults, CSR/mem/control). Otherwise the head issues single and D1
+  // shifts up. D1 waiting suppresses the second fetch parcel (shift needs
+  // exactly one free tail slot).
+  logic dual_suppress;
+  issue_unit u_pairDD (
+    .c0(dc), .c1(dc1),
+    .valid0(valid_d), .valid1(has_d1),
+    .fault0(fault_d), .fault1(fault_d1),
+    .can_dual(dualDD)
+  );
+  assign dual_suppress = has_d1 & ~dualDD;
+  assign issue2 = dualDD;
+  // Oldest unissued instruction (lane A candidate) + younger lane B candidate.
+  logic       chk0_valid, chk1_valid;
+  ctrl_t      chk0_ctrl, chk1_ctrl;
+  assign chk0_valid = valid_d;
+  assign chk0_ctrl  = dc;
+  assign chk1_valid = issue2;
+  assign chk1_ctrl  = dc1;
+  // A DYN (rm=dyn) op stalls at the issue position until older FRM/FCSR
+  // writes drain out of EX/MEM (the CSR updates when the write reaches WB,
+  // so releasing then reads the new mode). Backend keeps draining (like a
+  // load-use hold); freezing it too would livelock on the stale WB term.
+  assign id_needs_frm = chk0_valid & (chk0_ctrl.fpu_op != FPU_NONE) &
+                        (chk0_ctrl.fp_rm == RM_DYN);
   assign frm_pending = (ex_pkt.valid & writes_frm(ex_pkt.ctrl)) |
-                       (mem_pkt.valid & writes_frm(mem_pkt.ctrl)) |
-                       (wb_pkt.valid & writes_frm(wb_pkt.ctrl));
+                       (mem_pkt.valid & writes_frm(mem_pkt.ctrl));
   assign frm_stall = id_needs_frm & frm_pending;
 
   hazard_unit u_haz (
-    .id_rs1(rs1_d), .id_rs2(rs2_d), .id_rs3(rs3_d),
+    .id_c0(chk0_ctrl), .id_c0_valid(chk0_valid),
+    .id_c1(chk1_ctrl), .id_c1_valid(chk1_valid),
     .ex_rd(rd_x), .ex_mem_read(mem_is_load_x),
+    .ex_fp_load(ex_fp_load_x),
     .ex_mul_busy(mdu_busy), .ex_fpu_busy(fpu_busy),
     .mem_lsu_busy(lsu_busy),
     .branch_taken(redirect), .trap(trap),
-    .is_csr_op(dc.writes_csr), .csr_hazard(load_use_hazard_csr),
-    .stall(stall_raw), .flush_id(flush_id_raw), .flush_ex(flush_ex)
+    .is_csr_op(chk0_ctrl.writes_csr), .csr_hazard(load_use_hazard_csr),
+    .stall(stall_raw), .load_use(load_use_raw),
+    .flush_id(flush_id_raw), .flush_ex(flush_ex)
   );
   // A data-TLB miss stalls the whole pipe for the walker (fetch only
   // waits for its own translation at issue; it needs no stall term).
   logic dtlb_miss;
   assign dtlb_miss = mmu_miss_d;
-  assign stall = stall_raw | frm_stall | drain_busy_i | dtlb_miss;
+  // xret (mret/sret) reads mepc/sepc+mstatus in EX, so it must wait in D
+  // until older CSR writes drain out of EX/MEM/WB (the CSR updates when
+  // the write retires; resolving alongside would read the stale value).
+  // Frontend-only hold like load-use/frm (backend drains to resolve).
+  logic xret_csr_wait;
+  assign xret_csr_wait = chk0_valid &
+                         (chk0_ctrl.is_mret | chk0_ctrl.is_sret) &
+                         ((ex_pkt.valid & ex_pkt.ctrl.writes_csr) |
+                          (mem_pkt.valid & mem_pkt.ctrl.writes_csr) |
+                          (wb_pkt.valid & wb_pkt.ctrl.writes_csr));
+  assign stall = stall_raw | frm_stall | xret_csr_wait |
+                 drain_busy_i | dtlb_miss;
+  // Backend drain gate: everything except a load-use / frm hold lets
+  // EX/MEM/WB advance. Those holds freeze only the frontend (fetch/D/issue)
+  // so the older instruction drains and the hazard resolves; freezing the
+  // backend too would livelock (the waiter could never leave while its
+  // waiter waits). Dense dual-fetch reaches these states deterministically.
+  logic load_use_raw, backend_stall;
+  assign backend_stall = (stall_raw & ~load_use_raw) |
+                         drain_busy_i | dtlb_miss;
   `ifdef CORE_DEBUG
   // Event-driven fetch tracing (scheduler-safe: fires only on handshakes).
   always @(posedge clk) begin
@@ -790,40 +1070,79 @@ module rv64gch_core #(
   logic flush_all_no_refetch;
   assign flush_all_no_refetch = flush_id_raw | flush_ex;
 
+  // Decode-stage entries, built combinationally (issue-time operand
+  // values, always fresh from the regfile + WB bypass).
+  always_comb begin
+    d_entry = '0;
+    d_entry.valid = valid_d;
+    d_entry.pc    = pc_d;
+    d_entry.instr = instr_d;
+    d_entry.ctrl  = dc;
+    // Fold decompressor-illegal into the control illegal bit so the
+    // EX-stage trap logic catches reserved RVC encodings. The
+    // decompressor already substitutes a NOP payload, so no register
+    // or memory side-effect can occur before the trap flushes.
+    d_entry.ctrl.illegal = dc.illegal | illegal_c_d;
+    d_entry.is_c = is_c_d;
+    d_entry.illegal_c = illegal_c_d;
+    d_entry.fault_f = fault_d;
+    d_entry.fcause = fcause_d;
+    d_entry.fva = fva_d;
+    d_entry.rs1   = rf_rdata1;
+    d_entry.rs2   = rf_rdata2;
+    // FP operands are latched here (with WB->ID bypass already applied)
+    // so the multi-cycle FPU holds stable inputs for its whole run.
+    d_entry.fa    = fp_rf1;
+    d_entry.fb    = fp_rf2;
+    d_entry.fc    = fp_rf3;
+    d_entry.imm   = imm;
+  end
+
+  // Slot 1 entry (younger), fault flags included like the head.
+  always_comb begin
+    d_entry1 = '0;
+    d_entry1.valid = has_d1;
+    d_entry1.pc    = pc_d1;
+    d_entry1.instr = instr_d1;
+    d_entry1.ctrl  = dc1;
+    d_entry1.ctrl.illegal = dc1.illegal | illegal_c_d1;
+    d_entry1.is_c = is_c_d1;
+    d_entry1.illegal_c = illegal_c_d1;
+    d_entry1.fault_f = fault_d1;
+    d_entry1.fcause = fcause_d1;
+    d_entry1.fva = fva_d1;
+    d_entry1.rs1   = rf1_d1;
+    d_entry1.rs2   = rf2_d1;
+    d_entry1.fa    = fp1_d1;
+    d_entry1.fb    = fp2_d1;
+    d_entry1.fc    = fp3_d1;
+    d_entry1.imm   = imm1;
+  end
+
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-      ex_pkt <= '0;
+      ex_pkt <= '0; ex_pkt_b <= '0;
     end else if (trap) begin
-      ex_pkt <= '0;
-    end else if (!stall) begin
+      ex_pkt <= '0; ex_pkt_b <= '0;
+    end else if (!backend_stall) begin
       // xret is NOT killed here (unlike branches/jumps): it must retire at
       // WB for its CSR effects (MPIE/MPP/SPIE/SPP). It is harmless downstream
       // (no mem op, rd=x0) while pc/F/D already redirected around it.
+      // Lane B is always wrong-path younger work on a redirect/trap, so it
+      // is dropped; xret itself can never pair (excluded from simple-ALU).
       if (flush_redirect & ~(redirect & is_xret)) begin
-        ex_pkt <= '0;
+        ex_pkt <= '0; ex_pkt_b <= '0;
+      end else if (stall) begin
+        // Frontend-only hold (load-use / frm / xret-CSR): the backend
+        // drains below while Decode waits. (stall with a free backend
+        // implies one of those holds: all backend terms are clear.)
+        ex_pkt <= '0; ex_pkt_b <= '0;
+      end else if (issue2) begin // D0+D1 pair
+        ex_pkt <= d_entry; ex_pkt_b <= d_entry1;
+      end else if (valid_d) begin // single from head
+        ex_pkt <= d_entry; ex_pkt_b <= '0;
       end else begin
-        ex_pkt.valid <= valid_d;
-        ex_pkt.pc    <= pc_d;
-        ex_pkt.instr <= instr_d;
-        ex_pkt.ctrl  <= dc;
-        // Fold decompressor-illegal into the control illegal bit so the
-        // EX-stage trap logic catches reserved RVC encodings. The
-        // decompressor already substitutes a NOP payload, so no register
-        // or memory side-effect can occur before the trap flushes.
-        ex_pkt.ctrl.illegal <= dc.illegal | illegal_c_d;
-        ex_pkt.is_c <= is_c_d;
-        ex_pkt.illegal_c <= illegal_c_d;
-        ex_pkt.fault_f <= fault_d;
-        ex_pkt.fcause <= fcause_d;
-        ex_pkt.fva <= fva_d;
-        ex_pkt.rs1   <= rf_rdata1;
-        ex_pkt.rs2   <= rf_rdata2;
-        // FP operands are latched here (with WB->ID bypass already applied)
-        // so the multi-cycle FPU holds stable inputs for its whole run.
-        ex_pkt.fa    <= fp_rf1;
-        ex_pkt.fb    <= fp_rf2;
-        ex_pkt.fc    <= fp_rf3;
-        ex_pkt.imm   <= imm;
+        ex_pkt <= '0; ex_pkt_b <= '0;
       end
     end
   end
@@ -872,16 +1191,30 @@ module rv64gch_core #(
   assign fp_fwd_c = fp_fwd_c_mem ? fp_mem_fwd_data :
                     fp_fwd_c_wb  ? wb_data_w : ex_pkt.fc;
 
+  // Dual-issue younger-side forwarding sources: MEM/WB lane B entries are
+  // younger than their lane A counterparts, so they win on a WAW match.
+  logic mem_b_hit_a, mem_b_hit_b, wb_b_hit_a, wb_b_hit_b;
+  assign mem_b_hit_a = mem_pkt.b_valid & mem_pkt.b_we &
+                       (mem_pkt.b_rd == ex_pkt.ctrl.rs1);
+  assign mem_b_hit_b = mem_pkt.b_valid & mem_pkt.b_we &
+                       (mem_pkt.b_rd == ex_pkt.ctrl.rs2);
+  assign wb_b_hit_a = wb_pkt.b_valid & wb_pkt.b_we &
+                      (wb_pkt.b_rd == ex_pkt.ctrl.rs1);
+  assign wb_b_hit_b = wb_pkt.b_valid & wb_pkt.b_we &
+                      (wb_pkt.b_rd == ex_pkt.ctrl.rs2);
+
   always_comb begin
-    case (fwd_a)
+    if (mem_b_hit_a) rs1_fwd = mem_pkt.b_alu_res;
+    else case (fwd_a)
       2'd1: rs1_fwd = mem_fwd_data;
-      2'd2: rs1_fwd = wb_data_w;
-      default: rs1_fwd = ex_pkt.rs1;
+      2'd2: rs1_fwd = wb_b_hit_a ? wb_pkt.b_data : wb_data_w;
+      default: rs1_fwd = wb_b_hit_a ? wb_pkt.b_data : ex_pkt.rs1;
     endcase
-    case (fwd_b)
+    if (mem_b_hit_b) rs2_fwd = mem_pkt.b_alu_res;
+    else case (fwd_b)
       2'd1: rs2_fwd = mem_fwd_data;
-      2'd2: rs2_fwd = wb_data_w;
-      default: rs2_fwd = ex_pkt.rs2;
+      2'd2: rs2_fwd = wb_b_hit_b ? wb_pkt.b_data : wb_data_w;
+      default: rs2_fwd = wb_b_hit_b ? wb_pkt.b_data : ex_pkt.rs2;
     endcase
   end
 
@@ -912,6 +1245,62 @@ module rv64gch_core #(
 
   alu u_alu (.op(ex_pkt.ctrl.alu_op), .a(alu_a), .b(alu_b), .y(alu_y));
 
+  // Dual-issue lane B: second integer ALU for a paired simple-ALU op.
+  // Operand forwarding is youngest-first: same-cycle lane A result (a pair
+  // implies lane A is simple-ALU, so ex_result is its ALU output) > MEM
+  // lane B > MEM lane A > WB lane B > WB lane A > latched value.
+  logic [63:0] rs1_b_fwd, rs2_b_fwd, alu_a_b, alu_b_b, alu_y_b, ex_result_b;
+  logic        intra_b_a, intra_b_b;
+  logic        memb_b_a, memb_b_b, mema_b_a, mema_b_b;
+  logic        wbb_b_a, wbb_b_b, wba_b_a, wba_b_b;
+  assign intra_b_a = ex_pkt.valid & ex_pkt_b.valid & (rd_x != 5'd0) &
+                     (rd_x == ex_pkt_b.ctrl.rs1);
+  assign intra_b_b = ex_pkt.valid & ex_pkt_b.valid & (rd_x != 5'd0) &
+                     (rd_x == ex_pkt_b.ctrl.rs2);
+  assign memb_b_a = mem_pkt.b_valid & mem_pkt.b_we &
+                    (mem_pkt.b_rd == ex_pkt_b.ctrl.rs1);
+  assign memb_b_b = mem_pkt.b_valid & mem_pkt.b_we &
+                    (mem_pkt.b_rd == ex_pkt_b.ctrl.rs2);
+  assign mema_b_a = reg_we_m & (rd_m != 5'd0) &
+                    (rd_m == ex_pkt_b.ctrl.rs1);
+  assign mema_b_b = reg_we_m & (rd_m != 5'd0) &
+                    (rd_m == ex_pkt_b.ctrl.rs2);
+  assign wbb_b_a = wb_pkt.b_valid & wb_pkt.b_we &
+                   (wb_pkt.b_rd == ex_pkt_b.ctrl.rs1);
+  assign wbb_b_b = wb_pkt.b_valid & wb_pkt.b_we &
+                   (wb_pkt.b_rd == ex_pkt_b.ctrl.rs2);
+  assign wba_b_a = reg_we_w & (rd_w != 5'd0) &
+                   (rd_w == ex_pkt_b.ctrl.rs1);
+  assign wba_b_b = reg_we_w & (rd_w != 5'd0) &
+                   (rd_w == ex_pkt_b.ctrl.rs2);
+  assign rs1_b_fwd = intra_b_a ? ex_result :
+                     memb_b_a ? mem_pkt.b_alu_res :
+                     mema_b_a ? mem_fwd_data :
+                     wbb_b_a ? wb_pkt.b_data :
+                     wba_b_a ? wb_data_w : ex_pkt_b.rs1;
+  assign rs2_b_fwd = intra_b_b ? ex_result :
+                     memb_b_b ? mem_pkt.b_alu_res :
+                     mema_b_b ? mem_fwd_data :
+                     wbb_b_b ? wb_pkt.b_data :
+                     wba_b_b ? wb_data_w : ex_pkt_b.rs2;
+  always_comb begin
+    case (ex_pkt_b.ctrl.a_src)
+      SRC_IMM_I, SRC_IMM_S, SRC_IMM_B, SRC_IMM_U, SRC_IMM_J:
+        alu_a_b = ex_pkt_b.imm;
+      SRC_PC: alu_a_b = ex_pkt_b.pc;
+      default: alu_a_b = rs1_b_fwd;
+    endcase
+    // Lane B holds only LUI/AUIPC/OP-IMM(-32)/OP(-32): R-type (OP/OP32)
+    // takes rs2, everything else (incl. shift-immediates, whose shamt
+    // lives in imm, not rs2) takes imm. Mirrors lane A's override list.
+    if (ex_pkt_b.ctrl.opcode == OP_OP || ex_pkt_b.ctrl.opcode == OP_OP32)
+      alu_b_b = rs2_b_fwd;
+    else
+      alu_b_b = ex_pkt_b.imm;
+  end
+  alu u_alu_b (.op(ex_pkt_b.ctrl.alu_op), .a(alu_a_b), .b(alu_b_b), .y(alu_y_b));
+  assign ex_result_b = alu_y_b;
+
   always_comb begin
     case (ex_pkt.ctrl.funct3)
       3'b000: branch_resolved = (rs1_fwd == rs2_fwd);
@@ -939,6 +1328,10 @@ module rv64gch_core #(
 
   assign mem_is_load_x = ((ex_pkt.ctrl.lsu_op >= LSU_LB) & (ex_pkt.ctrl.lsu_op <= LSU_LWU)) |
                          (ex_pkt.ctrl.lsu_op == LSU_LR) | (ex_pkt.ctrl.lsu_op == LSU_AMO);
+  // EX holds an FP load (FLW/FLD): FP-file load-use handled in hazard_unit.
+  logic ex_fp_load_x;
+  assign ex_fp_load_x = ex_pkt.valid & mem_is_load_x &
+                        (ex_pkt.ctrl.opcode == OP_FPLOAD);
   assign mem_is_store_x = (ex_pkt.ctrl.lsu_op >= LSU_SB) & (ex_pkt.ctrl.lsu_op <= LSU_SD);
 
   logic mdu_in_ex;
@@ -1133,6 +1526,14 @@ module rv64gch_core #(
     mem_pkt_n.be = 8'hFF;
     mem_pkt_n.lock = (ex_pkt.ctrl.lsu_op == LSU_LR) | (ex_pkt.ctrl.lsu_op == LSU_SC) |
                      (ex_pkt.ctrl.lsu_op == LSU_AMO);
+    // Dual-issue lane B rides through (ALU-only, never traps). A redirect or
+    // trap means lane B is wrong-path younger work: squash it while lane A
+    // (e.g. a jal link) still flows to MEM.
+    mem_pkt_n.b_valid   = ex_pkt_b.valid & ~flush_redirect;
+    mem_pkt_n.b_rd      = ex_pkt_b.ctrl.rd;
+    mem_pkt_n.b_we      = ex_pkt_b.valid & (ex_pkt_b.ctrl.rd != 5'd0);
+    mem_pkt_n.b_alu_res = ex_result_b;
+    mem_pkt_n.b_pc      = ex_pkt_b.pc;
     case (ex_pkt.ctrl.lsu_op)
       LSU_LB, LSU_LBU: mem_pkt_n.be = 8'h01 << mem_pkt_n.mem_addr[2:0];
       LSU_LH, LSU_LHU: mem_pkt_n.be = 8'h03 << mem_pkt_n.mem_addr[2:0];
@@ -1175,7 +1576,7 @@ module rv64gch_core #(
       axi_pending <= 1'b0;
       lr_valid_q  <= 1'b0;
       amo_wr_q    <= 1'b0;
-    end else if (!stall) begin
+    end else if (!backend_stall) begin
       if (ex_pkt.valid)
         mem_pkt <= mem_pkt_n;
       else
@@ -1335,11 +1736,17 @@ module rv64gch_core #(
     // (ASID) rides a dedicated field, so retire has both operands.
     wb_pkt_n.rs2v = mem_pkt.rs2;
     if (mem_pkt.ctrl.reads_csr) wb_pkt_n.data = csr_rdata;
+    // Dual-issue lane B retire slot (integer ALU result only).
+    wb_pkt_n.b_valid = mem_pkt.b_valid;
+    wb_pkt_n.b_rd    = mem_pkt.b_rd;
+    wb_pkt_n.b_we    = mem_pkt.b_we;
+    wb_pkt_n.b_data  = mem_pkt.b_alu_res;
+    wb_pkt_n.b_pc    = mem_pkt.b_pc;
   end
 
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) wb_pkt <= '0;
-    else if (!stall) wb_pkt <= wb_pkt_n;
+    else if (!backend_stall) wb_pkt <= wb_pkt_n;
   end
 
   // Commit tracer for lock-step co-simulation with Unicorn (Phase A:
@@ -1352,10 +1759,15 @@ module rv64gch_core #(
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
     end else begin
-      if (!stall && wb_pkt_n.valid)
+      if (!backend_stall && wb_pkt_n.valid)
         $fwrite(cosim_f, "C %h %0d %h %b %b %0d %h %0d\n",
                 wb_pkt_n.pc, wb_pkt_n.rd, wb_pkt_n.data, wb_pkt_n.we,
                 wb_pkt_n.fp_we, wb_pkt_n.rd, wb_pkt_n.data, priv);
+      // Dual-issue lane B commits in the same cycle, younger (logged second).
+      if (!backend_stall && wb_pkt_n.b_valid)
+        $fwrite(cosim_f, "C %h %0d %h %b %b %0d %h %0d\n",
+                wb_pkt_n.b_pc, wb_pkt_n.b_rd, wb_pkt_n.b_data,
+                wb_pkt_n.b_we, 1'b0, wb_pkt_n.b_rd, wb_pkt_n.b_data, priv);
       if (trap)
         $fwrite(cosim_f, "T %h %0d\n", ex_pkt.pc, cause);
       // Completed memory writes only (mem_we excludes AMO read phases
@@ -1390,6 +1802,13 @@ module rv64gch_core #(
   assign reg_we_w = wb_pkt.we;
   assign fp_we_w = wb_pkt.fp_we;
   assign wb_data_w = wb_pkt.data;
+  // Dual-issue lane B writeback (second integer write port; lane B younger).
+  logic [4:0]  rd_w_b;
+  logic        reg_we_w_b;
+  logic [63:0] wb_data_w_b;
+  assign rd_w_b = wb_pkt.b_rd;
+  assign reg_we_w_b = wb_pkt.b_valid & wb_pkt.b_we;
+  assign wb_data_w_b = wb_pkt.b_data;
 
   logic [4:0] fcsr_fflags_we;
   logic [4:0] fcsr_fflags;
