@@ -11,7 +11,7 @@ MABI="lp64d"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-DEFAULT_TESTS="dyn_rm l1i_conflict l1d_wb l2_wb sv39_basic sv39_fault sv39_sfence deleg_basic asid_test sv48_basic priv_ecall priv_csr"
+DEFAULT_TESTS="dyn_rm l1i_conflict l1d_wb l2_wb sv39_basic sv39_fault sv39_sfence deleg_basic asid_test sv48_basic priv_ecall priv_csr bpred_ras"
 TESTS="${*:-$DEFAULT_TESTS}"
 
 pass=0; fail=0; failed_list=""

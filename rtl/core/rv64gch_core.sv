@@ -108,7 +108,8 @@ module rv64gch_core #(
     logic [63:0] fb;
     logic [63:0] fc;
     logic [63:0] imm;
-    logic        pred_taken; // D predicted taken (static BTFN); EX verifies
+    logic        pred_taken; // D predicted taken (fetch redirected); EX verifies
+    logic [63:0] pred_target; // D's predicted target (jalr: RAS/BTB; else pc+imm)
   } ex_pkt_t;
   ex_pkt_t ex_pkt, ex_pkt_n;
 
@@ -315,24 +316,97 @@ module rv64gch_core #(
   // otherwise deadlock the core, while a stale result from a flushed pc is
   // ignored. For a 32-bit instruction at byte offset 6 the window straddles
   // two 64-bit words, so fetch_res_valid waits for the second word.
-  // Static branch prediction (stage a: backward-taken / forward-not-taken).
-  // Predicted in Decode from the B-type sign bit; verified in EX via
-  // ex_pkt.pred_taken (redirect iff taken XOR predicted). A taken
-  // prediction redirects fetch immediately and squashes only younger
-  // Decode state; the predicting instruction itself still issues to EX to
-  // verify (it can never pair, so it always issues single).
+  // Static branch prediction (stage a: backward-taken / forward-not-taken)
+  // plus stage b: 64-entry direct-mapped BTB with 2-bit counters, an
+  // 8-deep return-address stack, and early-JAL redirect -- all predicted
+  // in Decode, verified in EX. BTB/RAS are pure predictions (never
+  // flushed by fences/traps; a stale entry just mispredicts once and the
+  // EX update corrects it). RAS updates at EX-resolve (in-order), so no
+  // speculative repair is ever needed.
+  localparam int BTB_ENTRIES = 64;
+  logic            btb_v [BTB_ENTRIES];
+  logic [40:0]     btb_tag [BTB_ENTRIES];
+  logic [63:0]     btb_tgt [BTB_ENTRIES];
+  logic [1:0]      btb_ctr [BTB_ENTRIES];
+  logic [63:0]     ras [8];
+  logic [3:0]      ras_count; // 0..8 valid entries
+  logic [2:0]      ras_ptr;   // next push slot; top is (ptr-1)&7
+  logic [63:0]     ras_top;
+  assign ras_top = ras[(ras_ptr - 3'd1) & 3'd7];
+  // D0/D1 classification.
+  logic d0_branch, d0_jal, d0_jalr, d1_branch, d1_jal, d1_jalr;
+  logic [4:0] d0_rs1, d0_rd, d1_rs1, d1_rd;
+  assign d0_branch = valid_d & dc.is_branch;
+  assign d0_jal    = valid_d & dc.is_jal;
+  assign d0_jalr   = valid_d & dc.is_jalr;
+  assign d0_rs1 = dc.rs1; assign d0_rd = dc.rd;
+  assign d1_branch = has_d1 & dc1.is_branch;
+  assign d1_jal    = has_d1 & dc1.is_jal;
+  assign d1_jalr   = has_d1 & dc1.is_jalr;
+  assign d1_rs1 = dc1.rs1; assign d1_rd = dc1.rd;
+  // Link-register call/ret classification (RISC-V convention: x1/x5).
+  function automatic logic is_link(input logic [4:0] r);
+    return (r == 5'd1) | (r == 5'd5);
+  endfunction
+  // BTB lookup (index pc[6:1] covers 2B parcels; tag is VA[47:7]).
+  logic [5:0] btb_idx0, btb_idx1;
+  logic [40:0] btb_tag0, btb_tag1;
+  logic btb_hit0, btb_hit1;
+  assign btb_idx0 = pc_d[6:1];   assign btb_tag0 = pc_d[47:7];
+  assign btb_idx1 = pc_d1[6:1];  assign btb_tag1 = pc_d1[47:7];
+  assign btb_hit0 = valid_d & btb_v[btb_idx0] & (btb_tag[btb_idx0] == btb_tag0);
+  assign btb_hit1 = has_d1 & btb_v[btb_idx1] & (btb_tag[btb_idx1] == btb_tag1);
+  // Slot prediction: RAS ret > BTB (counter for branches, target for
+  // jumps) > JAL-always-taken > static BTFN. Younger slot ignored when the
+  // older predicts taken (squashed).
+  logic d0_pred_t, d1_pred_t;
+  logic [63:0] d0_pred_tgt, d1_pred_tgt;
+  always_comb begin
+    d0_pred_t = 1'b0; d0_pred_tgt = '0;
+    if (d0_jalr & is_link(d0_rs1) & ~is_link(d0_rd) & (ras_count != 4'd0)) begin
+      d0_pred_t = 1'b1; d0_pred_tgt = ras_top; // return
+    end else if ((d0_branch | d0_jalr) & btb_hit0) begin
+      if (d0_branch & ~btb_ctr[btb_idx0][1]) begin
+        d0_pred_t = 1'b0; // counter says not-taken
+      end else begin
+        d0_pred_t = 1'b1; d0_pred_tgt = btb_tgt[btb_idx0];
+      end
+    end else if (d0_jal) begin
+      d0_pred_t = 1'b1; d0_pred_tgt = pc_d + imm; // unconditional, exact
+    end else if (d0_branch & dc.imm[63] & ~dc.illegal & ~illegal_c_d & ~fault_d) begin
+      d0_pred_t = 1'b1; d0_pred_tgt = pc_d + imm; // static BTFN
+    end
+  end
+  always_comb begin
+    d1_pred_t = 1'b0; d1_pred_tgt = '0;
+    if (!d0_pred_t) begin
+      if (d1_jalr & is_link(d1_rs1) & ~is_link(d1_rd) & (ras_count != 4'd0)) begin
+        d1_pred_t = 1'b1; d1_pred_tgt = ras_top;
+      end else if ((d1_branch | d1_jalr) & btb_hit1) begin
+        if (d1_branch & ~btb_ctr[btb_idx1][1]) begin
+          d1_pred_t = 1'b0;
+        end else begin
+          d1_pred_t = 1'b1; d1_pred_tgt = btb_tgt[btb_idx1];
+        end
+      end else if (d1_jal) begin
+        d1_pred_t = 1'b1; d1_pred_tgt = pc_d1 + imm1;
+      end else if (d1_branch & dc1.imm[63] & ~dc1.illegal & ~illegal_c_d1 & ~fault_d1) begin
+        d1_pred_t = 1'b1; d1_pred_tgt = pc_d1 + imm1;
+      end
+    end
+  end
   logic pred0, pred1, pred_any, pred_fire;
   logic [63:0] pred_target;
-  assign pred0 = valid_d & dc.is_branch & dc.imm[63] &
-                 ~dc.illegal & ~illegal_c_d & ~fault_d & ~fault_f_q;
-  assign pred1 = has_d1 & dc1.is_branch & dc1.imm[63] &
-                 ~dc1.illegal & ~illegal_c_d1 & ~fault_d1 & ~fault_f_q & ~pred0;
+  assign pred0 = d0_pred_t;
+  assign pred1 = d1_pred_t & ~d0_pred_t;
   assign pred_any = pred0 | pred1;
-  assign pred_target = pred0 ? (pc_d + imm) : (pc_d1 + imm1);
-  // Fire only when the frontend can act (no stall/fence; real redirects or
-  // traps override by priority in each consumer). Firing implies D0 issues
-  // this cycle, so the D shift/refill stays consistent.
-  assign pred_fire = pred_any & ~stall & ~vm_fence_active;
+  assign pred_target = pred0 ? d0_pred_tgt : d1_pred_tgt;
+  // Fire only when the frontend can act (no stall/fence/pending fault;
+  // real redirects or traps override by priority in each consumer).
+  // Firing implies D0 issues this cycle, so the D shift/refill stays
+  // consistent. EX latches pred_fire (not raw pred0) so verify matches
+  // what fetch actually did.
+  assign pred_fire = pred_any & ~stall & ~vm_fence_active & ~fault_f_q;
   assign fetch_done    = fetch_res_valid & ~stall & ~vm_fence_active & ~pred_fire;
   // Fetch virtual address: the straddling second word is translated
   // independently (it can sit on another page).
@@ -1159,8 +1233,10 @@ module rv64gch_core #(
     d_entry.fb    = fp_rf2;
     d_entry.fc    = fp_rf3;
     d_entry.imm   = imm;
-    // Latch this head's prediction (lane B never holds a branch).
-    d_entry.pred_taken = pred0;
+    // Latch this head's prediction outcome (lane B never holds a branch/
+    // jump). pred_fire (not raw pred0): verify must match what fetch did.
+    d_entry.pred_taken = pred0 & pred_fire;
+    d_entry.pred_target = pred_target;
   end
 
   // Slot 1 entry (younger), fault flags included like the head.
@@ -1391,16 +1467,88 @@ module rv64gch_core #(
   // worked when the target happened to be adjacent).
   logic is_xret;
   assign is_xret = ex_pkt.ctrl.is_mret | ex_pkt.ctrl.is_sret;
-  // A predicted branch redirects only on mispredict (taken XOR predicted).
-  // Mispredicted-taken-not-taken resumes at the fall-through pc.
+  // Control-transfer verify against the Decode prediction: branches
+  // redirect on mispredict (taken XOR predicted); jumps redirect unless
+  // already at the predicted target (JAL early-redirect makes EX a no-op;
+  // JALR compares the resolved register target). Mispredicted-taken-
+  // not-taken resumes at the fall-through pc.
   logic [63:0] branch_fallthrough;
+  logic [63:0] cf_actual_target;
   assign branch_fallthrough = ex_pkt.pc + (ex_pkt.is_c ? 64'd2 : 64'd4);
-  assign redirect = ex_pkt.valid & ((ex_pkt.ctrl.is_branch & (branch_resolved ^ ex_pkt.pred_taken)) |
-                                    ex_pkt.ctrl.is_jal | ex_pkt.ctrl.is_jalr |
-                                    is_xret);
+  assign cf_actual_target = branch_target; // pc+imm, or alu sum for jal/jalr
+  assign redirect = ex_pkt.valid &
+                    ((ex_pkt.ctrl.is_branch & (branch_resolved ^ ex_pkt.pred_taken)) |
+                     (ex_pkt.ctrl.is_jal & ((cf_actual_target != ex_pkt.pred_target) |
+                                            ~ex_pkt.pred_taken)) |
+                     (ex_pkt.ctrl.is_jalr & ((cf_actual_target != ex_pkt.pred_target) |
+                                             ~ex_pkt.pred_taken)) |
+                     is_xret);
   assign redirect_target = is_xret ? epc :
-                           ((ex_pkt.ctrl.is_branch & ~branch_resolved & ex_pkt.pred_taken) ?
-                            branch_fallthrough : branch_target);
+                           ((ex_pkt.ctrl.is_branch & ~branch_resolved) ?
+                            branch_fallthrough : cf_actual_target);
+
+  // BTB/RAS update at EX-resolve (in-order advance, skipped on traps).
+  // Outcomes are final here, so no speculative repair is needed. Branches
+  // allocate on taken (weakly-taken) and adapt both ways; JALR records its
+  // resolved register target (always taken); JAL needs no entry (decode
+  // computes its exact target). RAS pushes calls and pops returns.
+  logic ex_advance;
+  logic [5:0] btb_upd_idx;
+  logic ex_is_call, ex_is_ret;
+  assign btb_upd_idx = ex_pkt.pc[6:1];
+  assign ex_advance = ex_pkt.valid & ~backend_stall & ~trap;
+  function automatic logic [1:0] sat_inc(input logic [1:0] c);
+    return (c == 2'b11) ? c : c + 2'd1;
+  endfunction
+  function automatic logic [1:0] sat_dec(input logic [1:0] c);
+    return (c == 2'b00) ? c : c - 2'd1;
+  endfunction
+  assign ex_is_call = (ex_pkt.ctrl.is_jal | ex_pkt.ctrl.is_jalr) &
+                      is_link(ex_pkt.ctrl.rd);
+  assign ex_is_ret = ex_pkt.ctrl.is_jalr & is_link(ex_pkt.ctrl.rs1) &
+                     ~is_link(ex_pkt.ctrl.rd);
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      for (int i = 0; i < BTB_ENTRIES; i++) begin
+        btb_v[i] <= 1'b0;
+        btb_tag[i] <= '0;
+        btb_tgt[i] <= '0;
+        btb_ctr[i] <= 2'b01;
+      end
+      ras_ptr <= 3'd0;
+      ras_count <= 4'd0;
+      for (int j = 0; j < 8; j++) ras[j] <= '0;
+    end else if (ex_advance) begin
+      if (ex_pkt.ctrl.is_branch) begin
+        if (branch_resolved) begin
+          btb_v[btb_upd_idx] <= 1'b1;
+          btb_tag[btb_upd_idx] <= ex_pkt.pc[47:7];
+          btb_tgt[btb_upd_idx] <= ex_pkt.pc + ex_pkt.imm;
+          btb_ctr[btb_upd_idx] <= (btb_v[btb_upd_idx] &&
+                                   (btb_tag[btb_upd_idx] == ex_pkt.pc[47:7])) ?
+                                  sat_inc(btb_ctr[btb_upd_idx]) : 2'b10;
+        end else if (btb_v[btb_upd_idx] &&
+                     (btb_tag[btb_upd_idx] == ex_pkt.pc[47:7])) begin
+          btb_ctr[btb_upd_idx] <= sat_dec(btb_ctr[btb_upd_idx]);
+        end
+      end else if (ex_pkt.ctrl.is_jalr) begin
+        btb_v[btb_upd_idx] <= 1'b1;
+        btb_tag[btb_upd_idx] <= ex_pkt.pc[47:7];
+        btb_tgt[btb_upd_idx] <= branch_target;
+        btb_ctr[btb_upd_idx] <= 2'b11;
+      end
+      if (ex_is_call) begin
+        ras[ras_ptr] <= ex_pkt.pc + (ex_pkt.is_c ? 64'd2 : 64'd4);
+        ras_ptr <= (ras_ptr + 3'd1) & 3'd7;
+        if (ras_count != 4'd8) ras_count <= ras_count + 4'd1;
+      end else if (ex_is_ret) begin
+        if (ras_count != 4'd0) begin
+          ras_ptr <= (ras_ptr - 3'd1) & 3'd7;
+          ras_count <= ras_count - 4'd1;
+        end
+      end
+    end
+  end
 
   assign mem_is_load_x = ((ex_pkt.ctrl.lsu_op >= LSU_LB) & (ex_pkt.ctrl.lsu_op <= LSU_LWU)) |
                          (ex_pkt.ctrl.lsu_op == LSU_LR) | (ex_pkt.ctrl.lsu_op == LSU_AMO);

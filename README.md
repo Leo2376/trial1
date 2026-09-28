@@ -29,7 +29,7 @@ synthesis), not FPGA.
 | ASID tags + selective SFENCE.VMA | **DONE** | asid_test PASS |
 | MMU Sv48 (4-level walk, 512G/1G/2M/4K) | **DONE** | sv48_basic PASS |
 | Dual-issue frontend (8B fetch, dual decode/issue/retire, ALU+ALU) | **DONE (Phase 1)** | all ISA suites + directed PASS (see regression line) |
-| Branch prediction (static BTFN) | **DONE (stage a)** | all ISA suites PASS; loops ~25% faster |
+| Branch prediction (static BTFN + BTB/2-bit/RAS/JAL-early) | **DONE (stages a+b)** | all ISA suites PASS; loops ~25% faster |
 | RVV 1.0 vector engine | Not started | — |
 | IME 1.0 matrix extension | Not started | — |
 
@@ -42,6 +42,7 @@ hi-promote, straddle-safe); D0/D1 pair when both are simple-ALU
 second integer ALU lane with intra-pair bypass; dual retire via a
 2-write-port int regfile (younger lane-B wins). Backward branches predict
 taken in Decode (static BTFN, verified in EX, redirect only on mispredict).
+Jumps predict via BTB/RAS/JAL-early, verified against the resolved target.
 
 ## Next Steps (Roadmap)
 
@@ -116,14 +117,18 @@ taken in Decode (static BTFN, verified in EX, redirect only on mispredict).
    narrowed to EX/MEM, FP-file load-use stall for FLW/FLD consumers,
    xret drain-hold for back-to-back `csrw mepc/sepc → xret`.
    Remaining: MDU/FPU second-lane pairing, then branch prediction (8).
-8. **Branch prediction** — **DONE (stage a: static BTFN)**. Backward
-   branches predict taken in Decode (immediate fetch redirect, younger
-   Decode squashed, predictor still issues to EX to verify); EX redirects
-   only on mispredict (taken XOR predicted, fall-through resume on
-   taken-predicted-not-taken). Correctly predicted loops cost zero bubbles
-   (1000x loop: 16086→12069 cycles, -25%). Remaining stage (b): tiny BTB
-   + 2-bit saturating counters + small RAS for `jalr`/`ret`. No large
-   global-history / tournament predictor.
+8. **Branch prediction** — **DONE (stages a+b)**. (a) Static BTFN in
+   Decode, verified in EX (redirect only on mispredict). (b) 64-entry
+   direct-mapped BTB (tag VA[47:7], per-entry 2-bit counter; branches
+   allocate on taken, JALR records its register target, JAL needs no
+   entry), 8-deep RAS updated at EX-resolve (no speculative repair:
+   wrong-path calls never resolve), early-JAL redirect (exact pc+imm in
+   Decode). EX verifies taken-vs-predicted with stored pred target
+   (fall-through resume on taken-predicted-not-taken). BTB/RAS are pure
+   predictions (no fence/TLB invalidation; stale entries self-correct).
+   `software/tests/bpred_ras.S` covers nested RAS calls, a polymorphic
+   indirect jump, and a backward loop. Remaining: none planned (no large
+   global-history / tournament predictor).
 9. **RVV 1.0 (VLEN=256) + IME 1.0** — no separate VPU memory interface:
    vector/matrix traffic arbitrates onto the same AXI4 bus/fabric as the
    CPU (alongside LSU/fetch in `rv64gch_top`) and shares the L2/LLC chain.
@@ -201,7 +206,7 @@ cd sim/verilator && make decomp   # 44/44 PASS
 ./sim/verilator/obj_dir/Vtb_rv64gch_core +hex=/tmp/sv48_basic.hex      # TEST PASSED
 ```
 
-Last full regression (dual-issue Phase 1 + BTFN + FPU NaN-boxing fixes in path): rv64ui 50/50, rv64um 13/13, rv64uf 11/11, rv64uc 1/1 (rvc), rv64ua 19/19, rv64ud 12/12, tb_fpu 80/80, tb_decompressor 44/44, dyn_rm PASS, l1i_conflict PASS, l1d_wb PASS, l2_wb PASS, sv39_basic/fault/sfence PASS, deleg_basic PASS, asid_test PASS, sv48_basic PASS, priv_ecall PASS, priv_csr PASS.
+Last full regression (dual-issue Phase 1 + BTFN/BTB/RAS + FPU NaN-boxing fixes in path): rv64ui 50/50, rv64um 13/13, rv64uf 11/11, rv64uc 1/1 (rvc), rv64ua 19/19, rv64ud 12/12, tb_fpu 80/80, tb_decompressor 44/44, dyn_rm PASS, l1i_conflict PASS, l1d_wb PASS, l2_wb PASS, sv39_basic/fault/sfence PASS, deleg_basic PASS, asid_test PASS, sv48_basic PASS, priv_ecall PASS, priv_csr PASS, bpred_ras PASS.
 
 ## RTL Directory Structure & Module Relationships
 
