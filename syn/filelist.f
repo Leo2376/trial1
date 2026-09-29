@@ -17,4 +17,5 @@
 ../rtl/core/ctrl/forwarding_unit.sv
 ../rtl/core/ctrl/hazard_unit.sv
 ../rtl/core/issue/issue_unit.sv
+../rtl/core/lsu/lsu.sv
 ../rtl/core/rv64gch_core.sv

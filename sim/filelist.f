@@ -11,6 +11,7 @@
 ../../rtl/core/ctrl/forwarding_unit.sv
 ../../rtl/core/ctrl/hazard_unit.sv
 ../../rtl/core/issue/issue_unit.sv
+../../rtl/core/lsu/lsu.sv
 ../../rtl/soc/fabric/axi4_master.sv
 ../../rtl/cache/l1i/l1i.sv
 ../../rtl/cache/l1d/l1d.sv

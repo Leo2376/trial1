@@ -1400,9 +1400,19 @@ module rv64gch_core #(
   logic        intra_b_a, intra_b_b;
   logic        memb_b_a, memb_b_b, mema_b_a, mema_b_b;
   logic        wbb_b_a, wbb_b_b, wba_b_a, wba_b_b;
-  assign intra_b_a = ex_pkt.valid & ex_pkt_b.valid & (rd_x != 5'd0) &
+  // Intra-pair forward carries lane A's same-cycle EX result: valid only
+  // when lane A writes the integer file. An FP-to-FP lane A shares only
+  // the register NUMBER with lane B's integer source -- forwarding it
+  // would corrupt lane B (its operands come from MEM/WB/regfile instead;
+  // the result is sampled post-done at the coupled advance edge).
+  logic        laneA_writes_int;
+  assign laneA_writes_int = ex_pkt.valid &
+      (is_simple_alu_op(ex_pkt.ctrl) | is_mdu_op(ex_pkt.ctrl.alu_op) |
+       ((ex_pkt.ctrl.fpu_op != FPU_NONE) &
+        (ex_pkt.ctrl.wb_sel == WB_INT)));
+  assign intra_b_a = ex_pkt.valid & ex_pkt_b.valid & laneA_writes_int & (rd_x != 5'd0) &
                      (rd_x == ex_pkt_b.ctrl.rs1);
-  assign intra_b_b = ex_pkt.valid & ex_pkt_b.valid & (rd_x != 5'd0) &
+  assign intra_b_b = ex_pkt.valid & ex_pkt_b.valid & laneA_writes_int & (rd_x != 5'd0) &
                      (rd_x == ex_pkt_b.ctrl.rs2);
   assign memb_b_a = mem_pkt.b_valid & mem_pkt.b_we &
                     (mem_pkt.b_rd == ex_pkt_b.ctrl.rs1);
@@ -1616,46 +1626,12 @@ module rv64gch_core #(
       ex_result = ex_pkt.pc + (ex_pkt.is_c ? 64'd2 : 64'd4);
   end
 
-  // LR/SC reservation (single hart): set by LR, checked+cleared by SC,
-  // cleared on trap. Compared on full byte address.
-  logic        lr_valid_q;
-  logic [47:0] lr_addr_q;
-
-  // AMO ALU: old = aligned memory value, op2 = rs2. W operates on low 32b.
-  function automatic logic [63:0] amo_compute(logic [63:0] old, logic [63:0] op2,
-                                             amo_op_e op, logic is_d);
-    logic [31:0] o32, p32, r32;
-    logic [63:0] r64;
-    if (!is_d) begin
-      o32 = old[31:0]; p32 = op2[31:0];
-      unique case (op)
-        AMO_ADD:  r32 = o32 + p32;
-        AMO_SWAP: r32 = p32;
-        AMO_XOR:  r32 = o32 ^ p32;
-        AMO_AND:  r32 = o32 & p32;
-        AMO_OR:   r32 = o32 | p32;
-        AMO_MIN:  r32 = ($signed(o32) < $signed(p32)) ? o32 : p32;
-        AMO_MAX:  r32 = ($signed(o32) >= $signed(p32)) ? o32 : p32;
-        AMO_MINU: r32 = (o32 < p32) ? o32 : p32;
-        AMO_MAXU: r32 = (o32 >= p32) ? o32 : p32;
-        default:  r32 = o32;
-      endcase
-      return {{32{r32[31]}}, r32};
-    end
-    unique case (op)
-      AMO_ADD:  r64 = old + op2;
-      AMO_SWAP: r64 = op2;
-      AMO_XOR:  r64 = old ^ op2;
-      AMO_AND:  r64 = old & op2;
-      AMO_OR:   r64 = old | op2;
-      AMO_MIN:  r64 = ($signed(old) < $signed(op2)) ? old : op2;
-      AMO_MAX:  r64 = ($signed(old) >= $signed(op2)) ? old : op2;
-      AMO_MINU: r64 = (old < op2) ? old : op2;
-      AMO_MAXU: r64 = (old >= op2) ? old : op2;
-      default:  r64 = old;
-    endcase
-    return r64;
-  endfunction
+  // LR/SC + AMO + AXI transaction engine lives in rtl/core/lsu/lsu.sv;
+  // the EX->MEM packet, WB mux, and forwarding stay here.
+  logic        lsu_lr_valid;
+  logic [47:0] lsu_lr_addr;
+  logic        lsu_pending;
+  logic        lsu_mem_we;
 
   // Data-address translation (PIPT: the L1D sees physical only). The VA
   // is full-width; the PA feeds mem_pkt. A TLB miss stalls the pipe for
@@ -1715,7 +1691,7 @@ module rv64gch_core #(
   logic        ex_sc_success;
   // Reservation compare in PA space (identical to VA in Bare mode).
   assign ex_sc_success = (ex_pkt.ctrl.lsu_op == LSU_SC) &
-                         lr_valid_q & (lr_addr_q == mmu_pa_d);
+                         lsu_lr_valid & (lsu_lr_addr == mmu_pa_d);
   logic        ex_is_amo;
   assign ex_is_amo = (ex_pkt.ctrl.lsu_op == LSU_AMO);
   logic        ex_amo_is_d;
@@ -1774,84 +1750,57 @@ module rv64gch_core #(
     endcase
   end
 
-  // axi_pending marks the in-flight transaction of the current mem_pkt so
-  // that only its own completion (mem_ack) is interpreted as this load's/
-  // store's response. axi_issued suppresses a re-issue of the same
-  // transaction: once the AXI master has accepted a load/store request it
-  // stays asserted until the load/store leaves the MEM stage (the pipeline
-  // advances mem_pkt), so a completed transaction cannot be re-driven. lsu_busy
-  // is raised when a load/store/atomic enters MEM and drops when its final
-  // transaction's own ack returns, unstalling the pipeline so it drains to WB.
-  // AMO is two transactions (read old, write new): amo_wr_q tracks the phase.
-  logic amo_wr_q;
+  // EX->MEM packet advance; the LSU engine (u_lsu below) consumes
+  // mem_pkt and drives the data bus + busy/load-data outputs.
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       mem_pkt     <= '0;
-      lsu_busy    <= 1'b0;
-      axi_issued  <= 1'b0;
-      axi_pending <= 1'b0;
-      lr_valid_q  <= 1'b0;
-      lr_addr_q   <= '0;
-      amo_wr_q    <= 1'b0;
     end else if (trap) begin
       mem_pkt     <= '0;
-      lsu_busy    <= 1'b0;
-      axi_issued  <= 1'b0;
-      axi_pending <= 1'b0;
-      lr_valid_q  <= 1'b0;
-      amo_wr_q    <= 1'b0;
     end else if (!backend_stall) begin
       if (ex_pkt.valid)
         mem_pkt <= mem_pkt_n;
       else
         mem_pkt <= '0;
-      if (mem_pkt_n.valid & (mem_pkt_n.is_store | mem_pkt_n.is_load)) begin
-        lsu_busy    <= 1'b1;
-        axi_issued  <= 1'b0;
-        axi_pending <= 1'b0;
-        amo_wr_q    <= 1'b0;
-      end else begin
-        lsu_busy    <= 1'b0;
-        axi_issued  <= 1'b0;
-        axi_pending <= 1'b0;
-        amo_wr_q    <= 1'b0;
-        // SC (fail or success) consumes the reservation as it drains.
-        if (mem_pkt_n.valid & (mem_pkt_n.ctrl.lsu_op == LSU_SC))
-          lr_valid_q <= 1'b0;
-      end
-    end else begin
-      // Pipeline stalled (lsu_busy holds it). Issue the AXI request once and
-      // keep it issued until the load/store leaves MEM; clear lsu_busy only on
-      // the final transaction's own completion so the pipeline can then drain.
-      if (mem_req & mem_ready) begin
-        axi_issued  <= 1'b1;
-        axi_pending <= 1'b1;
-      end
-      if (axi_pending & mem_ack) begin
-        // LR sets the reservation when its read returns.
-        if (mem_pkt.valid & (mem_pkt.ctrl.lsu_op == LSU_LR)) begin
-          lr_valid_q  <= 1'b1;
-          lr_addr_q   <= mem_pkt.mem_addr;
-          lsu_busy    <= 1'b0;
-          axi_pending <= 1'b0;
-        // AMO read phase: advance to write phase, re-arm issue, stay busy.
-        end else if (mem_pkt.valid & (mem_pkt.ctrl.lsu_op == LSU_AMO) & ~amo_wr_q) begin
-          amo_wr_q    <= 1'b1;
-          axi_issued  <= 1'b0;
-          axi_pending <= 1'b0;
-        end else begin
-          lsu_busy    <= 1'b0;
-          axi_pending <= 1'b0;
-        end
-      end
-      // SC (success or fail) consumes the reservation once it leaves MEM;
-      // the drain happens via fetch_done path clearing busy above, but flag
-      // the clear here too for the success path that just acked.
-      if (axi_pending & mem_ack & mem_pkt.valid &
-          (mem_pkt.ctrl.lsu_op == LSU_SC))
-        lr_valid_q <= 1'b0;
     end
   end
+
+  lsu u_lsu (
+    .clk(clk), .rst_n(rst_n),
+    .stall_i(backend_stall), .trap_i(trap),
+    .req_valid_i(mem_pkt.valid),
+    .req_is_load_i(mem_pkt.is_load),
+    .req_is_store_i(mem_pkt.is_store),
+    .req_addr_i(mem_pkt.mem_addr),
+    .req_be_i(mem_pkt.be),
+    .req_wdata_i(mem_pkt.store_data),
+    .req_lsu_op_i(mem_pkt.ctrl.lsu_op),
+    .req_funct3_i(mem_pkt.ctrl.funct3),
+    .req_amo_op_i(mem_pkt.ctrl.amo_op),
+    .req_rs2_i(mem_pkt.rs2),
+    .req_lock_i(mem_pkt.lock),
+    .nxt_valid_i(mem_pkt_n.valid),
+    .nxt_is_load_i(mem_pkt_n.is_load),
+    .nxt_is_store_i(mem_pkt_n.is_store),
+    .nxt_is_sc_i(mem_pkt_n.valid &
+                 (mem_pkt_n.ctrl.lsu_op == LSU_SC)),
+    .fence_hold_i(vm_fence_active),
+    .d_rdata_i(mem_rdata),
+    .d_ack_i(mem_ack),
+    .d_ready_i(mem_ready),
+    .mem_req_o(mem_req),
+    .mem_we_o(lsu_mem_we),
+    .mem_addr_o(mem_addr),
+    .mem_be_o(mem_be),
+    .mem_wdata_o(mem_wdata),
+    .mem_lock_o(mem_lock),
+    .busy_o(lsu_busy),
+    .load_data_o(mem_rdata_aligned),
+    .lr_valid_o(lsu_lr_valid),
+    .lr_addr_o(lsu_lr_addr),
+    .pending_o(lsu_pending)
+  );
+  assign mem_we = lsu_mem_we;
 
   assign rd_m = mem_pkt.ctrl.rd;
   assign reg_we_m = mem_pkt.valid &
@@ -1861,75 +1810,6 @@ module rv64gch_core #(
   // must not be suppressed for rd==0.
   assign fp_we_m = mem_pkt.valid & (mem_pkt.ctrl.wb_sel == WB_FP);
   assign mem_alu_y = mem_pkt.alu_res;
-
-  // mem_req is asserted only until the AXI master accepts the load/store
-  // request (axi_issued). Staying asserted past acceptance would let the
-  // shared master re-issue the same transaction after it completes (e.g. a
-  // duplicate store write whose B response later arrives as a stale ack and
-  // corrupts a following load's lsu_busy). axi_issued clears when the
-  // transaction's ack returns, readying for the next load/store.
-  // AMO is read-then-write: we=0 in the read phase (amo_wr_q==0), we=1 with
-  // the computed new value in the write phase.
-  logic axi_issued;
-  logic mem_is_amo_w;
-  assign mem_is_amo_w = mem_pkt.valid & (mem_pkt.ctrl.lsu_op == LSU_AMO) & amo_wr_q;
-  logic [63:0] amo_old_aligned;
-  assign amo_old_aligned = align_load(load_data_q, 3'b0, (mem_pkt.ctrl.funct3 == 3'b011) ? LSU_LD : LSU_LW);
-  logic [63:0] amo_new;
-  assign amo_new = amo_compute(amo_old_aligned, mem_pkt.rs2, mem_pkt.ctrl.amo_op,
-                               (mem_pkt.ctrl.funct3 == 3'b011));
-  // No new data issue inside the fence window (a younger MEM op waits;
-  // lsu_busy already stalls the pipe, and the drain needs no competition).
-  assign mem_req   = mem_pkt.valid & (mem_pkt.is_store | mem_pkt.is_load) & ~axi_issued &
-                     ~vm_fence_active;
-  // AMO read phase must issue with we=0 (the entry is_store bit is 1, so it
-  // cannot be used directly); write phase uses the computed amo_new.
-  assign mem_we    = (mem_pkt.ctrl.lsu_op == LSU_AMO) ? amo_wr_q : mem_pkt.is_store;
-  assign mem_addr  = mem_pkt.mem_addr;
-  assign mem_be    = mem_pkt.be;
-  assign mem_wdata = mem_is_amo_w ? (amo_new << (mem_pkt.mem_addr[2:0]*8)) : mem_pkt.store_data;
-  assign mem_lock  = mem_pkt.lock;
-
-  function automatic logic [63:0] align_load(logic [63:0] d, logic [2:0] off, lsu_op_e op);
-    logic [63:0] r;
-    r = d >> (off*8);
-    case (op)
-      LSU_LB:  r = {{56{r[7]}},  r[7:0]};
-      LSU_LH:  r = {{48{r[15]}}, r[15:0]};
-      LSU_LW:  r = {{32{r[31]}}, r[31:0]};
-      LSU_LD:  r = r;
-      LSU_LBU: r = {56'd0, r[7:0]};
-      LSU_LHU: r = {48'd0, r[15:0]};
-      LSU_LWU: r = {32'd0, r[31:0]};
-      default: r = r;
-    endcase
-    return r;
-  endfunction
-
-  // The load read data is latched when THIS load's own AXI transaction
-  // completes (axi_pending drop), not on any dmem ack. The shared AXI port
-  // can deliver a stale ack (e.g. a prior store's B response) while a load is
-  // in MEM with the bus read data still holding a fetch word; latching on a
-  // bare mem_ack would capture the wrong value. axi_pending is asserted for
-  // the current mem_pkt's transaction and cleared only by its own ack.
-  // LR/AMO widths come from funct3 (010=W, 011=D); AMO latches only in its
-  // read phase (write ack must not overwrite the old value in load_data_q).
-  logic [63:0] load_data_q;
-  logic        axi_pending;
-  logic        amo_read_ack;
-  assign amo_read_ack = mem_pkt.valid & (mem_pkt.ctrl.lsu_op == LSU_AMO) & ~amo_wr_q;
-  always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) load_data_q <= '0;
-    else if (axi_pending & mem_ack & mem_pkt.valid & mem_pkt.is_load &
-             (mem_pkt.ctrl.lsu_op != LSU_AMO | amo_read_ack))
-      load_data_q <= align_load(mem_rdata, mem_pkt.mem_addr[2:0],
-        ((mem_pkt.ctrl.lsu_op == LSU_LR) | (mem_pkt.ctrl.lsu_op == LSU_AMO)) ?
-          ((mem_pkt.ctrl.funct3 == 3'b011) ? LSU_LD : LSU_LW) :
-          mem_pkt.ctrl.lsu_op);
-  end
-  always_comb begin
-    mem_rdata_aligned = load_data_q;
-  end
 
   always_comb begin
     wb_pkt_n = '0;
@@ -1996,7 +1876,7 @@ module rv64gch_core #(
         $fwrite(cosim_f, "T %h %0d\n", ex_pkt.pc, cause);
       // Completed memory writes only (mem_we excludes AMO read phases
       // and failed SCs, matching what actually reaches memory).
-      if (axi_pending & mem_ack & mem_pkt.valid & mem_we)
+      if (lsu_pending & mem_ack & mem_pkt.valid & lsu_mem_we)
         $fwrite(cosim_f, "M %h %h %h %h\n",
                 mem_pkt.pc, mem_pkt.mem_addr[47:0], mem_pkt.be, mem_wdata);
       $fflush(cosim_f);

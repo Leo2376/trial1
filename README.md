@@ -28,7 +28,7 @@ synthesis), not FPGA.
 | Trap delegation (medeleg/mideleg, S-trap entry, vectored tvec) | **DONE** | deleg_basic PASS |
 | ASID tags + selective SFENCE.VMA | **DONE** | asid_test PASS |
 | MMU Sv48 (4-level walk, 512G/1G/2M/4K) | **DONE** | sv48_basic PASS |
-| Dual-issue frontend (8B fetch, dual decode/issue/retire, ALU+ALU) | **DONE (Phase 1)** | all ISA suites + directed PASS (see regression line) |
+| Dual-issue frontend (8B fetch, dual decode/issue/retire, ALU+ALU and ALU+MDU/FPU) | **DONE (Phase 1+2)** | all ISA suites + directed PASS (see regression line) |
 | Branch prediction (static BTFN + BTB/2-bit/RAS/JAL-early) | **DONE (stages a+b)** | all ISA suites PASS; loops ~25% faster |
 | RVV 1.0 vector engine | Not started | — |
 | IME 1.0 matrix extension | Not started | — |
@@ -116,7 +116,13 @@ Jumps predict via BTB/RAS/JAL-early, verified against the resolved target.
    backend-drain instead of freeze on load-use/FRM holds, FRM pending
    narrowed to EX/MEM, FP-file load-use stall for FLW/FLD consumers,
    xret drain-hold for back-to-back `csrw mepc/sepc → xret`.
-   Remaining: MDU/FPU second-lane pairing, then branch prediction (8).
+   Phase 2 adds ALU+MDU/FPU pairing (lane A runs any MDU/FPU compute,
+   lane B a simple ALU; the pair advances in lockstep behind the long op
+   and retires the same cycle, so no extra bypass is needed; FP-to-FP
+   lane A gates the intra-pair forward). LSU extracted to
+   `rtl/core/lsu/lsu.sv` (MEM transaction engine: LR/SC, AMO, AXI
+   handshake, aligned load latch; packet/WB/forwarding stay in core).
+   Remaining: none (no second MDU/FPU, no VPU pairing).
 8. **Branch prediction** — **DONE (stages a+b)**. (a) Static BTFN in
    Decode, verified in EX (redirect only on mispredict). (b) 64-entry
    direct-mapped BTB (tag VA[47:7], per-entry 2-bit counter; branches
@@ -206,7 +212,7 @@ cd sim/verilator && make decomp   # 44/44 PASS
 ./sim/verilator/obj_dir/Vtb_rv64gch_core +hex=/tmp/sv48_basic.hex      # TEST PASSED
 ```
 
-Last full regression (dual-issue Phase 1 + BTFN/BTB/RAS + FPU NaN-boxing fixes in path): rv64ui 50/50, rv64um 13/13, rv64uf 11/11, rv64uc 1/1 (rvc), rv64ua 19/19, rv64ud 12/12, tb_fpu 80/80, tb_decompressor 44/44, dyn_rm PASS, l1i_conflict PASS, l1d_wb PASS, l2_wb PASS, sv39_basic/fault/sfence PASS, deleg_basic PASS, asid_test PASS, sv48_basic PASS, priv_ecall PASS, priv_csr PASS, bpred_ras PASS.
+Last full regression (dual-issue + LSU split + BTFN/BTB/RAS + FPU NaN-boxing fixes in path): rv64ui 50/50, rv64um 13/13, rv64uf 11/11, rv64uc 1/1 (rvc), rv64ua 19/19, rv64ud 12/12, tb_fpu 80/80, tb_decompressor 44/44, dyn_rm PASS, l1i_conflict PASS, l1d_wb PASS, l2_wb PASS, sv39_basic/fault/sfence PASS, deleg_basic PASS, asid_test PASS, sv48_basic PASS, priv_ecall PASS, priv_csr PASS, bpred_ras PASS.
 
 ## RTL Directory Structure & Module Relationships
 
@@ -234,8 +240,9 @@ rtl/
 │   ├── csr/
 │   │   └── csr_unit.sv           # CSRs: M/S-mode, fcsr, separate read port
 │   ├── issue/
-│   │   └── issue_unit.sv         # Dual-issue pairing predicate (simple-ALU only)
-│   └── lsu/                      # LSU logic lives in rv64gch_core.sv (MEM stage)
+│   │   └── issue_unit.sv         # Dual-issue pairing predicate (ALU+ALU, ALU+MDU/FPU)
+│   ├── lsu/
+│   │   └── lsu.sv                # LSU MEM engine: LR/SC, AMO, AXI handshake, load latch
 ├── vpu/                           # Vector/Matrix Unit (EMPTY, future)
 │   ├── ctrl/  regfile/  vlane/  munit/  vsew_lmul/  ldst/
 ├── mmu/mmu.sv                   # Sv39 MMU: TLB + walker (IMPLEMENTED)
@@ -266,6 +273,7 @@ rv64gch_core.sv
 ├── ctrl/hazard_unit.sv
 ├── ctrl/forwarding_unit.sv
 ├── issue/issue_unit.sv
+├── lsu/lsu.sv
 ├── regfile/regfile_int.sv
 ├── regfile/regfile_fp.sv
 ├── int_alu/alu.sv (x2: u_alu + u_alu_b)
@@ -317,5 +325,5 @@ VPU (RVV 1.0 + IME 1.0) ──┘
 - `.gitkeep` files preserve empty directories in git
 - Package files (`*_pkg.sv`) define shared types/constants
 - Interface files (`*_if.sv`) define bus/protocol interfaces
-- `rtl/core/lsu/` is intentionally empty: LSU logic currently lives inline in
-  `rv64gch_core.sv` (MEM stage) and will be extracted when the L1D lands
+- `rtl/core/lsu/lsu.sv` holds the MEM transaction engine (LR/SC, AMO, AXI
+  handshake, load latch); packet/WB/forwarding stay in `rv64gch_core.sv`

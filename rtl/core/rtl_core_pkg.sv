@@ -163,6 +163,42 @@ package rtl_core_pkg;
     endcase
   endfunction
 
+  // Dual-issue lane classes. Lane B is always simple integer ALU. Lane A is
+  // either simple-ALU (dual ALU + dual retire, intra-pair bypass for RAW)
+  // or a long op (MDU/FPU compute, no LSU/CSR/control): the pair advances
+  // in lockstep behind the long op (backend busy stalls couple them) and
+  // retires the same cycle, so no extra bypass or decoupling is needed.
+  // A long op's result is only sampled post-done; its EX-time value must
+  // never forward into lane B (see laneA_writes_int use in the core).
+  function automatic logic is_simple_alu_op(input ctrl_t c);
+    if (c.illegal) return 1'b0;
+    if (c.fpu_op != FPU_NONE) return 1'b0;
+    if (c.lsu_op != LSU_NONE) return 1'b0;
+    if (c.is_branch | c.is_jal | c.is_jalr) return 1'b0;
+    if (c.reads_csr | c.writes_csr) return 1'b0;
+    if (c.fence_i | c.is_sfence | c.is_ebreak | c.is_ecall) return 1'b0;
+    if (c.is_mret | c.is_sret | c.is_wfi) return 1'b0;
+    unique case (c.alu_op)
+      ALU_ADD, ALU_SUB, ALU_SLL, ALU_SLT, ALU_SLTU,
+      ALU_XOR, ALU_SRL, ALU_SRA, ALU_OR, ALU_AND,
+      ALU_ADDW, ALU_SUBW, ALU_SLLW, ALU_SRLW, ALU_SRAW,
+      ALU_LUI: return 1'b1;
+      default: return 1'b0; // NONE, COPYB, MDU family
+    endcase
+  endfunction
+
+  function automatic logic is_long_alu_op(input ctrl_t c);
+    if (c.illegal) return 1'b0;
+    if (c.lsu_op != LSU_NONE) return 1'b0;
+    if (c.is_branch | c.is_jal | c.is_jalr) return 1'b0;
+    if (c.reads_csr | c.writes_csr) return 1'b0;
+    if (c.fence_i | c.is_sfence | c.is_ebreak | c.is_ecall) return 1'b0;
+    if (c.is_mret | c.is_sret | c.is_wfi) return 1'b0;
+    if (is_mdu_op(c.alu_op)) return 1'b1;
+    if (c.fpu_op != FPU_NONE) return 1'b1;
+    return 1'b0;
+  endfunction
+
   function automatic mul_op_e alu_to_mul_op(alu_op_e op);
     case (op)
       ALU_MUL:    return MUL_MUL;
