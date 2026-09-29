@@ -11,7 +11,7 @@ MABI="lp64d"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-DEFAULT_TESTS="dyn_rm l1i_conflict l1d_wb l2_wb sv39_basic sv39_fault sv39_sfence deleg_basic asid_test sv48_basic priv_ecall priv_csr bpred_ras clint_timer plic_basic"
+DEFAULT_TESTS="dyn_rm l1i_conflict l1d_wb l2_wb sv39_basic sv39_fault sv39_sfence deleg_basic asid_test sv48_basic priv_ecall priv_csr bpred_ras clint_timer plic_basic h_basic"
 TESTS="${*:-$DEFAULT_TESTS}"
 
 pass=0; fail=0; failed_list=""
@@ -19,7 +19,11 @@ for t in $TESTS; do
   src="$ROOT/software/tests/$t.S"
   if [ ! -f "$src" ]; then echo "SKIP $t (no source)"; continue; fi
   elf="$WORK/$t.elf"; hex="$WORK/$t.hex"
-  if ! riscv64-unknown-elf-gcc -march=$MARCH -mabi=$MABI -nostdlib -nostartfiles -static \
+  tmarch="$MARCH"
+  case "$t" in
+    h_basic) tmarch="rv64imafdc_h_zicsr_zifencei" ;;
+  esac
+  if ! riscv64-unknown-elf-gcc -march=$tmarch -mabi=$MABI -nostdlib -nostartfiles -static \
         -T "$ENVDIR/link.ld" "$src" -o "$elf" 2>"$WORK/$t.cc_err"; then
     echo "COMPILE_FAIL $t"; fail=$((fail+1)); failed_list="$failed_list $t"; continue
   fi

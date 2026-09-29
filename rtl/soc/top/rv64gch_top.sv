@@ -35,6 +35,7 @@ module rv64gch_top #(
   logic        plic_eip, plic_seip;
   assign ext_irq = plic_eip | plic_seip;
   logic        fence_i_retire, sfence_retire, satp_we_retire, l1d_drain_busy;
+  logic        hfence_vvma_retire, hfence_gvma_retire;
   logic        ptw_req, ptw_we, ptw_ack, ptw_ready;
   logic [47:0] ptw_addr;
   logic [7:0]  ptw_be;
@@ -56,7 +57,9 @@ module rv64gch_top #(
     .mem_rdata(dmem_rdata), .mem_ack(dmem_ack),
     .mem_ready(dmem_ready), .mem_err(dmem_err),
     .dbg_pc(dbg_pc), .fence_i_o(fence_i_retire),
-    .sfence_o(sfence_retire), .satp_we_o(satp_we_retire),
+    .sfence_o(sfence_retire),
+    .hfence_vvma_o(hfence_vvma_retire), .hfence_gvma_o(hfence_gvma_retire),
+    .satp_we_o(satp_we_retire),
     .drain_busy_i(l1d_drain_busy),
     .ptw_req(ptw_req), .ptw_we(ptw_we), .ptw_addr(ptw_addr),
     .ptw_be(ptw_be), .ptw_wdata(ptw_wdata),
@@ -95,7 +98,8 @@ module rv64gch_top #(
     .wdata_o(l1d_wdata), .lock_o(l1d_lock),
     .rdata_i(l1d_rdata), .ack_i(l1d_ack), .ready_i(l1d_ready),
     .flush_i(1'b0),
-    .drain_i(fence_i_retire | sfence_retire | satp_we_retire),
+    .drain_i(fence_i_retire | sfence_retire | satp_we_retire |
+             hfence_vvma_retire | hfence_gvma_retire),
     .drain_busy_o(l1d_drain_busy)
   );
 

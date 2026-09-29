@@ -31,6 +31,9 @@ module rv64gch_core #(
   output logic             fence_i_o,
   // SFENCE.VMA retire pulse (TLB + L1D-drain trigger in the MMU stage).
   output logic             sfence_o,
+  // HFENCE.VVMA / HFENCE.GVMA retire pulses (TLB flush + drain like SFENCE).
+  output logic             hfence_vvma_o,
+  output logic             hfence_gvma_o,
   // Pulse when a SATP write retires at WB (TLB + L1D-drain trigger).
   output logic             satp_we_o,
   // L1D drain sweep in progress (SFENCE/SATP/FENCE.I writeback): stall.
@@ -85,6 +88,8 @@ module rv64gch_core #(
   logic [63:0]     epc, tvec;
   logic [1:0]      new_priv;
   logic            irq_pending;
+  logic            virt;
+  logic            csr_hstatus_spv, csr_hstatus_spvp;
 
   logic [63:0]     fp_rdata1, fp_rdata2, fp_rdata3;
   logic            fp_rdy;
@@ -180,17 +185,29 @@ module rv64gch_core #(
   // post-mret fetches run under the previous priv, fatal for non-identity
   // targets). The same-edge redirect/trap flushes discard in-flight work.
   logic [1:0] xret_priv;
+  logic xret_virt;
+  logic csr_virt, csr_trap_to_vs;
+  logic [63:0] csr_vsatp, csr_hgatp, csr_vsstatus;
+  logic [1:0] csr_new_priv;
+  logic csr_new_virt;
   assign xret_priv = ex_pkt.ctrl.is_mret ?
                      ((csr_mstatus[12:11] == 2'b10) ? PRIV_U :
                       priv_e'(csr_mstatus[12:11])) :
-                     (csr_sstatus[8] ? PRIV_S : PRIV_U);
+                     (csr_virt ? (csr_vsstatus[8] ? PRIV_S : PRIV_U) :
+                      (csr_hstatus_spv ? (csr_hstatus_spvp ? PRIV_S : PRIV_U) :
+                       (csr_sstatus[8] ? PRIV_S : PRIV_U)));
+  assign xret_virt = ex_pkt.ctrl.is_mret ? csr_mstatus[39] :
+                     (csr_virt ? 1'b1 : csr_hstatus_spv);
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       priv <= PRIV_M;
+      virt <= 1'b0;
     end else if (trap) begin
-      priv <= csr_trap_deleg ? PRIV_S : PRIV_M;
+      priv <= csr_new_priv;
+      virt <= csr_new_virt;
     end else if (redirect & is_xret) begin
       priv <= xret_priv;
+      virt <= xret_virt;
     end
   end
 
@@ -810,6 +827,11 @@ module rv64gch_core #(
                       // SFENCE.VMA rs1,rs2: funct7=0001001, rd must be x0.
                       else if ((i[31:25] == 7'b0001001) && (i[11:7] == 5'd0))
                         c.is_sfence = 1'b1;
+                      // HFENCE.VVMA (0001011) / HFENCE.GVMA (0010111).
+                      else if ((i[31:25] == 7'b0001011) && (i[11:7] == 5'd0))
+                        c.is_hfence_vvma = 1'b1;
+                      else if ((i[31:25] == 7'b0010111) && (i[11:7] == 5'd0))
+                        c.is_hfence_gvma = 1'b1;
                     end
                     default: begin
                       // All CSR ops read; all may write. CSRRS/CSRRC only
@@ -1198,7 +1220,8 @@ module rv64gch_core #(
   // duplicated -- the window simply delays. Covers through drain_busy so
   // there is no gap between retire-edge and sweep-start/end.
   logic vm_fence_active;
-  assign vm_fence_active = fence_i_o | sfence_o | satp_we_o | drain_busy_i;
+  assign vm_fence_active = fence_i_o | sfence_o | hfence_vvma_o | hfence_gvma_o |
+                           satp_we_o | vsatp_we_o | hgatp_we_o | drain_busy_i;
   // xret redirects like a taken branch: squash F/D and reload pc from
   // epc deterministically (no next_pc race), while the insn itself flows
   // on to retire its CSR effects at WB.
@@ -1660,12 +1683,17 @@ module rv64gch_core #(
   logic [4:0]  mmu_cause_d;
 
   // SFENCE.VMA retires with rs1 (VA) in csr_wdata and rs2 (ASID) in
-  // rs2v; x0 on either side means "all". The selective TLB flush fires at
-  // retire (ordered with the L1D drain); F/D refetch below re-translates.
+  // rs2v; x0 on either side means "all". HFENCE.VVMA/GVMA flush like
+  // SFENCE (conservative full flush for the H v0.1 TLB). SATP/VSATP/HGATP
+  // writes flush all. The selective TLB flush fires at retire (ordered
+  // with the L1D drain); F/D refetch below re-translates.
   mmu #(.ADDR_W(48), .TLB_ENTRIES(32)) u_mmu (
     .clk(clk), .rst_n(rst_n),
     .satp_i(csr_satp), .mstatus_i(csr_mstatus), .priv_i(priv),
-    .flush_all_i(satp_we_o),
+    .virt_i(virt), .vsatp_i(csr_vsatp), .hgatp_i(csr_hgatp),
+    .vsstatus_i(csr_vsstatus),
+    .flush_all_i(satp_we_o | vsatp_we_o | hgatp_we_o |
+                 hfence_vvma_o | hfence_gvma_o),
     .flush_sel_i(sfence_o),
     .flush_va_i(wb_pkt.csr_wdata),
     .flush_asid_i(wb_pkt.rs2v[15:0]),
@@ -1888,8 +1916,17 @@ module rv64gch_core #(
   // (WB holds), which is harmless for the idempotent L1I invalidate.
   assign fence_i_o = wb_pkt.valid & wb_pkt.ctrl.fence_i;
   assign sfence_o = wb_pkt.valid & wb_pkt.ctrl.is_sfence;
+  assign hfence_vvma_o = wb_pkt.valid & wb_pkt.ctrl.is_hfence_vvma;
+  assign hfence_gvma_o = wb_pkt.valid & wb_pkt.ctrl.is_hfence_gvma;
+  logic vsatp_we_o, hgatp_we_o;
+  assign vsatp_we_o = wb_pkt.valid & wb_pkt.ctrl.writes_csr &
+                      (wb_pkt.ctrl.csr_addr == CSR_VSATP);
+  assign hgatp_we_o = wb_pkt.valid & wb_pkt.ctrl.writes_csr &
+                      (wb_pkt.ctrl.csr_addr == CSR_HGATP);
   assign satp_we_o = wb_pkt.valid & wb_pkt.ctrl.writes_csr &
-                     (wb_pkt.ctrl.csr_addr == CSR_SATP);
+                     ((wb_pkt.ctrl.csr_addr == CSR_SATP) ||
+                      (wb_pkt.ctrl.csr_addr == CSR_VSATP) ||
+                      (wb_pkt.ctrl.csr_addr == CSR_HGATP));
   `ifdef CORE_DEBUG
   always @(posedge clk) begin
     if (fence_i_o | sfence_o | satp_we_o)
@@ -1917,6 +1954,7 @@ module rv64gch_core #(
   logic [4:0] fcsr_fflags_we;
   logic [4:0] fcsr_fflags;
   assign fcsr_fflags_we = wb_pkt.valid & wb_pkt.ctrl.is_fp & (wb_pkt.ctrl.fpu_op != FPU_NONE);
+  logic [63:0] csr_hstatus;
   csr_unit u_csr (
     .clk(clk), .rst_n(rst_n), .flush(flush_all_no_refetch),
     .priv(priv), .hartid(hartid_i),
@@ -1946,8 +1984,15 @@ module rv64gch_core #(
     .mstatus_o(csr_mstatus),
     .satp_o(csr_satp),
     .sstatus_o(csr_sstatus),
-    .trap_deleg_o(csr_trap_deleg)
+    .trap_deleg_o(csr_trap_deleg),
+    .virt_o(csr_virt), .vsatp_o(csr_vsatp), .hgatp_o(csr_hgatp),
+    .vsstatus_o(csr_vsstatus),
+    .trap_to_vs_o(csr_trap_to_vs),
+    .new_virt_priv_o(csr_new_priv), .new_virt_o(csr_new_virt),
+    .hstatus_o(csr_hstatus)
   );
+  assign csr_hstatus_spv = csr_hstatus[7];
+  assign csr_hstatus_spvp = csr_hstatus[8];
 
   // Fault plumbing for mtval: fetch bubble carries its VA, data faults
   // use the faulting EX virtual address. Interrupts record tval 0.
@@ -1984,7 +2029,8 @@ module rv64gch_core #(
         sync_trap = 1'b1; sync_cause = CAUSE_ILLEGAL_INSN;
       end else if (ex_pkt.ctrl.is_ecall) begin
         sync_trap = 1'b1; sync_cause = (priv == PRIV_M) ? CAUSE_M_ECALL :
-                              (priv == PRIV_S) ? CAUSE_SUP_ECALL : CAUSE_USER_ECALL;
+                              virt ? ((priv == PRIV_S) ? CAUSE_VS_ECALL : CAUSE_USER_ECALL) :
+                              ((priv == PRIV_S) ? CAUSE_SUP_ECALL : CAUSE_USER_ECALL);
       end else if (ex_pkt.ctrl.is_ebreak) begin
         sync_trap = 1'b1; sync_cause = CAUSE_BREAKPOINT;
       end else if (data_fault) begin

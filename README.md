@@ -33,11 +33,11 @@ synthesis), not FPGA.
 | Core interrupt take (precise M/S trap on MEI/MSI/MTI) | **DONE** | clint_timer/plic_basic PASS |
 | CLINT (mtime/mtimecmp/msip) | **DONE** | clint_timer PASS |
 | 64-source PLIC (priority/threshold/claim, M+S contexts) | **DONE** | plic_basic PASS |
+| H extension v0.1 (HS/VS/VU, stage-2 walk, hfence, VS-IRQ) | **DONE (v0.1)** | h_basic PASS |
 | RVV 1.0 vector engine | Not started | — |
 | IME 1.0 matrix extension | Not started | — |
 | LLC (1 MiB, shared) | Not started (only needed with VPU) | — |
 | Debug module / coherence dir | Not started (empty stubs) | — |
-| H extension | Not started | — |
 
 Current pipeline: 5-stage (F/D, EX, MEM, WB) in-order dual-issue with full
 hazard/forwarding for INT, FP and MDU; multi-cycle FPU (FADD/FSUB/FMUL
@@ -153,8 +153,13 @@ Jumps predict via BTB/RAS/JAL-early, verified against the resolved target.
     - **SoC stubs** — debug module (`rtl/soc/debug/`, RISC-V Debug Spec:
       halt/resume/abstract access) and coherence directory
       (`rtl/cache/coherence/`, needed only with DMA/VPU writers).
-    - **H extension** — planned, not started (hypervisor CSRs, 2-stage
-      translation, `hfence`, virtual interrupts).
+    - **H extension v0.1** — **DONE** (`h_basic` PASS: HS/VS/VU modes with
+      V bit, hstatus/hedeleg/hideleg/hgatp + vsstatus/vsie/vstvec/vsepc/
+      vscause/vstval/vsatp, MPV/SPV/SPVP, VS-ecall cause 10, guest faults
+      20/21/23 with htval/mtval2, nested 2-stage walker with G-stage A/D,
+      HFENCE.VVMA/GVMA, hvip/vsip virtual interrupts routed to VS or HS).
+      Left for later: HLV/HSV insns, hfence privilege checks, full VMID/
+      Sv39x4 upper-bit handling, riscv-tests `rv64h` suites.
     - **Verification hardening** — extend the Unicorn lock-step cosim flow
       to dual-issue/predictor paths; run the riscv-tests H-extension
       suites when H lands. No open failures: full regression is green
@@ -203,10 +208,13 @@ Three levels, all driven by the upstream riscv-tests ISA suites:
    `software/tests/deleg_basic.S` (delegated S-ecall handling + sret
    return + second ecall), `software/tests/asid_test.S` (two-ASID
    isolation + VA-selective sfence proven by survival + fault), and
-   `software/tests/sv48_basic.S` (4-level remap + alias + fetch + 2M
-   page + A/D under Sv48).
-   Build per the header comments, run with
-   `Vtb_rv64gch_core +hex=<test>.hex`, expect `TEST PASSED`.
+    `software/tests/sv48_basic.S` (4-level remap + alias + fetch + 2M
+    page + A/D under Sv48), `software/tests/h_basic.S` (H v0.1: HS CSR
+    readback, hfence.vvma/gvma, VS entry via SPV/sret, VS-timer IRQ to
+    HS, 2-stage data remap, VS-ecall to VS, G-fault 21 to HS; build with
+    `-march=rv64imafdc_h_zicsr_zifencei`).
+    Build per the header comments, run with
+    `Vtb_rv64gch_core +hex=<test>.hex`, expect `TEST PASSED`.
 
 Debug methodology (proven on the FPU work): when a test fails, disassemble the
 failing test case, write a minimal directed asm program that reports the
@@ -224,7 +232,7 @@ EXT=rv64ua tools/scripts/run_isa_tests.sh   # 19/19
 EXT=rv64ud tools/scripts/run_isa_tests.sh   # 12/12
 
 # FPU unit testbench
-cd sim/verilator && make fpu      # 79/79 PASS
+cd sim/verilator && make fpu      # 80/80 PASS
 
 # Decompressor (RVC) unit testbench
 cd sim/verilator && make decomp   # 44/44 PASS
@@ -241,9 +249,10 @@ cd sim/verilator && make decomp   # 44/44 PASS
 ./sim/verilator/obj_dir/Vtb_rv64gch_core +hex=/tmp/deleg_basic.hex     # TEST PASSED
 ./sim/verilator/obj_dir/Vtb_rv64gch_core +hex=/tmp/asid_test.hex       # TEST PASSED
 ./sim/verilator/obj_dir/Vtb_rv64gch_core +hex=/tmp/sv48_basic.hex      # TEST PASSED
+./sim/verilator/obj_dir/Vtb_rv64gch_core +hex=/tmp/h_basic.hex          # TEST PASSED
 ```
 
-Last full regression (dual-issue + LSU split + BTFN/BTB/RAS + FPU NaN-boxing + SoC IRQ fixes in path): rv64ui 50/50, rv64um 13/13, rv64uf 11/11, rv64uc 1/1 (rvc), rv64ua 19/19, rv64ud 12/12, tb_fpu 80/80, tb_decompressor 44/44, dyn_rm PASS, l1i_conflict PASS, l1d_wb PASS, l2_wb PASS, sv39_basic/fault/sfence PASS, deleg_basic PASS, asid_test PASS, sv48_basic PASS, priv_ecall PASS, priv_csr PASS, bpred_ras PASS, clint_timer PASS, plic_basic PASS.
+Last full regression (H v0.1 in path): rv64ui 50/50, rv64um 13/13, rv64uf 11/11, rv64uc 1/1 (rvc), rv64ua 19/19, rv64ud 12/12, tb_fpu 80/80, tb_decompressor 44/44, dyn_rm PASS, l1i_conflict PASS, l1d_wb PASS, l2_wb PASS, sv39_basic/fault/sfence PASS, deleg_basic PASS, asid_test PASS, sv48_basic PASS, priv_ecall PASS, priv_csr PASS, bpred_ras PASS, clint_timer PASS, plic_basic PASS, h_basic PASS.
 
 ## RTL Directory Structure & Module Relationships
 
@@ -340,7 +349,7 @@ VPU (RVV 1.0 + IME 1.0) ──┘
 ## ISA Support
 
 - **Base**: RV64I — **verified**
-- **Extensions**: M ✓, F ✓, D ✓, C ✓, A ✓ ("G" complete), Zicsr/Zifencei ✓ | H planned
+- **Extensions**: M ✓, F ✓, D ✓, C ✓, A ✓ ("G" complete), Zicsr/Zifencei ✓ | H v0.1 ✓ (HS/VS/VU, 2-stage, hfence, VS-IRQ; HLV/HSV later)
 - **Vector**: RVV 1.0 (VLEN=256, ELEN=64) — planned, shared CPU AXI4 bus (no separate IF)
 - **Matrix**: IME 1.0 (shared VPU regfile) — planned, shared CPU AXI4 bus (no separate IF)
 

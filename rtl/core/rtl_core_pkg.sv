@@ -83,8 +83,11 @@ package rtl_core_pkg;
     CAUSE_MISALIGNED_FETCH=5'd0, CAUSE_FETCH_ACCESS=5'd1, CAUSE_ILLEGAL_INSN=5'd2,
     CAUSE_BREAKPOINT=5'd3, CAUSE_MISALIGNED_LOAD=5'd4, CAUSE_LOAD_ACCESS=5'd5,
     CAUSE_MISALIGNED_STORE=5'd6, CAUSE_STORE_ACCESS=5'd7, CAUSE_USER_ECALL=5'd8,
-    CAUSE_SUP_ECALL=5'd9, CAUSE_M_ECALL=5'd11, CAUSE_FETCH_PAGE_FAULT=5'd12,
-    CAUSE_LOAD_PAGE_FAULT=5'd13, CAUSE_STORE_PAGE_FAULT=5'd15
+    CAUSE_SUP_ECALL=5'd9, CAUSE_VS_ECALL=5'd10, CAUSE_M_ECALL=5'd11,
+    CAUSE_FETCH_PAGE_FAULT=5'd12,
+    CAUSE_LOAD_PAGE_FAULT=5'd13, CAUSE_STORE_PAGE_FAULT=5'd15,
+    CAUSE_FETCH_GUEST_FAULT=5'd20, CAUSE_LOAD_GUEST_FAULT=5'd21,
+    CAUSE_VIRT_INSN=5'd22, CAUSE_STORE_GUEST_FAULT=5'd23
   } cause_e;
 
   localparam logic [4:0] CAUSE_MTIMER    = 5'd7;
@@ -118,6 +121,8 @@ package rtl_core_pkg;
     logic [1:0]  csr_op;
     logic        fence_i;
     logic        is_sfence;
+    logic        is_hfence_vvma;
+    logic        is_hfence_gvma;
     logic        is_ebreak;
     logic        is_ecall;
     logic        is_mret;
@@ -143,11 +148,19 @@ package rtl_core_pkg;
     CSR_MTVAL=12'h343, CSR_MIP=12'h344, CSR_MCYCLE=12'hB00, CSR_CYCLE=12'hC00,
     CSR_MINSTRET=12'hB02, CSR_INSTRET=12'hC02, CSR_MTIME=12'hC01, CSR_MVENDORID=12'hF11,
     CSR_MARCHID=12'hF12, CSR_MIMPID=12'hF13, CSR_MHARTID=12'hF14,
+    CSR_MTVAL2=12'h34B, CSR_MTINST=12'h34A,
     CSR_FCSR=12'h003, CSR_FFLAGS=12'h001, CSR_FRM=12'h002,
     CSR_SSTATUS=12'h100, CSR_SIE=12'h104, CSR_STVEC=12'h105, CSR_SSCRATCH=12'h140,
     CSR_SEPC=12'h141, CSR_SCAUSE=12'h142, CSR_STVAL=12'h143, CSR_SIP=12'h144,
     CSR_UTVEC=12'h005, CSR_USCRATCH=12'h040, CSR_UEPC=12'h041, CSR_UCAUSE=12'h042,
-    CSR_UTVAL=12'h043, CSR_SATP=12'h180;
+    CSR_UTVAL=12'h043, CSR_SATP=12'h180,
+    CSR_VSSTATUS=12'h200, CSR_VSIE=12'h204, CSR_VSTVEC=12'h205,
+    CSR_VSSCRATCH=12'h240, CSR_VSEPC=12'h241, CSR_VSCAUSE=12'h242,
+    CSR_VSTVAL=12'h243, CSR_VSIP=12'h244, CSR_VSATP=12'h280,
+    CSR_HSTATUS=12'h600, CSR_HEDELEG=12'h602, CSR_HIDELEG=12'h603,
+    CSR_HIE=12'h604, CSR_HTIMEDELTA=12'h605, CSR_HCOUNTEREN=12'h606,
+    CSR_HGEIE=12'h607, CSR_HTVAL=12'h643, CSR_HIP=12'h644, CSR_HVIP=12'h645,
+    CSR_HTINST=12'h64A, CSR_HGATP=12'h680, CSR_HGEIP=12'hE12;
 
   // satp MODE values (WARL: unsupported modes read back as Bare).
   localparam logic [3:0] SATP_BARE = 4'd0, SATP_SV39 = 4'd8, SATP_SV48 = 4'd9;
@@ -176,7 +189,8 @@ package rtl_core_pkg;
     if (c.lsu_op != LSU_NONE) return 1'b0;
     if (c.is_branch | c.is_jal | c.is_jalr) return 1'b0;
     if (c.reads_csr | c.writes_csr) return 1'b0;
-    if (c.fence_i | c.is_sfence | c.is_ebreak | c.is_ecall) return 1'b0;
+    if (c.fence_i | c.is_sfence | c.is_hfence_vvma | c.is_hfence_gvma |
+        c.is_ebreak | c.is_ecall) return 1'b0;
     if (c.is_mret | c.is_sret | c.is_wfi) return 1'b0;
     unique case (c.alu_op)
       ALU_ADD, ALU_SUB, ALU_SLL, ALU_SLT, ALU_SLTU,
@@ -192,7 +206,8 @@ package rtl_core_pkg;
     if (c.lsu_op != LSU_NONE) return 1'b0;
     if (c.is_branch | c.is_jal | c.is_jalr) return 1'b0;
     if (c.reads_csr | c.writes_csr) return 1'b0;
-    if (c.fence_i | c.is_sfence | c.is_ebreak | c.is_ecall) return 1'b0;
+    if (c.fence_i | c.is_sfence | c.is_hfence_vvma | c.is_hfence_gvma |
+        c.is_ebreak | c.is_ecall) return 1'b0;
     if (c.is_mret | c.is_sret | c.is_wfi) return 1'b0;
     if (is_mdu_op(c.alu_op)) return 1'b1;
     if (c.fpu_op != FPU_NONE) return 1'b1;
