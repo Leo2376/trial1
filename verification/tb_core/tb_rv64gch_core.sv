@@ -12,12 +12,15 @@ module tb_rv64gch_core;
   logic clk, rst_n;
 
   axi4_if #(.ID_W(ID_W), .ADDR_W(ADDR_W), .DATA_W(DATA_W)) cpu_if();
+  axi4_if #(.ID_W(ID_W), .ADDR_W(ADDR_W), .DATA_W(DATA_W)) rest_if();
   axi4_if #(.ID_W(ID_W), .ADDR_W(ADDR_W), .DATA_W(DATA_W)) dram_if();
   axi4_if #(.ID_W(ID_W), .ADDR_W(ADDR_W), .DATA_W(DATA_W)) hostif_if();
+  axi4_if #(.ID_W(ID_W), .ADDR_W(ADDR_W), .DATA_W(DATA_W)) stim_if();
 
   logic        test_done, test_pass;
   logic [63:0] tohost_val;
   logic        core_active;
+  logic [64:1] plic_sources;
 
   rv64gch_top #(
     .ADDR_W(ADDR_W), .DATA_W(DATA_W), .ID_W(ID_W), .XLEN(64)
@@ -27,8 +30,19 @@ module tb_rv64gch_core;
     .msi_n_i(1'b1),
     .dbg_req_i(2'b00),
     .dbg_halt_req_i(1'b0),
+    .plic_sources_i(plic_sources),
     .core_active_o(core_active),
     .mem(cpu_if)
+  );
+
+  // TB-level MMIO: IRQ stimulus (SW-driven PLIC sources) sits outside the
+  // SoC; CLINT/PLIC are decoded inside rv64gch_top and never reach here.
+  axi4_decoder #(
+    .ADDR_W(ADDR_W), .DATA_W(DATA_W), .ID_W(ID_W),
+    .BASE0(48'd0), .SIZE0(48'd0),
+    .BASE1(STIM_BASE), .SIZE1(STIM_TOP - STIM_BASE)
+  ) u_dec_pre (
+    .m(cpu_if), .s0(rest_if), .s1(stim_if)
   );
 
   axi4_decoder #(
@@ -36,7 +50,15 @@ module tb_rv64gch_core;
     .BASE0(DRAM_BASE),   .SIZE0(DRAM_TOP   - DRAM_BASE),
     .BASE1(HOSTIF_BASE), .SIZE1(HOSTIF_TOP - HOSTIF_BASE)
   ) u_dec (
-    .m(cpu_if), .s0(dram_if), .s1(hostif_if)
+    .m(rest_if), .s0(dram_if), .s1(hostif_if)
+  );
+
+  axi4_stim_model #(
+    .ADDR_W(ADDR_W), .DATA_W(DATA_W), .ID_W(ID_W),
+    .BASE(STIM_BASE)
+  ) u_stim (
+    .clk(clk), .rst_n(rst_n), .bus(stim_if),
+    .sources_o(plic_sources)
   );
 
   axi4_dram_model #(

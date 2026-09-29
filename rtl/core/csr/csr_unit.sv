@@ -34,6 +34,13 @@ module csr_unit #(
   input  logic              soft_irq,
   input  logic              ext_irq,
   output logic             irq_pending,
+  // Interrupt trap at an instruction boundary (core-driven): cause +
+  // take flag. mcause/scause record the interrupt bit (XLEN-1).
+  output logic             irq_take_o,
+  output logic [4:0]       irq_cause_o,
+  // This trap is an interrupt (not a sync fault): delegate via mideleg
+  // and set the mcause/scause interrupt bit.
+  input  logic              trap_irq_i,
   output logic             fi_we,
   output logic              fs_mstatus,
   output logic [4:0]        fcsr_fflags_we,
@@ -52,9 +59,11 @@ module csr_unit #(
 
   logic [XLEN-1:0] mstatus, mie, mtvec, mepc, mcause, mtval, mip, mscratch;
   logic [XLEN-1:0] medeleg, mideleg;
-  // Delegation for the live trap input (sync via medeleg; only sub-M priv).
+  // Delegation for the live trap input: sync traps via medeleg, interrupts
+  // via mideleg (only sub-M priv can delegate).
   logic trap_deleg;
-  assign trap_deleg = (priv != PRIV_M) && medeleg[cause];
+  assign trap_deleg = (priv != PRIV_M) &&
+                      (trap_irq_i ? mideleg[cause] : medeleg[cause]);
   assign trap_deleg_o = trap_deleg;
   // Next privilege, combinational so the core tracks transitions (trap,
   // mret, sret) on the committing edge; the redirect/trap flushes cover
@@ -175,14 +184,14 @@ module csr_unit #(
       if (trap) begin
         if (trap_deleg) begin
           sepc   <= trap_pc;
-          scause <= {59'd0, cause};
+          scause <= {trap_irq_i, 58'd0, cause};
           stval  <= tval_valid ? tval : '0;
           sstatus[8] <= priv[0];      // SPP = previous priv (U->0, S->1)
           sstatus[5] <= sie[1];       // SPIE = SIE
           sie        <= sie & ~64'd2; // SIE = 0
         end else begin
           mepc   <= trap_pc;
-          mcause <= {59'd0, cause};
+          mcause <= {trap_irq_i, 58'd0, cause};
           mtval  <= tval_valid ? tval : '0;
           mstatus[7]     <= mstatus[3];  // MPIE = MIE
           mstatus[3]     <= 1'b0;        // MIE = 0
@@ -285,6 +294,40 @@ module csr_unit #(
                 ({tvec_base[XLEN-1:2], 2'b0} + {57'd0, cause, 2'b00}) :
                 tvec_base;
   assign irq_pending = (mip[7] & mie[7]) | (mip[3] & mie[3]) | (mip[11] & mie[11]);
+  // Interrupt take (for the core's precise trap-at-boundary): per-line
+  // enables, MIE/SIE global gates, mideleg routing for S/U, priority
+  // MEI(11) > MSI(3) > MTI(7). From M only M-takes fire; from S/U a
+  // delegated line traps to S, otherwise to M. trap_deleg routes the
+  // target consistently (mideleg for interrupts).
+  logic m11, m3, m7, s11, s3, s7, m_any, s_any;
+  assign m11 = mip[11] & mie[11];
+  assign m3  = mip[3]  & mie[3];
+  assign m7  = mip[7]  & mie[7];
+  assign m_any = (m11 | m3 | m7) & mstatus[3];
+  assign s11 = mip[11] & mie[11] & mideleg[11];
+  assign s3  = mip[3]  & mie[3]  & mideleg[3];
+  assign s7  = mip[7]  & mie[7]  & mideleg[7];
+  assign s_any = (s11 | s3 | s7) & sie[1];
+  function automatic logic [4:0] irq_prio(input logic l11, input logic l3,
+                                          input logic l7);
+    if (l11) return 5'd11;
+    if (l3)  return 5'd3;
+    return 5'd7;
+  endfunction
+  always_comb begin
+    irq_take_o = 1'b0;
+    irq_cause_o = 5'd7;
+    if (priv == PRIV_M) begin
+      irq_take_o = m_any;
+      irq_cause_o = irq_prio(m11, m3, m7);
+    end else if (s_any) begin
+      irq_take_o = 1'b1;
+      irq_cause_o = irq_prio(s11, s3, s7);
+    end else begin
+      irq_take_o = m_any;
+      irq_cause_o = irq_prio(m11, m3, m7);
+    end
+  end
   assign fi_we = 1'b0;
   assign fs_mstatus = mstatus[14:13];
   assign fflags = fcsr[4:0];

@@ -30,6 +30,9 @@ synthesis), not FPGA.
 | MMU Sv48 (4-level walk, 512G/1G/2M/4K) | **DONE** | sv48_basic PASS |
 | Dual-issue frontend (8B fetch, dual decode/issue/retire, ALU+ALU and ALU+MDU/FPU) | **DONE (Phase 1+2)** | all ISA suites + directed PASS (see regression line) |
 | Branch prediction (static BTFN + BTB/2-bit/RAS/JAL-early) | **DONE (stages a+b)** | all ISA suites PASS; loops ~25% faster |
+| Core interrupt take (precise M/S trap on MEI/MSI/MTI) | **DONE** | clint_timer/plic_basic PASS |
+| CLINT (mtime/mtimecmp/msip) | **DONE** | clint_timer PASS |
+| 64-source PLIC (priority/threshold/claim, M+S contexts) | **DONE** | plic_basic PASS |
 | RVV 1.0 vector engine | Not started | — |
 | IME 1.0 matrix extension | Not started | — |
 
@@ -138,6 +141,17 @@ Jumps predict via BTB/RAS/JAL-early, verified against the resolved target.
 9. **RVV 1.0 (VLEN=256) + IME 1.0** — no separate VPU memory interface:
    vector/matrix traffic arbitrates onto the same AXI4 bus/fabric as the
    CPU (alongside LSU/fetch in `rv64gch_top`) and shares the L2/LLC chain.
+10. **SoC interrupts** — **DONE**. CLINT (`rtl/soc/clint/clint.sv`:
+    msip/mtimecmp/mtime, timer = mtime>=mtimecmp, reset-parked max) and
+    64-source PLIC (`rtl/soc/plic/plic.sv`: priority/threshold/claim per
+    context, level sources, lowest-ID tiebreak) live in `rv64gch_top`
+    behind chained `axi4_decoder`s (CLINT 0x10010_0000, PLIC 0x10020_0000,
+    TB-stim 0x10008_0000 for SW-driven sources in simulation only).
+    Core takes precise M/S traps (MEI>MSI>MTI, mideleg routing, int-bit
+    mcause, mepc = next unissued insn) once the backend drains.
+    `clint_timer` (mtimecmp + MTI trap + mepc/mip checks) and `plic_basic`
+    (arbitration/threshold/claim/complete over sources 1/40/64) PASS.
+    Remaining SoC stubs: debug module, coherence directory.
 
 ## Verification Scheme
 
@@ -212,7 +226,7 @@ cd sim/verilator && make decomp   # 44/44 PASS
 ./sim/verilator/obj_dir/Vtb_rv64gch_core +hex=/tmp/sv48_basic.hex      # TEST PASSED
 ```
 
-Last full regression (dual-issue + LSU split + BTFN/BTB/RAS + FPU NaN-boxing fixes in path): rv64ui 50/50, rv64um 13/13, rv64uf 11/11, rv64uc 1/1 (rvc), rv64ua 19/19, rv64ud 12/12, tb_fpu 80/80, tb_decompressor 44/44, dyn_rm PASS, l1i_conflict PASS, l1d_wb PASS, l2_wb PASS, sv39_basic/fault/sfence PASS, deleg_basic PASS, asid_test PASS, sv48_basic PASS, priv_ecall PASS, priv_csr PASS, bpred_ras PASS.
+Last full regression (dual-issue + LSU split + BTFN/BTB/RAS + FPU NaN-boxing + SoC IRQ fixes in path): rv64ui 50/50, rv64um 13/13, rv64uf 11/11, rv64uc 1/1 (rvc), rv64ua 19/19, rv64ud 12/12, tb_fpu 80/80, tb_decompressor 44/44, dyn_rm PASS, l1i_conflict PASS, l1d_wb PASS, l2_wb PASS, sv39_basic/fault/sfence PASS, deleg_basic PASS, asid_test PASS, sv48_basic PASS, priv_ecall PASS, priv_csr PASS, bpred_ras PASS, clint_timer PASS, plic_basic PASS.
 
 ## RTL Directory Structure & Module Relationships
 
@@ -253,13 +267,15 @@ rtl/
 │   ├── llc/  coherence/
 ├── soc/                           # SoC integration (IMPLEMENTED)
 │   ├── top/
-│   │   ├── rv64gch_top.sv        # Top-level SoC: core + fabric + boot ROM
-│   │   └── rv64gch_memmap_pkg.sv # Memory map
+│   │   ├── rv64gch_top.sv        # Top-level SoC: core + CLINT + PLIC + fabric
+│   │   └── rv64gch_memmap_pkg.sv # Memory map (DRAM/HOSTIF/STIM/CLINT/PLIC)
 │   ├── fabric/
 │   │   ├── axi4_if.sv            # AXI4 interface definitions
 │   │   ├── axi4_master.sv        # Core-side AXI4 master bridge
-│   │   └── axi4_decoder.sv       # AXI4 address decoder
-│   ├── clint/  plic/  debug/     # (EMPTY, future)
+│   │   └── axi4_decoder.sv       # AXI4 address decoder (chained for MMIO)
+│   ├── clint/clint.sv            # CLINT: msip/mtimecmp/mtime (IMPLEMENTED)
+│   ├── plic/plic.sv              # 64-source PLIC, M+S contexts (IMPLEMENTED)
+│   ├── debug/                    # (EMPTY, future)
 └── lib/                           # Common libraries (EMPTY, future)
 ```
 
@@ -287,9 +303,10 @@ rv64gch_core.sv
 
 ```
 rv64gch_top.sv
-├── core/rv64gch_core.sv
-├── fabric/axi4_* (interconnect)
-├── (verification) axi4_dram_model + axi4_hostif_model
+├── core/rv64gch_core.sv (now with precise interrupt take)
+├── soc/clint/clint.sv + soc/plic/plic.sv (MMIO-mapped IRQs)
+├── fabric/axi4_* (interconnect, chained MMIO decoders)
+├── (verification) axi4_dram_model + axi4_hostif_model + axi4_stim_model
 ```
 
 ### Planned Memory Hierarchy (single shared bus — no separate VPU interface)

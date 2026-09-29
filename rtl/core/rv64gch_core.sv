@@ -1927,15 +1927,17 @@ module rv64gch_core #(
     .csr_op(wb_pkt.ctrl.csr_op),
     .csr_rs1(wb_pkt.ctrl.rs1),
     .csr_rdata(csr_rdata),
-    .trap_pc(ex_pkt.pc),
+    .trap_pc(irq_fire ? pc_d : ex_pkt.pc),
     .cause(cause), .trap(trap),
-    .tval_valid(trap_is_fault), .tval(trap_tval),
+    .tval_valid(trap_is_fault & ~irq_fire), .tval(trap_tval),
     .mret(wb_pkt.ctrl.is_mret), .sret(wb_pkt.ctrl.is_sret),
     .ex_mret_i(ex_pkt.valid & ex_pkt.ctrl.is_mret),
     .ex_sret_i(ex_pkt.valid & ex_pkt.ctrl.is_sret),
     .epc(epc), .tvec(tvec),    .new_priv(new_priv),
     .timer_irq(timer_irq), .soft_irq(soft_irq), .ext_irq(ext_irq),
     .irq_pending(irq_pending),
+    .irq_take_o(irq_take_o), .irq_cause_o(irq_cause_o),
+    .trap_irq_i(irq_fire),
     .fi_we(), .fs_mstatus(),
     .fcsr_fflags_we(fcsr_fflags_we),
     .fcsr_fflags_in(wb_pkt.fflags),
@@ -1948,7 +1950,7 @@ module rv64gch_core #(
   );
 
   // Fault plumbing for mtval: fetch bubble carries its VA, data faults
-  // use the faulting EX virtual address.
+  // use the faulting EX virtual address. Interrupts record tval 0.
   logic       trap_is_fault;
   logic [63:0] trap_tval;
   assign trap_is_fault = (ex_pkt.valid & ex_pkt.fault_f) | data_fault;
@@ -1959,22 +1961,38 @@ module rv64gch_core #(
   assign data_fault = ex_mem_valid & mmu_fault_d;
   assign data_cause = mmu_cause_d;
 
+  // Precise interrupt take at an instruction boundary: the backend holds
+  // only older instructions, so once it drains the next insn (D head) can
+  // trap with mepc pointing at it (mret resumes it). Fires through
+  // frontend holds (the waiter re-executes after mret); a pending fetch
+  // fault bubble keeps seniority (sync first). Sync traps can't coincide
+  // (they need EX valid, but the backend is empty here).
+  logic       irq_take_o, irq_fire;
+  logic [4:0] irq_cause_o;
+  logic       backend_empty;
+  assign backend_empty = ~ex_pkt.valid & ~mem_pkt.valid;
+  assign irq_fire = irq_take_o & backend_empty & valid_d & ~fault_d;
+
+  logic       sync_trap;
+  logic [4:0] sync_cause;
   always_comb begin
-    trap = 1'b0; cause = 4'd0;
+    sync_trap = 1'b0; sync_cause = 4'd0;
     if (ex_pkt.valid) begin
       if (ex_pkt.fault_f) begin
-        trap = 1'b1; cause = ex_pkt.fcause;
+        sync_trap = 1'b1; sync_cause = ex_pkt.fcause;
       end else if (ex_pkt.ctrl.illegal) begin
-        trap = 1'b1; cause = CAUSE_ILLEGAL_INSN;
+        sync_trap = 1'b1; sync_cause = CAUSE_ILLEGAL_INSN;
       end else if (ex_pkt.ctrl.is_ecall) begin
-        trap = 1'b1; cause = (priv == PRIV_M) ? CAUSE_M_ECALL :
+        sync_trap = 1'b1; sync_cause = (priv == PRIV_M) ? CAUSE_M_ECALL :
                               (priv == PRIV_S) ? CAUSE_SUP_ECALL : CAUSE_USER_ECALL;
       end else if (ex_pkt.ctrl.is_ebreak) begin
-        trap = 1'b1; cause = CAUSE_BREAKPOINT;
+        sync_trap = 1'b1; sync_cause = CAUSE_BREAKPOINT;
       end else if (data_fault) begin
-        trap = 1'b1; cause = data_cause;
+        sync_trap = 1'b1; sync_cause = data_cause;
       end
     end
   end
+  assign trap = sync_trap | irq_fire;
+  assign cause = irq_fire ? irq_cause_o : sync_cause;
 
 endmodule

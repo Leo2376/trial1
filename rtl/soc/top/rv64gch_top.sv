@@ -11,6 +11,8 @@ module rv64gch_top #(
   input  logic                msi_n_i,
   input  logic [1:0]          dbg_req_i,
   input  logic                dbg_halt_req_i,
+  // PLIC sources 1..64 (level; 0 unused). Board pads on ASIC.
+  input  logic [64:1]         plic_sources_i,
 
   output logic                core_active_o,
 
@@ -30,15 +32,15 @@ module rv64gch_top #(
 
   logic [31:0] dbg_pc;
   logic        timer_irq, soft_irq, ext_irq;
+  logic        plic_eip, plic_seip;
+  assign ext_irq = plic_eip | plic_seip;
   logic        fence_i_retire, sfence_retire, satp_we_retire, l1d_drain_busy;
   logic        ptw_req, ptw_we, ptw_ack, ptw_ready;
   logic [47:0] ptw_addr;
   logic [7:0]  ptw_be;
   logic [63:0] ptw_wdata, ptw_rdata;
 
-  assign timer_irq = 1'b0;
-  assign soft_irq  = 1'b0;
-  assign ext_irq   = 1'b0;
+  // (timer/soft/ext IRQs driven by CLINT/PLIC below)
 
   rv64gch_core #(.XLEN(XLEN)) u_core (
     .clk(clk), .rst_n(rst_n),
@@ -156,10 +158,45 @@ module rv64gch_top #(
     .size(4'd3), .lock(m2_lock),
     .rdata(axi_rdata), .ack(axi_ack), .ready(axi_ready), .err(axi_err),
     .idle_o(axi_idle),
-    .bus(mem)
+    .bus(axi_l2)
   );
 
   assign dmem_err  = axi_err;
   assign fetch_err = axi_err;
+
+  // SoC MMIO: CLINT + 64-source PLIC live inside the SoC (fixed map);
+  // anything else passes through to the board-level bus. Two chained
+  // 2-way decoders (the only shape axi4_decoder supports).
+  axi4_if axi_l2();
+  axi4_if axi_mid();
+  axi4_if clint_if();
+  axi4_if plic_if();
+
+  clint #(.BASE(CLINT_BASE)) u_clint (
+    .clk(clk), .rst_n(rst_n), .bus(clint_if),
+    .timer_irq_o(timer_irq), .soft_irq_o(soft_irq)
+  );
+
+  plic #(.NUM_SOURCES(64), .BASE(PLIC_BASE)) u_plic (
+    .clk(clk), .rst_n(rst_n), .bus(plic_if),
+    .sources_i(plic_sources_i),
+    .eip_o(plic_eip), .seip_o(plic_seip)
+  );
+
+  axi4_decoder #(
+    .ADDR_W(ADDR_W), .DATA_W(DATA_W), .ID_W(ID_W),
+    .BASE0(48'd0), .SIZE0(48'd0),
+    .BASE1(CLINT_BASE), .SIZE1(CLINT_TOP - CLINT_BASE)
+  ) u_dec_clint (
+    .m(axi_l2), .s0(axi_mid), .s1(clint_if)
+  );
+
+  axi4_decoder #(
+    .ADDR_W(ADDR_W), .DATA_W(DATA_W), .ID_W(ID_W),
+    .BASE0(48'd0), .SIZE0(48'd0),
+    .BASE1(PLIC_BASE), .SIZE1(PLIC_TOP - PLIC_BASE)
+  ) u_dec_plic (
+    .m(axi_mid), .s0(mem), .s1(plic_if)
+  );
 
 endmodule
