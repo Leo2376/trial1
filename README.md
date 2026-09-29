@@ -35,6 +35,9 @@ synthesis), not FPGA.
 | 64-source PLIC (priority/threshold/claim, M+S contexts) | **DONE** | plic_basic PASS |
 | RVV 1.0 vector engine | Not started | — |
 | IME 1.0 matrix extension | Not started | — |
+| LLC (1 MiB, shared) | Not started (only needed with VPU) | — |
+| Debug module / coherence dir | Not started (empty stubs) | — |
+| H extension | Not started | — |
 
 Current pipeline: 5-stage (F/D, EX, MEM, WB) in-order dual-issue with full
 hazard/forwarding for INT, FP and MDU; multi-cycle FPU (FADD/FSUB/FMUL
@@ -81,8 +84,8 @@ Jumps predict via BTB/RAS/JAL-early, verified against the resolved target.
    fetch/data arbiter + owner latch in `rv64gch_top` is gone; MMIO
    bypasses as uncacheable on both ports; `l2_wb.S` forces an L2 dirty
    eviction to DRAM and checks the refill byte-exact).
-   Memory hierarchy through L2 complete; remaining: LLC (only needed with
-   VPU traffic), then MMU.
+    Memory hierarchy through L2 complete; remaining: LLC (only needed with
+    VPU traffic, see 9).
 5. **MMU Sv39** — **DONE** (`rtl/mmu/mmu.sv`: shared 32-entry TLB, HW
    walker with 4K/2M/1G leaves + A/D updates, PIPT so both caches are
    untouched; S/U priv, satp/SFENCE.VMA, SUM/MXR/MPRV, faults 12/13/15 +
@@ -99,8 +102,7 @@ Jumps predict via BTB/RAS/JAL-early, verified against the resolved target.
    follow delegation (not hard M on trap). **ASID DONE**: per-entry tags,
    retire-time selective SFENCE (VA and/or ASID qualified, rs1/rs2==x0
    means all) with a fence-window freeze instead of drop
-   (`asid_test` proves isolation + VA-selective survival).
-   Remaining: **Sv48** (mode 9 currently WARLs to Bare).
+    (`asid_test` proves isolation + VA-selective survival; Sv48 in 6).
 6. **MMU (Sv48)** — **DONE**. Same engine parameterized: 36-bit VPN,
    level-3 start, 512G leaves (PPN[26:0] alignment), Sv48 canonical rule,
    mode-9 WARL accept. `sv48_basic` proves a 4-level data remap + PA
@@ -138,9 +140,25 @@ Jumps predict via BTB/RAS/JAL-early, verified against the resolved target.
    `software/tests/bpred_ras.S` covers nested RAS calls, a polymorphic
    indirect jump, and a backward loop. Remaining: none planned (no large
    global-history / tournament predictor).
-9. **RVV 1.0 (VLEN=256) + IME 1.0** — no separate VPU memory interface:
-   vector/matrix traffic arbitrates onto the same AXI4 bus/fabric as the
-   CPU (alongside LSU/fetch in `rv64gch_top`) and shares the L2/LLC chain.
+9. **Remaining work** (everything above is DONE and green):
+    - **RVV 1.0 (VLEN=256) + IME 1.0** — the last big RTL block, not
+      started: VPU decode (`vsew_lmul/`), vector regfile, lanes (`vlane/`),
+      load/store unit (`ldst/`, arbitrating onto the same AXI4 bus/fabric
+      as the CPU LSU/fetch, sharing the L2/LLC chain — no separate VPU
+      memory interface), matrix unit (`munit/`, shared VPU regfile).
+      Suggested order: scalar RVV (OPIVV/OPMVV ALU first), then
+      strided/indexed loads, then masking/chaining, then IME.
+    - **LLC (1 MiB, shared CPU+VPU)** — only needed once VPU traffic
+      exists; until then the L2 feeds AXI4/DRAM directly.
+    - **SoC stubs** — debug module (`rtl/soc/debug/`, RISC-V Debug Spec:
+      halt/resume/abstract access) and coherence directory
+      (`rtl/cache/coherence/`, needed only with DMA/VPU writers).
+    - **H extension** — planned, not started (hypervisor CSRs, 2-stage
+      translation, `hfence`, virtual interrupts).
+    - **Verification hardening** — extend the Unicorn lock-step cosim flow
+      to dual-issue/predictor paths; run the riscv-tests H-extension
+      suites when H lands. No open failures: full regression is green
+      (see line below).
 10. **SoC interrupts** — **DONE**. CLINT (`rtl/soc/clint/clint.sv`:
     msip/mtimecmp/mtime, timer = mtime>=mtimecmp, reset-parked max) and
     64-source PLIC (`rtl/soc/plic/plic.sv`: priority/threshold/claim per
@@ -151,7 +169,6 @@ Jumps predict via BTB/RAS/JAL-early, verified against the resolved target.
     mcause, mepc = next unissued insn) once the backend drains.
     `clint_timer` (mtimecmp + MTI trap + mepc/mip checks) and `plic_basic`
     (arbitration/threshold/claim/complete over sources 1/40/64) PASS.
-    Remaining SoC stubs: debug module, coherence directory.
 
 ## Verification Scheme
 
