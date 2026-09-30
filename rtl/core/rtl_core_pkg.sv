@@ -129,6 +129,7 @@ package rtl_core_pkg;
     logic        vec_is_load;  // 1 = load, 0 = store
     logic        vec_strided;  // 1 = strided (VA=base+i*stride, stride=x[rs2])
     logic        vec_indexed;  // 1 = indexed (VA=base+vs2[i], vs2=rs2 field)
+    logic        vec_masked;   // 1 = masked (vm=0: skip v0.mask==0 elems)
     logic        is_vset;      // vsetvli/vsetivli (EX computes vl, WB commits)
     logic        vset_ivli;    // AVL is zimm (rs1 field), not x[rs1]
     logic        vset_vill;    // unsupported vtype -> vill (vl=0, no trap)

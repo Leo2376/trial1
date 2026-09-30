@@ -876,27 +876,29 @@ module rv64gch_core #(
       OP_FPLOAD: begin
                   // RVV shares 0000111: funct3 e8/e16/e32/e64 (000/101/110/
                   // 111) is vector (FP uses 010/011 only). Skeleton: e8
-                  // unit-stride, strided and indexed, unmasked only; wider
-                  // EEW and segments reserved for later.
+                  // unit-stride, strided and indexed, masked (vm=0, v0)
+                  // and unmasked; wider EEW and segments reserved for later.
                   if ((f3 == 3'b000 || f3 == 3'b101 || f3 == 3'b110 ||
                        f3 == 3'b111)) begin
                     c.wb_sel = WB_NONE;
                     c.alu_op = ALU_NONE;
-                    if (f3 == 3'b000 && i[31:26] == 6'b000000 && i[25] &&
+                    if (f3 == 3'b000 && i[31:26] == 6'b000000 &&
                         i[24:20] == 5'd0) begin
-                      c.is_vec_mem = 1'b1;   // vle8.v vd,(rs1)
+                      c.is_vec_mem = 1'b1;   // vle8.v vd,(rs1)[,v0.t]
                       c.vec_is_load = 1'b1;
+                      c.vec_masked = ~i[25];
                     end else if (f3 == 3'b000 && i[31:28] == 4'b0000 &&
-                                 i[27:26] == 2'b10 && i[25]) begin
-                      c.is_vec_mem = 1'b1;   // vlse8.v vd,(rs1),rs2
+                                 i[27:26] == 2'b10) begin
+                      c.is_vec_mem = 1'b1;   // vlse8.v vd,(rs1),rs2[,v0.t]
                       c.vec_is_load = 1'b1;  // stride = x[rs2]
                       c.vec_strided = 1'b1;
+                      c.vec_masked = ~i[25];
                     end else if (f3 == 3'b000 && i[31:28] == 4'b0000 &&
-                                 (i[27:26] == 2'b01 || i[27:26] == 2'b11) &&
-                                 i[25]) begin
+                                 (i[27:26] == 2'b01 || i[27:26] == 2'b11)) begin
                       c.is_vec_mem = 1'b1;   // vluxei8/vloxei8 vd,(rs1),vs2
                       c.vec_is_load = 1'b1;  // index = vs2[i] (e8, zero-ext)
                       c.vec_indexed = 1'b1;
+                      c.vec_masked = ~i[25];
                     end else begin
                       c.illegal = 1'b1;
                     end
@@ -911,21 +913,23 @@ module rv64gch_core #(
                        f3 == 3'b111)) begin
                     c.wb_sel = WB_NONE;
                     c.alu_op = ALU_NONE;
-                    if (f3 == 3'b000 && i[31:26] == 6'b000000 && i[25] &&
+                    if (f3 == 3'b000 && i[31:26] == 6'b000000 &&
                         i[24:20] == 5'd0) begin
-                      c.is_vec_mem = 1'b1;   // vse8.v vs3,(rs1)
+                      c.is_vec_mem = 1'b1;   // vse8.v vs3,(rs1)[,v0.t]
                       c.vec_is_load = 1'b0;
+                      c.vec_masked = ~i[25];
                     end else if (f3 == 3'b000 && i[31:28] == 4'b0000 &&
-                                 i[27:26] == 2'b10 && i[25]) begin
-                      c.is_vec_mem = 1'b1;   // vsse8.v vs3,(rs1),rs2
+                                 i[27:26] == 2'b10) begin
+                      c.is_vec_mem = 1'b1;   // vsse8.v vs3,(rs1),rs2[,v0.t]
                       c.vec_is_load = 1'b0;  // stride = x[rs2]
                       c.vec_strided = 1'b1;
+                      c.vec_masked = ~i[25];
                     end else if (f3 == 3'b000 && i[31:28] == 4'b0000 &&
-                                 (i[27:26] == 2'b01 || i[27:26] == 2'b11) &&
-                                 i[25]) begin
+                                 (i[27:26] == 2'b01 || i[27:26] == 2'b11)) begin
                       c.is_vec_mem = 1'b1;   // vsuxei8/vsoxei8 vs3,(rs1),vs2
                       c.vec_is_load = 1'b0;  // index = vs2[i] (e8, zero-ext)
                       c.vec_indexed = 1'b1;
+                      c.vec_masked = ~i[25];
                     end else begin
                       c.illegal = 1'b1;
                     end
@@ -1993,6 +1997,9 @@ module rv64gch_core #(
   logic [4:0]  vrf_iaddr;
   logic [4:0]  vrf_iidx;
   logic [7:0]  vrf_idata;
+  logic [4:0]  vrf_maddr;
+  logic [4:0]  vrf_midx;
+  logic [7:0]  vrf_mdata;
   logic [7:0]  csr_vl, csr_vstart;
   logic [63:0] csr_vtype;
   assign vec_mem_active = mem_pkt.valid & mem_pkt.ctrl.is_vec_mem;
@@ -2000,6 +2007,7 @@ module rv64gch_core #(
     .clk(clk), .rst_n(rst_n),
     .raddr_i(vrf_raddr), .ridx_i(vrf_ridx), .rdata_o(vrf_rdata),
     .iaddr_i(vrf_iaddr), .iidx_i(vrf_iidx), .idata_o(vrf_idata),
+    .maddr_i(vrf_maddr), .midx_i(vrf_midx), .mdata_o(vrf_mdata),
     .waddr_i(vrf_waddr), .widx_i(vrf_widx), .wdata_i(vrf_wdata),
     .we_i(vrf_we)
   );
@@ -2011,12 +2019,15 @@ module rv64gch_core #(
     .stride_i(mem_pkt.rs2),   // x[rs2] latched at EX->MEM (backend holds)
     .is_indexed_i(mem_pkt.ctrl.vec_indexed),
     .vs2_i(mem_pkt.ctrl.rs2), // index vector reg number (rs2 field)
+    .masked_i(mem_pkt.ctrl.vec_masked),
     .base_va_i(mem_pkt.mem_addr), .vd_i(mem_pkt.ctrl.rd),
     .vl_i(csr_vl), .vstart_i(csr_vstart),
     .vrf_raddr_o(vrf_raddr), .vrf_ridx_o(vrf_ridx),
     .vrf_rdata_i(vrf_rdata),
     .vrf_iaddr_o(vrf_iaddr), .vrf_iidx_o(vrf_iidx),
     .vrf_idata_i(vrf_idata),
+    .vrf_maddr_o(vrf_maddr), .vrf_midx_o(vrf_midx),
+    .vrf_mdata_i(vrf_mdata),
     .vrf_waddr_o(vrf_waddr), .vrf_widx_o(vrf_widx),
     .vrf_wdata_o(vrf_wdata), .vrf_we_o(vrf_we),
     .mmu_va_o(vlsu_mmu_va), .mmu_rd_o(vlsu_mmu_rd),

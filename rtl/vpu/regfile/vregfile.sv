@@ -20,6 +20,11 @@ module vregfile #(
   input  logic [4:0]       iaddr_i,
   input  logic [4:0]       iidx_i,
   output logic [7:0]       idata_o,
+  // Mask port (v0 mask-bit source for vm=0 ops): combinational. A third
+  // port so masked indexed stores can read data + index + mask together.
+  input  logic [4:0]       maddr_i,
+  input  logic [4:0]       midx_i,
+  output logic [7:0]       mdata_o,
   // Write port (VLSU load-data sink): synchronous.
   input  logic [4:0]       waddr_i,
   input  logic [4:0]       widx_i,
@@ -31,6 +36,7 @@ module vregfile #(
 
   assign rdata_o = vrf[raddr_i][ridx_i];
   assign idata_o = vrf[iaddr_i][iidx_i];
+  assign mdata_o = vrf[maddr_i][midx_i];
 
   always_ff @(posedge clk) begin
     if (we_i)
