@@ -15,6 +15,11 @@ module vregfile #(
   input  logic [4:0]       raddr_i,
   input  logic [4:0]       ridx_i,   // byte element index (SEW=8)
   output logic [7:0]       rdata_o,
+  // Index port (indexed gather/scatter address source): combinational.
+  // A second port so indexed stores can read data + index together.
+  input  logic [4:0]       iaddr_i,
+  input  logic [4:0]       iidx_i,
+  output logic [7:0]       idata_o,
   // Write port (VLSU load-data sink): synchronous.
   input  logic [4:0]       waddr_i,
   input  logic [4:0]       widx_i,
@@ -25,6 +30,7 @@ module vregfile #(
   logic [7:0] vrf [NREG][VLEN_B];
 
   assign rdata_o = vrf[raddr_i][ridx_i];
+  assign idata_o = vrf[iaddr_i][iidx_i];
 
   always_ff @(posedge clk) begin
     if (we_i)

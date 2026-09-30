@@ -250,10 +250,16 @@ module mmu #(
   logic [63:0] walk_pte_q;
   logic        walk_virt_q;  // guest walk (VS-stage + G-stage)
   // Latched fault (cause + VA), cleared by a new walk or flush edge.
+  // fault_wr_q records the access type at latch time: a latched fault only
+  // matches a later access of the same type (load vs store select different
+  // page-fault causes). A type change forces a fresh walk, which re-latches
+  // the exact cause. (Exposed by back-to-back vector load/store faults to
+  // the same VA with no intervening SFENCE.)
   logic        fault_q;
   logic        fault_which_q;
   logic [4:0]  fault_cause_q;
   logic [63:0] fault_va_q;
+  logic        fault_wr_q;
   // Flush edges (retire pulses stretch across stalls; apply once).
   logic flush_all_d_q, flush_sel_d_q;
   // Selective clear mask (blocking): entries matching (va iff has_va,
@@ -271,11 +277,12 @@ module mmu #(
     end
   end
 
-  // Walker fault applies only to the VA it was raised for.
+  // Walker fault applies only to the VA it was raised for, with a live
+  // access of the same type (fault_wr_q agreement; see declaration note).
   logic fault_f_match, fault_d_match;
   assign fault_f_match = fault_q && !fault_which_q && (fault_va_q == va_f_i);
   assign fault_d_match = fault_q && fault_which_q && (fault_va_q == va_d_i) &&
-                         valid_d_i;
+                         valid_d_i && (fault_wr_q == wr_d_i);
 
   // Which port wants a walk (lookup missed incl. D-update, no fault)?
   // Data needs a live EX memory op; fetch is quasi-always needed.
@@ -387,7 +394,7 @@ module mmu #(
       resume_q <= 2'd0;
       g_level_q <= 2'd2; g_ppn_q <= '0; g_pte_q <= '0; g_va_q <= '0;
       fault_q <= 1'b0; fault_which_q <= 1'b0;
-      fault_cause_q <= '0; fault_va_q <= '0;
+      fault_cause_q <= '0; fault_va_q <= '0; fault_wr_q <= 1'b0;
       tlb_rr_q <= '0;
       tlb_valid <= '0;
       flush_all_d_q <= 1'b0;
@@ -436,6 +443,7 @@ module mmu #(
                   fault_cause_q <= wr_d_i ? CAUSE_STORE_GUEST_FAULT
                                            : CAUSE_LOAD_GUEST_FAULT;
                   fault_va_q    <= va_d_i;
+                  fault_wr_q    <= wr_d_i;
                 end else begin
                   wst <= WR_GREAD;
                 end
@@ -444,6 +452,7 @@ module mmu #(
                 fault_which_q <= 1'b1;
                 fault_cause_q <= CAUSE_LOAD_ACCESS;
                 fault_va_q    <= va_d_i;
+                fault_wr_q    <= wr_d_i;
               end else if (virt_i && g_enable) begin
                 // Guest VS walk: first VS PTE address is a GPA.
                 vs_gpa_q <= vs_pte_gpa(virt_i ? vsatp_ppn : satp_ppn,
@@ -482,6 +491,7 @@ module mmu #(
                   fault_which_q <= 1'b0;
                   fault_cause_q <= CAUSE_FETCH_GUEST_FAULT;
                   fault_va_q    <= va_f_i;
+                  fault_wr_q    <= 1'b0;
                 end else begin
                   wst <= WR_GREAD;
                 end
@@ -490,6 +500,7 @@ module mmu #(
                 fault_which_q <= 1'b0;
                 fault_cause_q <= CAUSE_FETCH_ACCESS;
                 fault_va_q    <= va_f_i;
+                fault_wr_q    <= 1'b0;
               end else if (virt_i && g_enable) begin
                 vs_gpa_q <= vs_pte_gpa(virt_i ? vsatp_ppn : satp_ppn,
                                        is_sv48 ? 2'd3 : 2'd2, va_f_i);
@@ -633,6 +644,7 @@ module mmu #(
               fault_q       <= 1'b1;
               fault_which_q <= walk_which_q;
               fault_va_q    <= walk_va_q;
+              fault_wr_q    <= walk_wr_q;
               wst           <= WR_IDLE;
             end
           end
@@ -804,6 +816,7 @@ module mmu #(
               fault_q       <= 1'b1;
               fault_which_q <= walk_which_q;
               fault_va_q    <= walk_va_q;
+              fault_wr_q    <= walk_wr_q;
               wst           <= WR_IDLE;
             end
           end

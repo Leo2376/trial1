@@ -34,7 +34,7 @@ synthesis), not FPGA.
 | CLINT (mtime/mtimecmp/msip) | **DONE** | clint_timer PASS |
 | 64-source PLIC (priority/threshold/claim, M+S contexts) | **DONE** | plic_basic PASS |
 | H extension v0.1 (HS/VS/VU, stage-2 walk, hfence, VS-IRQ) | **DONE (v0.1)** | h_basic PASS |
-| RVV 1.0 vector engine | **v0 DONE (vset + unit-stride/strided e8 ld/st via shared-path VLSU, precise fault/restart)** | v_basic + v_strided PASS |
+| RVV 1.0 vector engine | **v0 DONE (vset + unit/stride/indexed e8 ld/st via shared-path VLSU, precise fault/restart)** | v_basic + v_strided + v_indexed PASS |
 | IME 1.0 matrix extension | Not started | — |
 | LLC (1 MiB, shared) | Not started (only needed with VPU) | — |
 | Debug module / coherence dir | Not started (empty stubs) | — |
@@ -142,18 +142,22 @@ Jumps predict via BTB/RAS/JAL-early, verified against the resolved target.
    global-history / tournament predictor).
 9. **Remaining work** (everything above is DONE and green):
     - **RVV 1.0 (VLEN=256) + IME 1.0** — v0 skeleton **DONE**: `vsetvli`/
-      `vsetivli` (e8m1/ta,ma; rest vill), `vle8.v`/`vse8.v` unit-stride and
+      `vsetivli` (e8m1/ta,ma; rest vill), `vle8.v`/`vse8.v` unit-stride,
       `vlse8.v`/`vsse8.v` strided (VA=base+i*stride, stride=x[rs2],
-      negative strides OK) via `rtl/vpu/ldst/vlsu.sv` time-multiplexing
-      the CPU LSU data path (same MMU port + L1D beat, same AXI4/L2 chain
-      — no separate VPU interface), `rtl/vpu/regfile/vregfile.sv`
-      (32x32B, byte ports), vl/vtype/vstart CSRs + VS dirty, precise
-      per-element faults (vstart restart). `software/tests/v_basic.S`
-      proves config, 32B move, and a straddling load fault;
-      `software/tests/v_strided.S` proves stride-4/stride-1/stride-(-1)
-      moves, a load-sourced stride, and a straddling strided fault.
-      Next: indexed (gather/scatter), masking/chaining, OPIVV/OPMVV ALU,
-      wider SEW/LMUL; then IME (`munit/`, shared regfile).
+      negative strides OK) and `vluxei8`/`vloxei8`/`vsuxei8`/`vsoxei8`
+      indexed (VA=base+vs2[i], e8 zero-ext indices) via `rtl/vpu/ldst/
+      vlsu.sv` time-multiplexing the CPU LSU data path (same MMU port +
+      L1D beat, same AXI4/L2 chain — no separate VPU interface),
+      `rtl/vpu/regfile/vregfile.sv` (32x32B, data + index read ports),
+      vl/vtype/vstart CSRs + VS dirty, precise per-element faults (vstart
+      restart). `software/tests/v_basic.S` proves config, 32B move, and a
+      straddling load fault; `software/tests/v_strided.S` proves
+      stride-4/1/-1 moves, a load-sourced stride, and a straddling
+      strided fault; `software/tests/v_indexed.S` proves gather/scatter,
+      reversed indices, and a load-then-store fault pair to the same VA
+      (the pair caught a stale-cause MMU fault latch, now keyed on
+      access type). Next: masking/chaining, OPIVV/OPMVV ALU, wider
+      SEW/LMUL; then IME (`munit/`, shared regfile).
     - **LLC (1 MiB, shared CPU+VPU)** — only needed once VPU traffic
       exists; until then the L2 feeds AXI4/DRAM directly.
     - **SoC stubs** — debug module (`rtl/soc/debug/`, RISC-V Debug Spec:

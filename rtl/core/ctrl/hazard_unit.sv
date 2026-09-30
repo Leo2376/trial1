@@ -52,7 +52,8 @@ module hazard_unit #(
   // I-type immediates reuse the rs2 field for imm bits (never a reg).
   function automatic logic reads_rs2(input ctrl_t c);
     // RVV: strided vector ld/st read the stride from x[rs2]; unit-stride
-    // reads no int rs2 (the field is lumop/vm), vector data lives in VRF.
+    // reads no int rs2 (the field is lumop/vm), indexed reads vs2 from
+    // the VRF (never the int file), vector data lives in VRF.
     if (c.is_vec_mem)
       return c.vec_strided;
     if (c.is_fp)

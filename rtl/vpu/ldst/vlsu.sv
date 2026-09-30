@@ -5,9 +5,9 @@
 // port (VA/rd/wr/valid) and the L1D beat (req/we/addr/be/wdata) to the
 // VLSU and gates the scalar LSU off. One SEW=8 element per beat:
 //
-//   VA=base+i (unit) or VA=va_q+=stride (strided) -> wait TLB hit
-//   (walker stalls pipe via dtlb_miss, VLSU holds) -> latch PA ->
-//   mem beat -> ack -> next i (load: byte to VRF).
+//   VA=base+i (unit), va_q+=stride (strided) or base+vs2[i] (indexed)
+//   -> wait TLB hit (walker stalls pipe via dtlb_miss, VLSU holds) ->
+//   latch PA -> mem beat -> ack -> next i (load: byte to VRF).
 //
 // Faults are precise per element: the MMU fault cause is reported with
 // elem_idx_o so the core traps with vstart=i (restartable). Interrupts
@@ -26,6 +26,8 @@ module vlsu #(
   input  logic             is_load_i,
   input  logic             is_stride_i,  // vlse/vsse: VA advances by stride
   input  logic [63:0]      stride_i,     // byte stride (x[rs2], signed)
+  input  logic             is_indexed_i, // vluxei/vsuxei: VA=base+vs2[i]
+  input  logic [4:0]       vs2_i,        // index vector reg (rs2 field)
   input  logic [63:0]      base_va_i,
   input  logic [4:0]       vd_i,
   input  logic [7:0]       vl_i,
@@ -34,6 +36,9 @@ module vlsu #(
   output logic [4:0]       vrf_raddr_o,
   output logic [4:0]       vrf_ridx_o,
   input  logic [7:0]       vrf_rdata_i,
+  output logic [4:0]       vrf_iaddr_o,  // index source (vs2[i], e8)
+  output logic [4:0]       vrf_iidx_o,
+  input  logic [7:0]       vrf_idata_i,
   output logic [4:0]       vrf_waddr_o,
   output logic [4:0]       vrf_widx_o,
   output logic [7:0]       vrf_wdata_o,
@@ -79,11 +84,17 @@ module vlsu #(
   logic        pending_q;
 
   logic [63:0] va_cur;
-  // Unit: VA=base+i. Strided: running va_q (init skips vstart elements so a
-  // restart after a fault resumes at the right address, not base+vstart*i).
-  // All stride/stride-flag inputs ride the stable MEM packet (backend holds
+  // Unit: VA=base+i. Strided: running va_q (init skips vstart elements so
+  // a restart after a fault resumes at the right address). Indexed:
+  // VA=base+vs2[i] (e8 index, zero-extended; each element independent so
+  // restarts need no accumulator).
+  // All stride/index inputs ride the stable MEM packet (backend holds
   // while sequencing), so live use is safe. 8b vstart x 64b stride mult.
-  assign va_cur = is_stride_i ? va_q : (base_va_i + {56'd0, i_q});
+  assign vrf_iaddr_o = vs2_i;
+  assign vrf_iidx_o  = i_q[4:0];
+  assign va_cur = is_stride_i ? va_q :
+                  (is_indexed_i ? (base_va_i + {56'd0, vrf_idata_i}) :
+                                  (base_va_i + {56'd0, i_q}));
   assign elem_idx_o = i_q;
 
   // VRF: store source reads element i combinationally; load sink writes
