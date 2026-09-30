@@ -4,6 +4,12 @@ on:
   push:
   pull_request:
 
+# Pinned riscv-tests revision: floating master already drifted under us
+# once (rv64ua-only, harmless). This SHA is the exact revision the repo
+# is green against; bump deliberately after a local full green run.
+env:
+  RISCV_TESTS_REV: 87b04f07a51f57b134a935c6157222bbd35905d9
+
 jobs:
   isa:
     runs-on: ubuntu-latest
@@ -21,9 +27,12 @@ jobs:
           verilator --version
           riscv64-unknown-elf-gcc --version
 
-      - name: Fetch riscv-tests ISA sources
+      - name: Fetch riscv-tests ISA sources (pinned)
         run: |
-          git clone --depth 1 https://github.com/riscv-software-src/riscv-tests.git /tmp/riscv-tests
+          git init /tmp/riscv-tests && cd /tmp/riscv-tests
+          git remote add origin https://github.com/riscv-software-src/riscv-tests.git
+          git fetch --depth 1 origin "$RISCV_TESTS_REV" && git checkout "$RISCV_TESTS_REV"
+          git log -1 --format="%H %ad"
           ls /tmp/riscv-tests/isa/${{ matrix.ext }} | head
 
       - name: Build Verilator simulator
