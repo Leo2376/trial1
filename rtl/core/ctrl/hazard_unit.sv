@@ -51,6 +51,10 @@ module hazard_unit #(
   // Integer rs2 readers: R-type ALU, store/AMO data, branches.
   // I-type immediates reuse the rs2 field for imm bits (never a reg).
   function automatic logic reads_rs2(input ctrl_t c);
+    // RVV: strided vector ld/st read the stride from x[rs2]; unit-stride
+    // reads no int rs2 (the field is lumop/vm), vector data lives in VRF.
+    if (c.is_vec_mem)
+      return c.vec_strided;
     if (c.is_fp)
       return 1'b0;
     if (c.opcode == OP_OP || c.opcode == OP_OP32)

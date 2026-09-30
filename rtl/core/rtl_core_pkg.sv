@@ -124,9 +124,10 @@ package rtl_core_pkg;
     logic        is_sfence;
     logic        is_hfence_vvma;
     logic        is_hfence_gvma;
-    // RVV skeleton (shared-path VLSU): unit-stride e8 + vsetvli only.
-    logic        is_vec_mem;   // vle/vse (flows to MEM, sequenced by VLSU)
-    logic        vec_is_load;  // 1 = vle, 0 = vse
+    // RVV skeleton (shared-path VLSU): e8 unit-stride + strided, vsetvli.
+    logic        is_vec_mem;   // vle/vse/vlse/vsse (MEM-sequenced by VLSU)
+    logic        vec_is_load;  // 1 = load, 0 = store
+    logic        vec_strided;  // 1 = strided (VA=base+i*stride, stride=x[rs2])
     logic        is_vset;      // vsetvli/vsetivli (EX computes vl, WB commits)
     logic        vset_ivli;    // AVL is zimm (rs1 field), not x[rs1]
     logic        vset_vill;    // unsupported vtype -> vill (vl=0, no trap)

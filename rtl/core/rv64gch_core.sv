@@ -875,16 +875,22 @@ module rv64gch_core #(
                   endcase end
       OP_FPLOAD: begin
                   // RVV shares 0000111: funct3 e8/e16/e32/e64 (000/101/110/
-                  // 111) is vector (FP uses 010/011 only). Skeleton: vle8
-                  // unit-stride unmasked only; wider EEW reserved for later.
+                  // 111) is vector (FP uses 010/011 only). Skeleton: e8
+                  // unit-stride and strided, unmasked only; wider EEW,
+                  // indexed and segments reserved for later.
                   if ((f3 == 3'b000 || f3 == 3'b101 || f3 == 3'b110 ||
                        f3 == 3'b111)) begin
                     c.wb_sel = WB_NONE;
                     c.alu_op = ALU_NONE;
-                    if (f3 == 3'b000 && i[27:26] == 2'b00 && i[25] &&
+                    if (f3 == 3'b000 && i[31:26] == 6'b000000 && i[25] &&
                         i[24:20] == 5'd0) begin
                       c.is_vec_mem = 1'b1;   // vle8.v vd,(rs1)
                       c.vec_is_load = 1'b1;
+                    end else if (f3 == 3'b000 && i[31:28] == 4'b0000 &&
+                                 i[27:26] == 2'b10 && i[25]) begin
+                      c.is_vec_mem = 1'b1;   // vlse8.v vd,(rs1),rs2
+                      c.vec_is_load = 1'b1;  // stride = x[rs2]
+                      c.vec_strided = 1'b1;
                     end else begin
                       c.illegal = 1'b1;
                     end
@@ -899,10 +905,15 @@ module rv64gch_core #(
                        f3 == 3'b111)) begin
                     c.wb_sel = WB_NONE;
                     c.alu_op = ALU_NONE;
-                    if (f3 == 3'b000 && i[27:26] == 2'b00 && i[25] &&
+                    if (f3 == 3'b000 && i[31:26] == 6'b000000 && i[25] &&
                         i[24:20] == 5'd0) begin
                       c.is_vec_mem = 1'b1;   // vse8.v vs3,(rs1)
                       c.vec_is_load = 1'b0;
+                    end else if (f3 == 3'b000 && i[31:28] == 4'b0000 &&
+                                 i[27:26] == 2'b10 && i[25]) begin
+                      c.is_vec_mem = 1'b1;   // vsse8.v vs3,(rs1),rs2
+                      c.vec_is_load = 1'b0;  // stride = x[rs2]
+                      c.vec_strided = 1'b1;
                     end else begin
                       c.illegal = 1'b1;
                     end
@@ -1980,6 +1991,8 @@ module rv64gch_core #(
     .clk(clk), .rst_n(rst_n),
     .active_i(vec_mem_active), .trap_i(trap),
     .is_load_i(mem_pkt.ctrl.vec_is_load),
+    .is_stride_i(mem_pkt.ctrl.vec_strided),
+    .stride_i(mem_pkt.rs2),   // x[rs2] latched at EX->MEM (backend holds)
     .base_va_i(mem_pkt.mem_addr), .vd_i(mem_pkt.ctrl.rd),
     .vl_i(csr_vl), .vstart_i(csr_vstart),
     .vrf_raddr_o(vrf_raddr), .vrf_ridx_o(vrf_ridx),
