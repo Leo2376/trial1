@@ -130,6 +130,8 @@ package rtl_core_pkg;
     logic        vec_strided;  // 1 = strided (VA=base+i*stride, stride=x[rs2])
     logic        vec_indexed;  // 1 = indexed (VA=base+vs2[i], vs2=rs2 field)
     logic        vec_masked;   // 1 = masked (vm=0: skip v0.mask==0 elems)
+    logic        is_vec_alu;   // OPIVV/OPMVV ALU (MEM-sequenced by VALU)
+    logic [5:0]  vec_aluop;    // ALU funct6 (rs1=vs1, rs2=vs2 numbers)
     logic        is_vset;      // vsetvli/vsetivli (EX computes vl, WB commits)
     logic        vset_ivli;    // AVL is zimm (rs1 field), not x[rs1]
     logic        vset_vill;    // unsupported vtype -> vill (vl=0, no trap)
@@ -158,6 +160,10 @@ package rtl_core_pkg;
   localparam int VLMAX = 32;
   // Supported vtypei (ma=1,ta=1,sew=000,lmul=000); anything else -> vill.
   localparam logic [10:0] VTYPEI_E8M1 = 11'h0C0;
+  // OPIVV funct6 (OP-V funct3=000), incl. vmv.v.v (funct6=010111).
+  localparam logic [5:0] VALU_ADD = 6'b000000, VALU_SUB  = 6'b000010,
+                         VALU_AND = 6'b001001, VALU_OR   = 6'b001010,
+                         VALU_XOR = 6'b001011, VALU_COPY = 6'b010111;
 
   localparam logic [11:0] CSR_VSTART=12'h008,
     CSR_VL=12'hC20, CSR_VTYPE=12'hC21;
@@ -204,7 +210,7 @@ package rtl_core_pkg;
   // never forward into lane B (see laneA_writes_int use in the core).
   function automatic logic is_simple_alu_op(input ctrl_t c);
     if (c.illegal) return 1'b0;
-    if (c.is_vec_mem | c.is_vset) return 1'b0; // RVV: lane-A single
+    if (c.is_vec_mem | c.is_vec_alu | c.is_vset) return 1'b0; // RVV: single
     if (c.fpu_op != FPU_NONE) return 1'b0;
     if (c.lsu_op != LSU_NONE) return 1'b0;
     if (c.is_branch | c.is_jal | c.is_jalr) return 1'b0;
@@ -223,7 +229,7 @@ package rtl_core_pkg;
 
   function automatic logic is_long_alu_op(input ctrl_t c);
     if (c.illegal) return 1'b0;
-    if (c.is_vec_mem | c.is_vset) return 1'b0; // RVV: lane-A single
+    if (c.is_vec_mem | c.is_vec_alu | c.is_vset) return 1'b0; // RVV: single
     if (c.lsu_op != LSU_NONE) return 1'b0;
     if (c.is_branch | c.is_jal | c.is_jalr) return 1'b0;
     if (c.reads_csr | c.writes_csr) return 1'b0;

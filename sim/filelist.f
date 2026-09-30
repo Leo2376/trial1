@@ -14,6 +14,7 @@
 ../../rtl/core/lsu/lsu.sv
 ../../rtl/vpu/regfile/vregfile.sv
 ../../rtl/vpu/ldst/vlsu.sv
+../../rtl/vpu/vlane/valu.sv
 ../../rtl/soc/fabric/axi4_master.sv
 ../../rtl/soc/clint/clint.sv
 ../../rtl/soc/plic/plic.sv

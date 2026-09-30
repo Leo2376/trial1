@@ -20,4 +20,5 @@
 ../rtl/core/lsu/lsu.sv
 ../rtl/vpu/regfile/vregfile.sv
 ../rtl/vpu/ldst/vlsu.sv
+../rtl/vpu/vlane/valu.sv
 ../rtl/core/rv64gch_core.sv

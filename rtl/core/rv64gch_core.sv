@@ -944,11 +944,21 @@ module rv64gch_core #(
                   // bits[31:20]) / vsetivli (bits[31:30]==11 marker, vtype in
                   // bits[29:20], AVL zimm in rs1 field). Supported vtype is
                   // e8m1/ta,ma only; anything else sets vill (vl=0, no trap).
-                  // Remaining OP-V (vector ALU, later) is illegal for now.
+                  // OPIVV (funct3=000): e8 add/sub/and/or/xor (vd=vs2[]vs1)
+                  // and vmv.v.v (funct6=010111: vd=vs1 copy). vm (bit 25)
+                  // masks via v0 on all of them. Remaining OP-V (OPMVV/
+                  // OPFVV/widening/mul/div/compare/slide/...) is illegal.
                   // NOTE: OP-V is 1010111, distinct from OP-FP 1010011.
                   c.wb_sel = WB_NONE;
                   c.alu_op = ALU_NONE;
-                  if (f3 == 3'b111 && i[31:30] == 2'b11) begin
+                  if (f3 == 3'b000 &&
+                      (i[31:26] == VALU_ADD || i[31:26] == VALU_SUB ||
+                       i[31:26] == VALU_AND || i[31:26] == VALU_OR ||
+                       i[31:26] == VALU_XOR || i[31:26] == VALU_COPY)) begin
+                    c.is_vec_alu = 1'b1;      // vd[i] = vs2[i] op vs1[i]
+                    c.vec_aluop = i[31:26];   // (COPY: vd[i] = vs1[i])
+                    c.vec_masked = ~i[25];
+                  end else if (f3 == 3'b111 && i[31:30] == 2'b11) begin
                     c.is_vset = 1'b1; c.vset_ivli = 1'b1;
                     c.vtypei = {1'b0, i[29:20]};
                     c.vset_vill = (i[29:20] != VTYPEI_E8M1[9:0]);
@@ -1276,11 +1286,12 @@ module rv64gch_core #(
                         ((ex_pkt.valid & ex_pkt.ctrl.writes_csr) |
                          (mem_pkt.valid & mem_pkt.ctrl.writes_csr) |
                          (wb_pkt.valid & wb_pkt.ctrl.writes_csr));
-  // RVV: a vector ld/st samples vl/vstart in MEM, so it waits in D until
-  // any older vset drains out of EX/MEM/WB (vl/vtype commit at WB retire).
-  // Frontend-only hold like xret_csr_wait (backend drains to resolve).
+  // RVV: a vector ld/st or ALU op samples vl/vstart in MEM, so it waits
+  // in D until any older vset drains out of EX/MEM/WB (vl/vtype commit
+  // at WB retire). Frontend-only hold like xret_csr_wait.
   logic vec_vset_wait;
-  assign vec_vset_wait = chk0_valid & chk0_ctrl.is_vec_mem &
+  assign vec_vset_wait = chk0_valid &
+                         (chk0_ctrl.is_vec_mem | chk0_ctrl.is_vec_alu) &
                          ((ex_pkt.valid & ex_pkt.ctrl.is_vset) |
                           (mem_pkt.valid & mem_pkt.ctrl.is_vset) |
                           (wb_pkt.valid & wb_pkt.ctrl.is_vset));
@@ -1296,13 +1307,17 @@ module rv64gch_core #(
                         ((ex_pkt.valid & ex_pkt.ctrl.is_vset) |
                          (mem_pkt.valid & mem_pkt.ctrl.is_vset) |
                          (wb_pkt.valid & wb_pkt.ctrl.is_vset));
-  // RVV: while the VLSU sequences elements the whole backend holds (like
-  // dtlb_miss); the fault cycle holds too so the faulting op never
-  // advances to WB (the trap flush clears MEM instead).
-  logic vec_mem_hold;
+  // RVV: while the VLSU or VALU sequences elements the whole backend
+  // holds (like dtlb_miss); the VLSU fault cycle holds too so the
+  // faulting op never advances to WB (the trap flush clears MEM instead).
+  // VALU cannot fault; its hold simply serializes vector ops (no VRF
+  // forwarding: an op always sees fully-retired vector state).
+  logic vec_mem_hold, vec_alu_hold, vec_hold;
   assign vec_mem_hold = vec_mem_active & ~vlsu_done;
+  assign vec_alu_hold = vec_alu_active & ~valu_done;
+  assign vec_hold = vec_mem_hold | vec_alu_hold;
   assign stall = stall_raw | frm_stall | xret_csr_wait | csr_raw_wait |
-                 vec_vset_wait | vec_csr_wait | vec_mem_hold |
+                 vec_vset_wait | vec_csr_wait | vec_hold |
                  drain_busy_i | dtlb_miss;
   // Backend drain gate: everything except a load-use / frm hold lets
   // EX/MEM/WB advance. Those holds freeze only the frontend (fetch/D/issue)
@@ -1311,7 +1326,7 @@ module rv64gch_core #(
   // waiter waits). Dense dual-fetch reaches these states deterministically.
   logic load_use_raw, backend_stall;
   assign backend_stall = (stall_raw & ~load_use_raw) |
-                         vec_mem_hold |
+                         vec_hold |
                          drain_busy_i | dtlb_miss;
   `ifdef CORE_DEBUG
   // Event-driven fetch tracing (scheduler-safe: fires only on handshakes).
@@ -1978,10 +1993,13 @@ module rv64gch_core #(
   // are still muxed for cleanliness.
   assign lsu_mem_we = lsu_mem_we_s;
 
-  // RVV v0 skeleton: vector regfile + shared-path VLSU. While a vector
-  // op occupies MEM the L1D beat serves the VLSU element; the scalar LSU
-  // is idle then (see note above), so this mux is arbitration-free.
-  logic        vec_mem_active;
+  // RVV v0 skeleton: vector regfile + shared-path VLSU + VALU. While a
+  // vector op occupies MEM the VRF ports serve that unit (VLSU element
+  // memory vs VALU compute); the scalar LSU is idle then (see note
+  // above), so all muxes are arbitration-free. Only one unit is ever
+  // active (a single MEM packet), and both gate everything on their own
+  // active level, so the VRF mux defaults to the VALU side when idle.
+  logic        vec_mem_active, vec_alu_active;
   logic        vlsu_busy, vlsu_done, vlsu_fault, vlsu_beat;
   logic [7:0]  vlsu_idx;
   logic [63:0] vlsu_mmu_va;
@@ -1990,6 +2008,7 @@ module rv64gch_core #(
   logic [47:0] vlsu_mem_addr;
   logic [7:0]  vlsu_mem_be;
   logic [63:0] vlsu_mem_wdata;
+  logic        valu_busy, valu_done;
   logic [4:0]  vrf_raddr, vrf_waddr;
   logic [4:0]  vrf_ridx, vrf_widx;
   logic [7:0]  vrf_rdata, vrf_wdata;
@@ -2000,9 +2019,31 @@ module rv64gch_core #(
   logic [4:0]  vrf_maddr;
   logic [4:0]  vrf_midx;
   logic [7:0]  vrf_mdata;
+  // Unit-side VRF drives (muxed onto the single physical ports above).
+  logic [4:0]  vlsu_vrf_raddr, vlsu_vrf_waddr, vlsu_vrf_iaddr, vlsu_vrf_maddr;
+  logic [4:0]  vlsu_vrf_ridx, vlsu_vrf_widx, vlsu_vrf_iidx, vlsu_vrf_midx;
+  logic [7:0]  vlsu_vrf_wdata;
+  logic        vlsu_vrf_we;
+  logic [4:0]  valu_vrf_raddr, valu_vrf_waddr, valu_vrf_iaddr, valu_vrf_maddr;
+  logic [4:0]  valu_vrf_ridx, valu_vrf_widx, valu_vrf_iidx, valu_vrf_midx;
+  logic [7:0]  valu_vrf_wdata;
+  logic        valu_vrf_we;
   logic [7:0]  csr_vl, csr_vstart;
   logic [63:0] csr_vtype;
   assign vec_mem_active = mem_pkt.valid & mem_pkt.ctrl.is_vec_mem;
+  assign vec_alu_active = mem_pkt.valid & mem_pkt.ctrl.is_vec_alu;
+  // VRF port mux (combinational; idle side is don't-care, gated by each
+  // unit's own active level on we).
+  assign vrf_raddr = vec_mem_active ? vlsu_vrf_raddr : valu_vrf_raddr;
+  assign vrf_ridx  = vec_mem_active ? vlsu_vrf_ridx  : valu_vrf_ridx;
+  assign vrf_iaddr = vec_mem_active ? vlsu_vrf_iaddr : valu_vrf_iaddr;
+  assign vrf_iidx  = vec_mem_active ? vlsu_vrf_iidx  : valu_vrf_iidx;
+  assign vrf_maddr = vec_mem_active ? vlsu_vrf_maddr : valu_vrf_maddr;
+  assign vrf_midx  = vec_mem_active ? vlsu_vrf_midx  : valu_vrf_midx;
+  assign vrf_waddr = vec_mem_active ? vlsu_vrf_waddr : valu_vrf_waddr;
+  assign vrf_widx  = vec_mem_active ? vlsu_vrf_widx  : valu_vrf_widx;
+  assign vrf_wdata = vec_mem_active ? vlsu_vrf_wdata : valu_vrf_wdata;
+  assign vrf_we    = vec_mem_active ? vlsu_vrf_we    : valu_vrf_we;
   vregfile u_vregfile (
     .clk(clk), .rst_n(rst_n),
     .raddr_i(vrf_raddr), .ridx_i(vrf_ridx), .rdata_o(vrf_rdata),
@@ -2022,14 +2063,14 @@ module rv64gch_core #(
     .masked_i(mem_pkt.ctrl.vec_masked),
     .base_va_i(mem_pkt.mem_addr), .vd_i(mem_pkt.ctrl.rd),
     .vl_i(csr_vl), .vstart_i(csr_vstart),
-    .vrf_raddr_o(vrf_raddr), .vrf_ridx_o(vrf_ridx),
+    .vrf_raddr_o(vlsu_vrf_raddr), .vrf_ridx_o(vlsu_vrf_ridx),
     .vrf_rdata_i(vrf_rdata),
-    .vrf_iaddr_o(vrf_iaddr), .vrf_iidx_o(vrf_iidx),
+    .vrf_iaddr_o(vlsu_vrf_iaddr), .vrf_iidx_o(vlsu_vrf_iidx),
     .vrf_idata_i(vrf_idata),
-    .vrf_maddr_o(vrf_maddr), .vrf_midx_o(vrf_midx),
+    .vrf_maddr_o(vlsu_vrf_maddr), .vrf_midx_o(vlsu_vrf_midx),
     .vrf_mdata_i(vrf_mdata),
-    .vrf_waddr_o(vrf_waddr), .vrf_widx_o(vrf_widx),
-    .vrf_wdata_o(vrf_wdata), .vrf_we_o(vrf_we),
+    .vrf_waddr_o(vlsu_vrf_waddr), .vrf_widx_o(vlsu_vrf_widx),
+    .vrf_wdata_o(vlsu_vrf_wdata), .vrf_we_o(vlsu_vrf_we),
     .mmu_va_o(vlsu_mmu_va), .mmu_rd_o(vlsu_mmu_rd),
     .mmu_wr_o(vlsu_mmu_wr), .mmu_valid_o(vlsu_mmu_valid),
     .mmu_hit_i(mmu_hit_d), .mmu_pa_i(mmu_pa_d),
@@ -2042,6 +2083,25 @@ module rv64gch_core #(
     .fence_hold_i(vm_fence_active),
     .busy_o(vlsu_busy), .done_o(vlsu_done), .fault_o(vlsu_fault),
     .elem_idx_o(vlsu_idx), .beat_o(vlsu_beat)
+  );
+  valu u_valu (
+    .clk(clk), .rst_n(rst_n),
+    .active_i(vec_alu_active), .trap_i(trap),
+    .aluop_i(mem_pkt.ctrl.vec_aluop),
+    .vd_i(mem_pkt.ctrl.rd),
+    .vs1_i(mem_pkt.ctrl.rs1), // vector reg numbers (rs1/rs2 fields)
+    .vs2_i(mem_pkt.ctrl.rs2),
+    .masked_i(mem_pkt.ctrl.vec_masked),
+    .vl_i(csr_vl), .vstart_i(csr_vstart),
+    .vrf_raddr_o(valu_vrf_raddr), .vrf_ridx_o(valu_vrf_ridx),
+    .vrf_rdata_i(vrf_rdata),
+    .vrf_iaddr_o(valu_vrf_iaddr), .vrf_iidx_o(valu_vrf_iidx),
+    .vrf_idata_i(vrf_idata),
+    .vrf_maddr_o(valu_vrf_maddr), .vrf_midx_o(valu_vrf_midx),
+    .vrf_mdata_i(vrf_mdata),
+    .vrf_waddr_o(valu_vrf_waddr), .vrf_widx_o(valu_vrf_widx),
+    .vrf_wdata_o(valu_vrf_wdata), .vrf_we_o(valu_vrf_we),
+    .busy_o(valu_busy), .done_o(valu_done)
   );
   assign mem_req   = vec_mem_active ? vlsu_mem_req   : lsu_mem_req;
   assign mem_we    = vec_mem_active ? vlsu_mem_we    : lsu_mem_we_s;
@@ -2279,10 +2339,10 @@ module rv64gch_core #(
       end
     end
   end
-  // A younger EX trap is held off while the VLSU sequences (the older
-  // vector op must complete or fault first -- precise-trap order); the
-  // vector fault itself traps with the MMU cause (it is the oldest).
-  assign trap = (sync_trap & ~vec_mem_hold) | irq_fire | vec_fault;
+  // A younger EX trap is held off while the VLSU/VALU sequences (the
+  // older vector op must complete or fault first -- precise-trap order);
+  // the vector fault itself traps with the MMU cause (it is the oldest).
+  assign trap = (sync_trap & ~vec_hold) | irq_fire | vec_fault;
   assign cause = irq_fire ? irq_cause_o :
                  (vec_fault ? data_cause : sync_cause);
 

@@ -34,7 +34,7 @@ synthesis), not FPGA.
 | CLINT (mtime/mtimecmp/msip) | **DONE** | clint_timer PASS |
 | 64-source PLIC (priority/threshold/claim, M+S contexts) | **DONE** | plic_basic PASS |
 | H extension v0.1 (HS/VS/VU, stage-2 walk, hfence, VS-IRQ) | **DONE (v0.1)** | h_basic PASS |
-| RVV 1.0 vector engine | **v0 DONE (vset + unit/stride/indexed e8 ld/st, masked+unmasked, via shared-path VLSU, precise fault/restart)** | v_basic + v_strided + v_indexed + v_masked PASS |
+| RVV 1.0 vector engine | **v0 DONE (vset + e8 ld/st unit/stride/indexed, masked+unmasked, OPIVV ALU + vmv, precise fault/restart)** | v_basic + v_strided + v_indexed + v_masked + v_alu PASS |
 | IME 1.0 matrix extension | Not started | — |
 | LLC (1 MiB, shared) | Not started (only needed with VPU) | — |
 | Debug module / coherence dir | Not started (empty stubs) | — |
@@ -160,8 +160,14 @@ Jumps predict via BTB/RAS/JAL-early, verified against the resolved target.
       (the pair caught a stale-cause MMU fault latch, now keyed on
       access type); `software/tests/v_masked.S` proves masked unit/
       strided/indexed moves with undisturbed semantics and fault
-      avoidance over an unmapped element. Next: OPIVV/OPMVV ALU, wider
-      SEW/LMUL; then IME (`munit/`, shared regfile).
+      avoidance over an unmapped element. First compute is in:
+      `rtl/vpu/vlane/valu.sv` (element-serial e8 OPIVV add/sub/and/or/
+      xor + `vmv.v.v`, masked and unmasked, occupying MEM under the same
+      hold that serializes vector ops — no VRF forwarding needed);
+      `software/tests/v_alu.S` proves all six ops, wrap/identity
+      properties, and masked add (it also caught `vmv.v.v` living in
+      OPIVV/funct6, not OPMVV). Next: more ALU (min/max/mul/compare/
+      slides), wider SEW/LMUL; then IME (`munit/`, shared regfile).
     - **LLC (1 MiB, shared CPU+VPU)** — only needed once VPU traffic
       exists; until then the L2 feeds AXI4/DRAM directly.
     - **SoC stubs** — debug module (`rtl/soc/debug/`, RISC-V Debug Spec:
