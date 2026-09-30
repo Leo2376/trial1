@@ -34,7 +34,7 @@ synthesis), not FPGA.
 | CLINT (mtime/mtimecmp/msip) | **DONE** | clint_timer PASS |
 | 64-source PLIC (priority/threshold/claim, M+S contexts) | **DONE** | plic_basic PASS |
 | H extension v0.1 (HS/VS/VU, stage-2 walk, hfence, VS-IRQ) | **DONE (v0.1)** | h_basic PASS |
-| RVV 1.0 vector engine | Not started | — |
+| RVV 1.0 vector engine | **v0 DONE (vsetvli/vsetivli + vle8/vse8 unit-stride via shared-path VLSU, precise fault/restart)** | v_basic PASS |
 | IME 1.0 matrix extension | Not started | — |
 | LLC (1 MiB, shared) | Not started (only needed with VPU) | — |
 | Debug module / coherence dir | Not started (empty stubs) | — |
@@ -141,13 +141,15 @@ Jumps predict via BTB/RAS/JAL-early, verified against the resolved target.
    indirect jump, and a backward loop. Remaining: none planned (no large
    global-history / tournament predictor).
 9. **Remaining work** (everything above is DONE and green):
-    - **RVV 1.0 (VLEN=256) + IME 1.0** — the last big RTL block, not
-      started: VPU decode (`vsew_lmul/`), vector regfile, lanes (`vlane/`),
-      load/store unit (`ldst/`, arbitrating onto the same AXI4 bus/fabric
-      as the CPU LSU/fetch, sharing the L2/LLC chain — no separate VPU
-      memory interface), matrix unit (`munit/`, shared VPU regfile).
-      Suggested order: scalar RVV (OPIVV/OPMVV ALU first), then
-      strided/indexed loads, then masking/chaining, then IME.
+    - **RVV 1.0 (VLEN=256) + IME 1.0** — v0 skeleton **DONE**: `vsetvli`/
+      `vsetivli` (e8m1/ta,ma; rest vill), `vle8.v`/`vse8.v` unit-stride
+      unmasked via `rtl/vpu/ldst/vlsu.sv` time-multiplexing the CPU LSU data
+      path (same MMU port + L1D beat, same AXI4/L2 chain — no separate VPU
+      interface), `rtl/vpu/regfile/vregfile.sv` (32x32B, byte ports),
+      vl/vtype/vstart CSRs + VS dirty, precise per-element faults (vstart
+      restart). `software/tests/v_basic.S` proves config, 32B move, and a
+      straddling load fault. Next: strided/indexed, masking/chaining,
+      OPIVV/OPMVV ALU, wider SEW/LMUL; then IME (`munit/`, shared regfile).
     - **LLC (1 MiB, shared CPU+VPU)** — only needed once VPU traffic
       exists; until then the L2 feeds AXI4/DRAM directly.
     - **SoC stubs** — debug module (`rtl/soc/debug/`, RISC-V Debug Spec:

@@ -24,6 +24,7 @@ package rtl_core_pkg;
   localparam opcode_t OP_FPLOAD  = 7'b0000111;
   localparam opcode_t OP_FPSTORE = 7'b0100111;
   localparam opcode_t OP_FPOP     = 7'b1010011;
+  localparam opcode_t OP_V        = 7'b1010111; // RVV: vsetvli/vsetivli (OPCFG) + vector ALU (later)
   localparam opcode_t OP_FMADD    = 7'b1000011;
   localparam opcode_t OP_FMSUB    = 7'b1000111;
   localparam opcode_t OP_FNMSUB   = 7'b1001011;
@@ -123,6 +124,13 @@ package rtl_core_pkg;
     logic        is_sfence;
     logic        is_hfence_vvma;
     logic        is_hfence_gvma;
+    // RVV skeleton (shared-path VLSU): unit-stride e8 + vsetvli only.
+    logic        is_vec_mem;   // vle/vse (flows to MEM, sequenced by VLSU)
+    logic        vec_is_load;  // 1 = vle, 0 = vse
+    logic        is_vset;      // vsetvli/vsetivli (EX computes vl, WB commits)
+    logic        vset_ivli;    // AVL is zimm (rs1 field), not x[rs1]
+    logic        vset_vill;    // unsupported vtype -> vill (vl=0, no trap)
+    logic [10:0] vtypei;       // vtype immediate (vsetvli [31:20], ivli [29:20])
     logic        is_ebreak;
     logic        is_ecall;
     logic        is_mret;
@@ -142,6 +150,14 @@ package rtl_core_pkg;
   localparam logic [4:0] FF_NV = 5'b10000, FF_DZ = 5'b01000, FF_OF = 5'b00100,
                         FF_UF = 5'b00010, FF_NX = 5'b00001;
 
+  // RVV v0 skeleton: VLEN=256, SEW=8/LMUL=1 only -> VLMAX=32.
+  localparam int VLEN = 256;
+  localparam int VLMAX = 32;
+  // Supported vtypei (ma=1,ta=1,sew=000,lmul=000); anything else -> vill.
+  localparam logic [10:0] VTYPEI_E8M1 = 11'h0C0;
+
+  localparam logic [11:0] CSR_VSTART=12'h008,
+    CSR_VL=12'hC20, CSR_VTYPE=12'hC21;
   localparam logic [11:0] CSR_MSTATUS=12'h300, CSR_MISA=12'h301, CSR_MEDELEG=12'h302,
     CSR_MIDELEG=12'h303, CSR_MIE=12'h304,
     CSR_MTVEC=12'h305, CSR_MSCRATCH=12'h340, CSR_MEPC=12'h341, CSR_MCAUSE=12'h342,
@@ -185,6 +201,7 @@ package rtl_core_pkg;
   // never forward into lane B (see laneA_writes_int use in the core).
   function automatic logic is_simple_alu_op(input ctrl_t c);
     if (c.illegal) return 1'b0;
+    if (c.is_vec_mem | c.is_vset) return 1'b0; // RVV: lane-A single
     if (c.fpu_op != FPU_NONE) return 1'b0;
     if (c.lsu_op != LSU_NONE) return 1'b0;
     if (c.is_branch | c.is_jal | c.is_jalr) return 1'b0;
@@ -203,6 +220,7 @@ package rtl_core_pkg;
 
   function automatic logic is_long_alu_op(input ctrl_t c);
     if (c.illegal) return 1'b0;
+    if (c.is_vec_mem | c.is_vset) return 1'b0; // RVV: lane-A single
     if (c.lsu_op != LSU_NONE) return 1'b0;
     if (c.is_branch | c.is_jal | c.is_jalr) return 1'b0;
     if (c.reads_csr | c.writes_csr) return 1'b0;

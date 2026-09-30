@@ -28,6 +28,12 @@ module hazard_unit #(
   // jalr, AMO/LR/SC, register-form CSR ops, and int-source FP ops
   // (FCVT.W/D.X, FMV.W.X/D.X). LUI/AUIPC/JAL and imm-CSR read no int reg.
   function automatic logic reads_rs1(input ctrl_t c);
+    // RVV: vector ld/st read the base (rs1); vsetvli reads AVL (rs1)
+    // while vsetivli takes its uimm from the rs1 field (no reg read).
+    if (c.is_vec_mem)
+      return 1'b1;
+    if (c.is_vset)
+      return ~c.vset_ivli;
     if (c.is_fp)
       return (c.fpu_op == FPU_I2F) | (c.fpu_op == FPU_MV_X2F);
     if (c.opcode == OP_OP || c.opcode == OP_OPIMM ||

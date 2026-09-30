@@ -62,7 +62,17 @@ module csr_unit #(
   output logic              trap_to_vs_o,
   output logic [1:0]        new_virt_priv_o,
   output logic              new_virt_o,
-  output logic [XLEN-1:0]   hstatus_o
+  output logic [XLEN-1:0]   hstatus_o,
+  // RVV v0: vset retire commit + vector-fault vstart + state readback.
+  input  logic              vset_we_i,
+  input  logic [7:0]        vset_vl_i,
+  input  logic [10:0]       vset_vtype_i,
+  input  logic              vset_vill_i,
+  input  logic              vec_trap_i,
+  input  logic [7:0]        vec_idx_i,
+  output logic [7:0]        vl_o,
+  output logic [63:0]       vtype_o,
+  output logic [7:0]        vstart_o
 );
   import rtl_core_pkg::*;
 
@@ -75,6 +85,9 @@ module csr_unit #(
   logic [XLEN-1:0] htval, htinst, hgatp, hvip;
   logic [XLEN-1:0] vsstatus, vsie, vstvec, vsscratch, vsepc, vscause, vstval;
   logic [XLEN-1:0] vsip, vsatp;
+  // RVV v0 skeleton state (SEW=8/LMUL=1 only; see vset commit below).
+  logic [7:0]  v_vstart, v_vl;
+  logic [63:0] v_vtype;
   // Delegation for the live trap input.
   // M-mode never delegates. Guest (V=1) traps consult hedeleg/hideleg
   // first (to VS); otherwise they fall to HS. HS/U (V=0) traps consult
@@ -173,8 +186,10 @@ module csr_unit #(
       // SSTATUS is a restricted view: FS[14:13]/XS[16:15]/SUM[18]/MXR[19]
       // live in mstatus and are overlaid here (sstatus flop holds the
       // S-only bits: SIE/SPIE/UBE/SPP/VS). UXL[33:32] hardwires to 2 (RV64).
-      CSR_SSTATUS:  v = ((sstatus & ~64'h0000_0003_000F_6000) |
-                         (mstatus & 64'h0000_0000_000F_6000)) |
+      // RVV: mstatus.VS[10:9] is aliased the same way (sstatus/vsstatus
+      // writes route through; vset sets Dirty).
+      CSR_SSTATUS:  v = ((sstatus & ~64'h0000_0003_000F_6600) |
+                         (mstatus & 64'h0000_0000_000F_6600)) |
                         64'h0000_0002_0000_0000;
       CSR_SATP:     v = satp;
       CSR_SIE:      v = sie;
@@ -198,8 +213,8 @@ module csr_unit #(
       CSR_HIP:      v = {hvip[63:11], 1'b0, hvip[9:7], 1'b0, hvip[5:3], 1'b0, hvip[1], 1'b0};
       CSR_HVIP:     v = hvip;
       CSR_HGEIP:    v = '0;
-      CSR_VSSTATUS: v = ((vsstatus & ~64'h0000_0003_000F_6000) |
-                         (mstatus & 64'h0000_0000_000F_6000)) |
+      CSR_VSSTATUS: v = ((vsstatus & ~64'h0000_0003_000F_6600) |
+                         (mstatus & 64'h0000_0000_000F_6600)) |
                         64'h0000_0002_0000_0000;
       CSR_VSIE:     v = vsie;
       CSR_VSTVEC:   v = vstvec;
@@ -209,6 +224,9 @@ module csr_unit #(
       CSR_VSTVAL:   v = vstval;
       CSR_VSIP:     v = vsip | (hvip & 64'h0000_0000_0000_0444);
       CSR_VSATP:    v = vsatp;
+      CSR_VSTART:   v = {56'd0, v_vstart};
+      CSR_VL:       v = {56'd0, v_vl};
+      CSR_VTYPE:    v = v_vtype;
       CSR_FCSR:     v = (fcsr & ~64'd31) |
                         (fcsr_fflags_we ? {59'd0, fcsr[4:0] | fcsr_fflags_in}
                                         : {59'd0, fcsr[4:0]});
@@ -236,6 +254,7 @@ module csr_unit #(
       hgatp <= '0; hvip <= '0;
       vsstatus <= '0; vsie <= '0; vstvec <= '0; vsscratch <= '0;
       vsepc <= '0; vscause <= '0; vstval <= '0; vsip <= '0; vsatp <= '0;
+      v_vstart <= '0; v_vl <= '0; v_vtype <= '0;
       mcycle   <= '0; minstret <= '0; fcsr <= '0;
       satp <= '0;
     end else begin
@@ -249,6 +268,12 @@ module csr_unit #(
       new_priv <= new_priv_comb;
       virt_q <= new_virt_comb;
       if (trap) begin
+        // RVV: a faulting vector op restarts at the faulting element.
+        // The vstart update dirties mstatus.VS like any vector state change.
+        if (vec_trap_i) begin
+          v_vstart <= {56'd0, vec_idx_i};
+          mstatus[10:9] <= 2'b11;
+        end
         if (trap_to_vs) begin
           vsepc   <= trap_pc;
           vscause <= {trap_irq_i, 58'd0, cause};
@@ -301,6 +326,19 @@ module csr_unit #(
           sstatus[5] <= 1'b1;  // SPIE = 1
           sstatus[8] <= 1'b0;  // SPP = U
         end
+      end else if (!flush && vset_we_i) begin
+        // RVV vsetvli/vsetivli retire: commit vl/vtype, reset vstart,
+        // mark mstatus.VS Dirty. vill (unsupported vtype): vl=0, vtype.vill.
+        v_vstart <= '0;
+        if (vset_vill_i) begin
+          v_vl    <= '0;
+          v_vtype <= {1'b1, 63'd0};
+        end else begin
+          v_vl    <= vset_vl_i;
+          v_vtype <= {1'b0, 55'd0, vset_vtype_i[7], vset_vtype_i[6],
+                      vset_vtype_i[5:3], vset_vtype_i[2:0]};
+        end
+        mstatus[10:9] <= 2'b11;
       end else if (!flush && csr_op_we) begin
         case (csr_addr)
           CSR_MSTATUS:  mstatus  <= csr_wval;
@@ -337,7 +375,14 @@ module csr_unit #(
             mstatus[16:15] <= csr_wval[16:15];
             mstatus[18]    <= csr_wval[18];
             mstatus[19]    <= csr_wval[19];
+            mstatus[10:9]  <= csr_wval[10:9];
           end
+          CSR_VSTART: begin
+            v_vstart <= csr_wval[7:0];
+            // Explicit vstart writes modify vector state -> VS Dirty.
+            mstatus[10:9] <= 2'b11;
+          end
+          // VL/VTYPE are read-only (written by vsetvli/vsetivli retire).
           CSR_VSIE:      vsie     <= csr_wval;
           CSR_VSTVEC:    vstvec   <= csr_wval;
           CSR_VSSCRATCH: vsscratch <= csr_wval;
@@ -357,11 +402,12 @@ module csr_unit #(
           end
           CSR_SSTATUS: begin
             sstatus <= csr_wval;
-            // FS/XS/SUM/MXR alias mstatus; route them through.
+            // FS/XS/SUM/MXR/VS alias mstatus; route them through.
             mstatus[14:13] <= csr_wval[14:13];
             mstatus[16:15] <= csr_wval[16:15];
             mstatus[18]    <= csr_wval[18];
             mstatus[19]    <= csr_wval[19];
+            mstatus[10:9]  <= csr_wval[10:9];
           end
           CSR_SIE:      sie      <= csr_wval;
           CSR_STVEC:    stvec    <= csr_wval;
@@ -526,5 +572,8 @@ module csr_unit #(
   assign hgatp_o = hgatp;
   assign vsstatus_o = vsstatus;
   assign hstatus_o = hstatus;
+  assign vl_o = v_vl;
+  assign vtype_o = v_vtype;
+  assign vstart_o = v_vstart;
 
 endmodule

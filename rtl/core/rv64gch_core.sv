@@ -873,13 +873,67 @@ module rv64gch_core #(
                       c.illegal = 1'b1;
                     end
                   endcase end
-      OP_FPLOAD: begin c.is_fp = 1'b1; c.wb_sel = WB_FP;
-                  // FLW (funct3=2, 32-bit) / FLD (funct3=3, 64-bit).
-                  c.lsu_op = (f3 == 3'b010) ? LSU_LW : LSU_LD; end
-      OP_FPSTORE:begin c.is_fp = 1'b1; c.wb_sel = WB_NONE;
-                  // FSW (funct3=2, 32-bit) / FSD (funct3=3, 64-bit).
-                  c.lsu_op = (f3 == 3'b010) ? LSU_SW : LSU_SD; end
+      OP_FPLOAD: begin
+                  // RVV shares 0000111: funct3 e8/e16/e32/e64 (000/101/110/
+                  // 111) is vector (FP uses 010/011 only). Skeleton: vle8
+                  // unit-stride unmasked only; wider EEW reserved for later.
+                  if ((f3 == 3'b000 || f3 == 3'b101 || f3 == 3'b110 ||
+                       f3 == 3'b111)) begin
+                    c.wb_sel = WB_NONE;
+                    c.alu_op = ALU_NONE;
+                    if (f3 == 3'b000 && i[27:26] == 2'b00 && i[25] &&
+                        i[24:20] == 5'd0) begin
+                      c.is_vec_mem = 1'b1;   // vle8.v vd,(rs1)
+                      c.vec_is_load = 1'b1;
+                    end else begin
+                      c.illegal = 1'b1;
+                    end
+                  end else begin
+                    c.is_fp = 1'b1; c.wb_sel = WB_FP;
+                    // FLW (funct3=2, 32-bit) / FLD (funct3=3, 64-bit).
+                    c.lsu_op = (f3 == 3'b010) ? LSU_LW : LSU_LD;
+                  end end
+      OP_FPSTORE:begin
+                  // RVV shares 0100111 the same way (FP uses 010/011 only).
+                  if ((f3 == 3'b000 || f3 == 3'b101 || f3 == 3'b110 ||
+                       f3 == 3'b111)) begin
+                    c.wb_sel = WB_NONE;
+                    c.alu_op = ALU_NONE;
+                    if (f3 == 3'b000 && i[27:26] == 2'b00 && i[25] &&
+                        i[24:20] == 5'd0) begin
+                      c.is_vec_mem = 1'b1;   // vse8.v vs3,(rs1)
+                      c.vec_is_load = 1'b0;
+                    end else begin
+                      c.illegal = 1'b1;
+                    end
+                  end else begin
+                    c.is_fp = 1'b1; c.wb_sel = WB_NONE;
+                    // FSW (funct3=2, 32-bit) / FSD (funct3=3, 64-bit).
+                    c.lsu_op = (f3 == 3'b010) ? LSU_SW : LSU_SD;
+                  end end
       OP_FPOP:   begin c.is_fp = 1'b1; {c.fp_fmt, c.fpu_op, c.wb_sel, c.fp_rm} = decode_fpu_op(i); end
+      OP_V:      begin
+                  // RVV OPCFG (funct3=111): vsetvli (bits[31:30]!=11, vtype in
+                  // bits[31:20]) / vsetivli (bits[31:30]==11 marker, vtype in
+                  // bits[29:20], AVL zimm in rs1 field). Supported vtype is
+                  // e8m1/ta,ma only; anything else sets vill (vl=0, no trap).
+                  // Remaining OP-V (vector ALU, later) is illegal for now.
+                  // NOTE: OP-V is 1010111, distinct from OP-FP 1010011.
+                  c.wb_sel = WB_NONE;
+                  c.alu_op = ALU_NONE;
+                  if (f3 == 3'b111 && i[31:30] == 2'b11) begin
+                    c.is_vset = 1'b1; c.vset_ivli = 1'b1;
+                    c.vtypei = {1'b0, i[29:20]};
+                    c.vset_vill = (i[29:20] != VTYPEI_E8M1[9:0]);
+                    c.wb_sel = WB_INT;
+                  end else if (f3 == 3'b111) begin
+                    c.is_vset = 1'b1; c.vset_ivli = 1'b0;
+                    c.vtypei = i[31:20];
+                    c.vset_vill = (i[31:20] != VTYPEI_E8M1);
+                    c.wb_sel = WB_INT;
+                  end else begin
+                    c.illegal = 1'b1;
+                  end end
       OP_FMADD, OP_FMSUB, OP_FNMSUB, OP_FNMADD: begin
                   c.is_fp = 1'b1; c.rs3 = i[31:27]; c.wb_sel = WB_FP;
                   // fmt lives in bits [26:25] (00=S, 01=D): double iff i[25].
@@ -995,8 +1049,14 @@ module rv64gch_core #(
       // the explicit imm12 copy was missing, so bit 63 read 0 and every
       // backward branch jumped wild. Forward-only suites never caught it.)
       OP_BRANCH:r = {{51{i[31]}}, i[31], i[7], i[30:25], i[11:8], 1'b0};
-      OP_LOAD, OP_SYSTEM, OP_FPLOAD, OP_FENCE:
+      OP_LOAD, OP_SYSTEM, OP_FENCE:
                r = {{52{i[31]}}, i[31:20]};
+      // Vector ld/st have no immediate (EA = x[rs1]); the funct6/vm/lumop
+      // bits alias the I-imm field and must not leak into the address.
+      // OP_V (vset) carries no memory address either.
+      OP_FPLOAD:
+               r = ((f3 == 3'b000 || f3 == 3'b101 || f3 == 3'b110 ||
+                     f3 == 3'b111)) ? 64'd0 : {{52{i[31]}}, i[31:20]};
       OP_OPIMM:
                // Shift-immediate (SLLI/SRLI/SRAI) uses a 6-bit shamt in
                // i[25:20]; other OP-IMM use the sign-extended I-type imm.
@@ -1011,8 +1071,12 @@ module rv64gch_core #(
                  r = {59'b0, i[24:20]};
                else
                  r = {{52{i[31]}}, i[31:20]};
-      OP_STORE, OP_FPSTORE:
+      OP_STORE:
                r = {{52{i[31]}}, i[31:25], i[11:7]};
+      OP_FPSTORE:
+               r = ((f3 == 3'b000 || f3 == 3'b101 || f3 == 3'b110 ||
+                     f3 == 3'b111)) ? 64'd0 : {{52{i[31]}}, i[31:25], i[11:7]};
+      OP_V:    r = 64'd0;
       default: r = '0;
     endcase
     return r;
@@ -1185,7 +1249,33 @@ module rv64gch_core #(
                         ((ex_pkt.valid & ex_pkt.ctrl.writes_csr) |
                          (mem_pkt.valid & mem_pkt.ctrl.writes_csr) |
                          (wb_pkt.valid & wb_pkt.ctrl.writes_csr));
+  // RVV: a vector ld/st samples vl/vstart in MEM, so it waits in D until
+  // any older vset drains out of EX/MEM/WB (vl/vtype commit at WB retire).
+  // Frontend-only hold like xret_csr_wait (backend drains to resolve).
+  logic vec_vset_wait;
+  assign vec_vset_wait = chk0_valid & chk0_ctrl.is_vec_mem &
+                         ((ex_pkt.valid & ex_pkt.ctrl.is_vset) |
+                          (mem_pkt.valid & mem_pkt.ctrl.is_vset) |
+                          (wb_pkt.valid & wb_pkt.ctrl.is_vset));
+  // RVV: a CSR read of vl/vtype/vstart must wait in D until any older
+  // vset drains out of EX/MEM/WB (vl/vtype/vstart commit at WB retire;
+  // the same-cycle CSR-write bypass covers scalar writes only, not vset).
+  // Frontend-only hold like csr_raw_wait (backend drains to resolve).
+  logic vec_csr_wait;
+  assign vec_csr_wait = chk0_valid & chk0_ctrl.reads_csr &
+                        ((chk0_ctrl.csr_addr == CSR_VSTART) |
+                         (chk0_ctrl.csr_addr == CSR_VL) |
+                         (chk0_ctrl.csr_addr == CSR_VTYPE)) &
+                        ((ex_pkt.valid & ex_pkt.ctrl.is_vset) |
+                         (mem_pkt.valid & mem_pkt.ctrl.is_vset) |
+                         (wb_pkt.valid & wb_pkt.ctrl.is_vset));
+  // RVV: while the VLSU sequences elements the whole backend holds (like
+  // dtlb_miss); the fault cycle holds too so the faulting op never
+  // advances to WB (the trap flush clears MEM instead).
+  logic vec_mem_hold;
+  assign vec_mem_hold = vec_mem_active & ~vlsu_done;
   assign stall = stall_raw | frm_stall | xret_csr_wait | csr_raw_wait |
+                 vec_vset_wait | vec_csr_wait | vec_mem_hold |
                  drain_busy_i | dtlb_miss;
   // Backend drain gate: everything except a load-use / frm hold lets
   // EX/MEM/WB advance. Those holds freeze only the frontend (fetch/D/issue)
@@ -1194,6 +1284,7 @@ module rv64gch_core #(
   // waiter waits). Dense dual-fetch reaches these states deterministically.
   logic load_use_raw, backend_stall;
   assign backend_stall = (stall_raw & ~load_use_raw) |
+                         vec_mem_hold |
                          drain_busy_i | dtlb_miss;
   `ifdef CORE_DEBUG
   // Event-driven fetch tracing (scheduler-safe: fires only on handshakes).
@@ -1638,11 +1729,23 @@ module rv64gch_core #(
   assign fpu_busy = fpu_in_ex & ~fpu_done;
 
   logic [63:0] ex_result;
+  // RVV vsetvli/vsetivli: AVL is x[rs1] (x0 = VLMAX) or the rs1-field
+  // zimm for ivli; vl = min(AVL, VLMAX), vill (decode-flagged) forces 0.
+  // The rd writeback (vl) rides the normal WB_INT path; vl/vtype commit
+  // to the CSR unit at WB retire (which also resets vstart, sets VS=11).
+  logic [63:0] vset_avl;
+  logic [7:0]  vset_vl;
+  assign vset_avl = ex_pkt.ctrl.vset_ivli ? {59'd0, ex_pkt.ctrl.rs1} :
+                    (ex_pkt.ctrl.rs1 == 5'd0 ? 64'(VLMAX) : rs1_fwd);
+  assign vset_vl = ex_pkt.ctrl.vset_vill ? 8'd0 :
+                   (vset_avl[63:8] != 56'd0 ? 8'(VLMAX) :
+                    (vset_avl[7:0] > 8'(VLMAX) ? 8'(VLMAX) : vset_avl[7:0]));
   always_comb begin
     ex_result = alu_y;
     if (is_mdu_op(ex_pkt.ctrl.alu_op))
       ex_result = mdu_res;
     if (ex_pkt.ctrl.fpu_op != FPU_NONE) ex_result = fpu_res;
+    if (ex_pkt.ctrl.is_vset) ex_result = {56'd0, vset_vl};
     // JAL/JALR link: return address is the next sequential PC, which is
     // pc+2 for a compressed instruction and pc+4 otherwise.
     if (ex_pkt.ctrl.is_jal | ex_pkt.ctrl.is_jalr)
@@ -1672,7 +1775,9 @@ module rv64gch_core #(
   end
   logic        ex_mem_valid;
   logic        ex_mem_rd, ex_mem_wr;
-  assign ex_mem_valid = ex_pkt.valid &
+  // Vector ld/st translates per element inside MEM (VLSU drives the data
+  // port then); EX must not present it as a scalar memory op.
+  assign ex_mem_valid = ex_pkt.valid & ~ex_pkt.ctrl.is_vec_mem &
       (mem_is_load_x | mem_is_store_x | ex_is_amo |
        (ex_pkt.ctrl.lsu_op == LSU_SC));
   assign ex_mem_rd = mem_is_load_x;
@@ -1687,6 +1792,8 @@ module rv64gch_core #(
   // SFENCE (conservative full flush for the H v0.1 TLB). SATP/VSATP/HGATP
   // writes flush all. The selective TLB flush fires at retire (ordered
   // with the L1D drain); F/D refetch below re-translates.
+  // RVV: while a vector op occupies MEM the data port serves the VLSU's
+  // per-element VA (EX is frozen, so no scalar competes for the port).
   mmu #(.ADDR_W(48), .TLB_ENTRIES(32)) u_mmu (
     .clk(clk), .rst_n(rst_n),
     .satp_i(csr_satp), .mstatus_i(csr_mstatus), .priv_i(priv),
@@ -1702,9 +1809,11 @@ module rv64gch_core #(
     .va_f_i(fetch_va), .priv_f_i(priv),
     .hit_f_o(mmu_hit_f), .pa_f_o(mmu_pa_f), .miss_f_o(mmu_miss_f),
     .fault_f_o(mmu_fault_f), .cause_f_o(mmu_cause_f),
-    .va_d_i(ex_va_full), .priv_d_i(eff_priv_d),
-    .rd_d_i(ex_mem_rd), .wr_d_i(ex_mem_wr),
-    .valid_d_i(ex_mem_valid),
+    .va_d_i(vec_mem_active ? vlsu_mmu_va : ex_va_full),
+    .priv_d_i(eff_priv_d),
+    .rd_d_i(vec_mem_active ? vlsu_mmu_rd : ex_mem_rd),
+    .wr_d_i(vec_mem_active ? vlsu_mmu_wr : ex_mem_wr),
+    .valid_d_i(vec_mem_active ? vlsu_mmu_valid : ex_mem_valid),
     .hit_d_o(mmu_hit_d), .pa_d_o(mmu_pa_d), .miss_d_o(mmu_miss_d),
     .fault_d_o(mmu_fault_d), .cause_d_o(mmu_cause_d),
     .req_o(ptw_req), .we_o(ptw_we), .addr_o(ptw_addr), .be_o(ptw_be),
@@ -1742,8 +1851,12 @@ module rv64gch_core #(
     // zero-extended for CSRRWI/CSRRSI/CSRRCI (funct3[2]).
     mem_pkt_n.csr_wdata = (ex_pkt.ctrl.funct3[2]) ? {59'd0, ex_pkt.ctrl.rs1} : rs1_fwd;
     // Physical address from the MMU (PIPT). In Bare mode this equals the
-    // VA low 48 bits, identical to the old direct assignment.
-    mem_pkt_n.mem_addr = {16'd0, mmu_pa_d};
+    // VA low 48 bits, identical to the old direct assignment. Vector ops
+    // carry the VA base instead (per-element translation happens in MEM
+    // via the VLSU); is_load/is_store stay 0 so the scalar LSU, WB mux
+    // and forwarding all ignore the packet.
+    mem_pkt_n.mem_addr = ex_pkt.ctrl.is_vec_mem ? ex_mem_addr :
+                         {16'd0, mmu_pa_d};
     // SC writes memory only on reservation success; AMO always reads then
     // writes (phased in the MEM FSM below).
     mem_pkt_n.is_store = mem_is_store_x | ex_is_amo |
@@ -1793,6 +1906,11 @@ module rv64gch_core #(
     end
   end
 
+  logic lsu_mem_req, lsu_mem_we_s;
+  logic [47:0] lsu_mem_addr;
+  logic [7:0] lsu_mem_be;
+  logic [63:0] lsu_mem_wdata;
+  logic lsu_mem_lock;
   lsu u_lsu (
     .clk(clk), .rst_n(rst_n),
     .stall_i(backend_stall), .trap_i(trap),
@@ -1816,19 +1934,77 @@ module rv64gch_core #(
     .d_rdata_i(mem_rdata),
     .d_ack_i(mem_ack),
     .d_ready_i(mem_ready),
-    .mem_req_o(mem_req),
-    .mem_we_o(lsu_mem_we),
-    .mem_addr_o(mem_addr),
-    .mem_be_o(mem_be),
-    .mem_wdata_o(mem_wdata),
-    .mem_lock_o(mem_lock),
+    .mem_req_o(lsu_mem_req),
+    .mem_we_o(lsu_mem_we_s),
+    .mem_addr_o(lsu_mem_addr),
+    .mem_be_o(lsu_mem_be),
+    .mem_wdata_o(lsu_mem_wdata),
+    .mem_lock_o(lsu_mem_lock),
     .busy_o(lsu_busy),
     .load_data_o(mem_rdata_aligned),
     .lr_valid_o(lsu_lr_valid),
     .lr_addr_o(lsu_lr_addr),
     .pending_o(lsu_pending)
   );
-  assign mem_we = lsu_mem_we;
+  // NOTE: u_lsu is inherently inert for vector packets (is_load/is_store
+  // are 0 for them, so it never enters busy nor issues), but the outputs
+  // are still muxed for cleanliness.
+  assign lsu_mem_we = lsu_mem_we_s;
+
+  // RVV v0 skeleton: vector regfile + shared-path VLSU. While a vector
+  // op occupies MEM the L1D beat serves the VLSU element; the scalar LSU
+  // is idle then (see note above), so this mux is arbitration-free.
+  logic        vec_mem_active;
+  logic        vlsu_busy, vlsu_done, vlsu_fault, vlsu_beat;
+  logic [7:0]  vlsu_idx;
+  logic [63:0] vlsu_mmu_va;
+  logic        vlsu_mmu_rd, vlsu_mmu_wr, vlsu_mmu_valid;
+  logic        vlsu_mem_req, vlsu_mem_we;
+  logic [47:0] vlsu_mem_addr;
+  logic [7:0]  vlsu_mem_be;
+  logic [63:0] vlsu_mem_wdata;
+  logic [4:0]  vrf_raddr, vrf_waddr;
+  logic [4:0]  vrf_ridx, vrf_widx;
+  logic [7:0]  vrf_rdata, vrf_wdata;
+  logic        vrf_we;
+  logic [7:0]  csr_vl, csr_vstart;
+  logic [63:0] csr_vtype;
+  assign vec_mem_active = mem_pkt.valid & mem_pkt.ctrl.is_vec_mem;
+  vregfile u_vregfile (
+    .clk(clk), .rst_n(rst_n),
+    .raddr_i(vrf_raddr), .ridx_i(vrf_ridx), .rdata_o(vrf_rdata),
+    .waddr_i(vrf_waddr), .widx_i(vrf_widx), .wdata_i(vrf_wdata),
+    .we_i(vrf_we)
+  );
+  vlsu u_vlsu (
+    .clk(clk), .rst_n(rst_n),
+    .active_i(vec_mem_active), .trap_i(trap),
+    .is_load_i(mem_pkt.ctrl.vec_is_load),
+    .base_va_i(mem_pkt.mem_addr), .vd_i(mem_pkt.ctrl.rd),
+    .vl_i(csr_vl), .vstart_i(csr_vstart),
+    .vrf_raddr_o(vrf_raddr), .vrf_ridx_o(vrf_ridx),
+    .vrf_rdata_i(vrf_rdata),
+    .vrf_waddr_o(vrf_waddr), .vrf_widx_o(vrf_widx),
+    .vrf_wdata_o(vrf_wdata), .vrf_we_o(vrf_we),
+    .mmu_va_o(vlsu_mmu_va), .mmu_rd_o(vlsu_mmu_rd),
+    .mmu_wr_o(vlsu_mmu_wr), .mmu_valid_o(vlsu_mmu_valid),
+    .mmu_hit_i(mmu_hit_d), .mmu_pa_i(mmu_pa_d),
+    .mmu_fault_i(mmu_fault_d),
+    .mem_req_o(vlsu_mem_req), .mem_we_o(vlsu_mem_we),
+    .mem_addr_o(vlsu_mem_addr), .mem_be_o(vlsu_mem_be),
+    .mem_wdata_o(vlsu_mem_wdata),
+    .mem_rdata_i(mem_rdata), .mem_ack_i(mem_ack),
+    .mem_ready_i(mem_ready),
+    .fence_hold_i(vm_fence_active),
+    .busy_o(vlsu_busy), .done_o(vlsu_done), .fault_o(vlsu_fault),
+    .elem_idx_o(vlsu_idx), .beat_o(vlsu_beat)
+  );
+  assign mem_req   = vec_mem_active ? vlsu_mem_req   : lsu_mem_req;
+  assign mem_we    = vec_mem_active ? vlsu_mem_we    : lsu_mem_we_s;
+  assign mem_addr  = vec_mem_active ? vlsu_mem_addr  : lsu_mem_addr;
+  assign mem_be    = vec_mem_active ? vlsu_mem_be    : lsu_mem_be;
+  assign mem_wdata = vec_mem_active ? vlsu_mem_wdata : lsu_mem_wdata;
+  assign mem_lock  = vec_mem_active ? 1'b0           : lsu_mem_lock;
 
   assign rd_m = mem_pkt.ctrl.rd;
   assign reg_we_m = mem_pkt.valid &
@@ -1907,6 +2083,10 @@ module rv64gch_core #(
       if (lsu_pending & mem_ack & mem_pkt.valid & lsu_mem_we)
         $fwrite(cosim_f, "M %h %h %h %h\n",
                 mem_pkt.pc, mem_pkt.mem_addr[47:0], mem_pkt.be, mem_wdata);
+      // Completed vector store beats (element PA/be/data, same semantics).
+      if (vlsu_beat & vlsu_mem_we & vec_mem_active)
+        $fwrite(cosim_f, "M %h %h %h %h\n",
+                mem_pkt.pc, vlsu_mem_addr, vlsu_mem_be, vlsu_mem_wdata);
       $fflush(cosim_f);
     end
   end
@@ -1965,7 +2145,7 @@ module rv64gch_core #(
     .csr_op(wb_pkt.ctrl.csr_op),
     .csr_rs1(wb_pkt.ctrl.rs1),
     .csr_rdata(csr_rdata),
-    .trap_pc(irq_fire ? pc_d : ex_pkt.pc),
+    .trap_pc(vec_fault ? mem_pkt.pc : (irq_fire ? pc_d : ex_pkt.pc)),
     .cause(cause), .trap(trap),
     .tval_valid(trap_is_fault & ~irq_fire), .tval(trap_tval),
     .mret(wb_pkt.ctrl.is_mret), .sret(wb_pkt.ctrl.is_sret),
@@ -1989,22 +2169,39 @@ module rv64gch_core #(
     .vsstatus_o(csr_vsstatus),
     .trap_to_vs_o(csr_trap_to_vs),
     .new_virt_priv_o(csr_new_priv), .new_virt_o(csr_new_virt),
-    .hstatus_o(csr_hstatus)
+    .hstatus_o(csr_hstatus),
+    .vset_we_i(wb_pkt.valid & wb_pkt.ctrl.is_vset),
+    .vset_vl_i(wb_pkt.data[7:0]),
+    .vset_vtype_i(wb_pkt.ctrl.vtypei),
+    .vset_vill_i(wb_pkt.ctrl.vset_vill),
+    .vec_trap_i(vec_fault),
+    .vec_idx_i(vlsu_idx),
+    .vl_o(csr_vl), .vtype_o(csr_vtype), .vstart_o(csr_vstart)
   );
   assign csr_hstatus_spv = csr_hstatus[7];
   assign csr_hstatus_spvp = csr_hstatus[8];
 
-  // Fault plumbing for mtval: fetch bubble carries its VA, data faults
-  // use the faulting EX virtual address. Interrupts record tval 0.
+  // Fault plumbing for mtval: fetch bubble carries its VA, scalar data
+  // faults use the faulting EX virtual address, vector faults use the
+  // faulting element VA (vstart carries the index). Interrupts record 0.
+  // Scalar data_fault is muted while a vector op occupies MEM (the data
+  // port serves the VLSU then; a frozen younger EX op must not alias it).
   logic       trap_is_fault;
   logic [63:0] trap_tval;
-  assign trap_is_fault = (ex_pkt.valid & ex_pkt.fault_f) | data_fault;
-  assign trap_tval     = (ex_pkt.valid & ex_pkt.fault_f) ? ex_pkt.fva : ex_va_full;
+  assign trap_is_fault = (ex_pkt.valid & ex_pkt.fault_f) | data_fault |
+                         vec_fault;
+  assign trap_tval     = vec_fault ? vlsu_mmu_va :
+                         ((ex_pkt.valid & ex_pkt.fault_f) ? ex_pkt.fva :
+                          ex_va_full);
 
   logic       data_fault;
   logic [4:0] data_cause;
-  assign data_fault = ex_mem_valid & mmu_fault_d;
+  assign data_fault = ex_mem_valid & mmu_fault_d & ~vec_mem_active;
   assign data_cause = mmu_cause_d;
+  // Vector element fault: precise trap with epc = the vector insn (it
+  // restarts at vstart) and tval = the faulting element VA.
+  logic       vec_fault;
+  assign vec_fault = vec_mem_active & vlsu_fault;
 
   // Precise interrupt take at an instruction boundary: the backend holds
   // only older instructions, so once it drains the next insn (D head) can
@@ -2038,7 +2235,11 @@ module rv64gch_core #(
       end
     end
   end
-  assign trap = sync_trap | irq_fire;
-  assign cause = irq_fire ? irq_cause_o : sync_cause;
+  // A younger EX trap is held off while the VLSU sequences (the older
+  // vector op must complete or fault first -- precise-trap order); the
+  // vector fault itself traps with the MMU cause (it is the oldest).
+  assign trap = (sync_trap & ~vec_mem_hold) | irq_fire | vec_fault;
+  assign cause = irq_fire ? irq_cause_o :
+                 (vec_fault ? data_cause : sync_cause);
 
 endmodule

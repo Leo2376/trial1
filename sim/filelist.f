@@ -12,6 +12,8 @@
 ../../rtl/core/ctrl/hazard_unit.sv
 ../../rtl/core/issue/issue_unit.sv
 ../../rtl/core/lsu/lsu.sv
+../../rtl/vpu/regfile/vregfile.sv
+../../rtl/vpu/ldst/vlsu.sv
 ../../rtl/soc/fabric/axi4_master.sv
 ../../rtl/soc/clint/clint.sv
 ../../rtl/soc/plic/plic.sv
