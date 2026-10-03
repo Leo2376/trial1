@@ -130,6 +130,9 @@ package rtl_core_pkg;
     logic        vec_strided;  // 1 = strided (VA=base+i*stride, stride=x[rs2])
     logic        vec_indexed;  // 1 = indexed (VA=base+vs2[i], vs2=rs2 field)
     logic        vec_masked;   // 1 = masked (vm=0: skip v0.mask==0 elems)
+    logic [1:0]  vec_eew;      // mem element width: funct3 000/101/110/111
+                               // -> 8/16/32/64 (must match SEW, except e8
+                               // indices which pair with any SEW)
     logic        is_vec_alu;   // OPIVV/OPMVV ALU (MEM-sequenced by VALU)
     logic [5:0]  vec_aluop;    // ALU funct6 (rs1=vs1, rs2=vs2 numbers)
     logic        is_vset;      // vsetvli/vsetivli (EX computes vl, WB commits)
@@ -155,15 +158,42 @@ package rtl_core_pkg;
   localparam logic [4:0] FF_NV = 5'b10000, FF_DZ = 5'b01000, FF_OF = 5'b00100,
                         FF_UF = 5'b00010, FF_NX = 5'b00001;
 
-  // RVV v0 skeleton: VLEN=256, SEW=8/LMUL=1 only -> VLMAX=32.
+  // RVV: VLEN=256, LMUL=1 only -> VLMAX = 32/16/8/4 for SEW=8/16/32/64.
+  // (Kept for reference; vset computes VLMAX from the vtype SEW field.)
   localparam int VLEN = 256;
   localparam int VLMAX = 32;
-  // Supported vtypei (ma=1,ta=1,sew=000,lmul=000); anything else -> vill.
+  // Example supported vtypei (ma=1,ta=1,sew=000,lmul=000); vill is decided
+  // per-field by vec_vill in the core (SEW 8/16/32/64, LMUL=1, ta, ma).
   localparam logic [10:0] VTYPEI_E8M1 = 11'h0C0;
   // OPIVV funct6 (OP-V funct3=000), incl. vmv.v.v (funct6=010111).
+  // vmerge.vvm shares funct6=010111 with vm=0 (decode maps it to
+  // VALU_MERGE, an internal code); mask-producing compares (011000..)
+  // write bit i of vd (LMUL=1 mask layout) via a vd read-modify-write.
+  // vrgather.vv also lives in OPIVV (funct6=001100).
+  // OPMVV/OPMVX integer multiply/divide share funct6s across funct3; the
+  // VALU disambiguates with funct3 (saturating-add vs divide share
+  // 100000..100011). OPIVX slides/gather and OPMVX slide1 are classified
+  // by (funct3, funct6) in the VALU; decode passes funct6 through.
   localparam logic [5:0] VALU_ADD = 6'b000000, VALU_SUB  = 6'b000010,
+                         VALU_MINU = 6'b000100, VALU_MIN = 6'b000101,
+                         VALU_MAXU = 6'b000110, VALU_MAX = 6'b000111,
                          VALU_AND = 6'b001001, VALU_OR   = 6'b001010,
-                         VALU_XOR = 6'b001011, VALU_COPY = 6'b010111;
+                         VALU_XOR = 6'b001011, VALU_COPY = 6'b010111,
+                         VALU_SEQ = 6'b011000, VALU_SNE  = 6'b011001,
+                         VALU_SLTU = 6'b011010, VALU_SLT = 6'b011011,
+                         VALU_SLEU = 6'b011100, VALU_SLE = 6'b011101,
+                         VALU_SADDU = 6'b100000, VALU_SADD = 6'b100001,
+                         VALU_SSUBU = 6'b100010, VALU_SSUB = 6'b100011,
+                         VALU_SLL = 6'b100101,
+                         VALU_SRL = 6'b101000, VALU_SRA  = 6'b101001,
+                         VALU_MERGE = 6'b111111,
+                         VALU_DIVU = 6'b100000, VALU_DIV = 6'b100001,
+                         VALU_REMU = 6'b100010, VALU_REM = 6'b100011,
+                         VALU_MULHU = 6'b100100, VALU_MUL = 6'b100101,
+                         VALU_MULHSU = 6'b100110, VALU_MULH = 6'b100111,
+                         VALU_GATHER = 6'b001100,
+                         VALU_SLIDEUP = 6'b001110,
+                         VALU_SLIDEDN = 6'b001111;
 
   localparam logic [11:0] CSR_VSTART=12'h008,
     CSR_VL=12'hC20, CSR_VTYPE=12'hC21;

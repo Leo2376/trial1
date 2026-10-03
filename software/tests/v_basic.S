@@ -6,8 +6,9 @@
  * A=D=0 to exercise the walker A/D path through the VLSU-driven port).
  *
  * S phase 1 (CSR/config): vsetvli e8m1ta_ma -> vl==32 (VLMAX), vl/vtype
- * CSR readback, mstatus.VS==Dirty; vsetivli 8 -> vl==8; vill vtype
- * (sew16) -> vl==0, vtype.vill==1; vstart CSR RW + vset reset.
+ * CSR readback, mstatus.VS==Dirty; vsetivli 8 -> vl==8; vsetvli e16m1 ->
+ * vl==16, vtype==0xC8; vill vtype (LMUL=2) -> vl==0, vtype.vill==1;
+ * vstart CSR RW + vset reset.
  * S phase 2 (movement): 32B scalar pattern -> vle8.v v0 -> vse8.v v0 ->
  * scalar ld compare (4 dwords).
  * S phase 3 (fault/restart): vl=8, vle8.v from 0x80200FFC (4B in the
@@ -119,8 +120,17 @@ s_entry:                        # S-mode, translation ON
     bnez t1, fail1E
     li t1, 32
     bne t0, t1, fail1E
-    # --- vill vtype (sew16) -> vl==0, vtype[63]==1, then restore ---
+    # --- e16 is supported: vl==16, vtype==0xC8, no vill ---
     vsetvli t0, zero, e16, m1, ta, ma
+    li t1, 16
+    bne t0, t1, fail20
+    csrr t0, vl
+    bne t0, t1, fail20
+    csrr t0, vtype
+    li t1, 0xC8
+    bne t0, t1, fail20
+    # --- vill vtype (LMUL=2) -> vl==0, vtype[63]==1, then restore ---
+    vsetvli t0, zero, e8, m2, ta, ma
     bnez t0, fail20
     csrr t0, vl
     bnez t0, fail20

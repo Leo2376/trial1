@@ -34,7 +34,7 @@ synthesis), not FPGA.
 | CLINT (mtime/mtimecmp/msip) | **DONE** | clint_timer PASS |
 | 64-source PLIC (priority/threshold/claim, M+S contexts) | **DONE** | plic_basic PASS |
 | H extension v0.1 (HS/VS/VU, stage-2 walk, hfence, VS-IRQ) | **DONE (v0.1)** | h_basic PASS |
-| RVV 1.0 vector engine | **v0 DONE (vset + e8 ld/st unit/stride/indexed, masked+unmasked, OPIVV ALU + vmv, precise fault/restart)** | v_basic + v_strided + v_indexed + v_masked + v_alu PASS |
+| RVV 1.0 vector engine | **v1 DONE (SEW=8/16/32/64 LMUL=1; unit/stride/e8-indexed ld/st; OPIVV+OPMVV+OPIVX/OPMVX integer ALU incl. mul/div, merge, compares; slides; vrgather; precise fault/restart)** | v_basic + v_strided + v_indexed + v_masked + v_alu + v_alu2 + v_muldiv + v_slide + v_sew PASS |
 | IME 1.0 matrix extension | Not started | — |
 | LLC (1 MiB, shared) | Not started (only needed with VPU) | — |
 | Debug module / coherence dir | Not started (empty stubs) | — |
@@ -141,33 +141,95 @@ Jumps predict via BTB/RAS/JAL-early, verified against the resolved target.
    indirect jump, and a backward loop. Remaining: none planned (no large
    global-history / tournament predictor).
 9. **Remaining work** (everything above is DONE and green):
-    - **RVV 1.0 (VLEN=256) + IME 1.0** — v0 skeleton **DONE**: `vsetvli`/
-      `vsetivli` (e8m1/ta,ma; rest vill), `vle8.v`/`vse8.v` unit-stride,
-      `vlse8.v`/`vsse8.v` strided (VA=base+i*stride, stride=x[rs2],
-      negative strides OK) and       `vluxei8`/`vloxei8`/`vsuxei8`/`vsoxei8`
-      indexed (VA=base+vs2[i], e8 zero-ext indices), each masked (vm=0,
-      v0 mask: masked-off elements skip memory, never fault, and leave
-      dest/memory undisturbed) and unmasked, via `rtl/vpu/ldst/
+    - **RVV 1.0 (VLEN=256) + IME 1.0** — v1 **DONE**: `vsetvli`/
+      `vsetivli` (SEW=8/16/32/64, LMUL=1, ta,ma; rest vill; VLMAX=32/16/
+      8/4; AVL-reg form), unit-stride (`vle`/`vse`, EEW==SEW enforced),
+      `vlse`/`vsse` strided (VA=base+i*stride, stride=x[rs2],
+      negative strides OK) and `vluxei8`/`vsuxei8`
+      indexed (VA=base+vs2[i], e8 zero-ext indices, any SEW), each masked
+      (vm=0, v0 mask: masked-off elements skip memory, never fault, and
+      leave dest/memory undisturbed) and unmasked, via `rtl/vpu/ldst/
       vlsu.sv` time-multiplexing the CPU LSU data path (same MMU port +
-      L1D beat, same AXI4/L2 chain — no separate VPU interface),
-      `rtl/vpu/regfile/vregfile.sv` (32x32B, data + index + mask read
-      ports), vl/vtype/vstart CSRs + VS dirty, precise per-element faults
-      (vstart restart). `software/tests/v_basic.S` proves config, 32B
-      move, and a straddling load fault; `software/tests/v_strided.S`
-      proves stride-4/1/-1 moves, a load-sourced stride, and a straddling
-      strided fault; `software/tests/v_indexed.S` proves gather/scatter,
+      L1D beat, same AXI4/L2 chain — no separate VPU interface, now
+      byte-serial over (element, byte) with element-precise vstart),
+      `rtl/vpu/regfile/vregfile.sv` (32x32B, data + index + mask + dest
+      + gather read ports), vl/vtype/vstart CSRs + VS dirty, precise
+      per-element faults (vstart restart). `software/tests/v_basic.S`
+      proves config, 32B move, and a straddling load fault;
+      `software/tests/v_strided.S` proves stride-4/1/-1 moves, a
+      load-sourced stride, and a straddling strided fault;
+      `software/tests/v_indexed.S` proves gather/scatter,
       reversed indices, and a load-then-store fault pair to the same VA
       (the pair caught a stale-cause MMU fault latch, now keyed on
       access type); `software/tests/v_masked.S` proves masked unit/
       strided/indexed moves with undisturbed semantics and fault
-      avoidance over an unmapped element. First compute is in:
-      `rtl/vpu/vlane/valu.sv` (element-serial e8 OPIVV add/sub/and/or/
-      xor + `vmv.v.v`, masked and unmasked, occupying MEM under the same
-      hold that serializes vector ops — no VRF forwarding needed);
-      `software/tests/v_alu.S` proves all six ops, wrap/identity
-      properties, and masked add (it also caught `vmv.v.v` living in
-      OPIVV/funct6, not OPMVV). Next: more ALU (min/max/mul/compare/
-      slides), wider SEW/LMUL; then IME (`munit/`, shared regfile).
+      avoidance over an unmapped element. Integer compute is in:
+      `rtl/vpu/vlane/valu.sv` (element-serial OPIVV add/sub/min/max/and/
+      or/xor/saturating/shift + `vmv.v.v`/`vmerge.vvm` + compares, masked
+      and unmasked, occupying MEM under the same hold that serializes
+      vector ops — no VRF forwarding needed);
+       `software/tests/v_alu.S` proves all six ops, wrap/identity
+       properties, and masked add (it also caught `vmv.v.v` living in
+       OPIVV/funct6, not OPMVV). Sequencer restart is proven: back-to-back
+       vector ops hand MEM over with no idle gap, so the VLSU/VALU cannot
+       delimit sequences on the active level alone (the second op inherited
+       the first op's done state and retired empty -- this swallowed the
+       second `vxor` of the `v_alu` round-trip). The core now pulses
+       `vec_start_q` when a vector op enters MEM and both units (re)sample
+       `vl`/`vstart` on it (`v_alu` phase 5 + the `v_alu2` ALU chain cover
+       it). Full OPIVV integer ALU is in: `vminu`/`vmin`/`vmaxu`/`vmax`,
+       saturating `vsaddu`/`vsadd`/`vssubu`/`vssub`, `vsll`/`vsrl`/`vsra`
+       (amount = low 3 bits of vs1[i]), `vmerge.vvm` (v0 selects, never
+       skips), and the mask-producing compares `vmseq`/`vmsne`/`vmsltu`/
+       `vmslt`/`vmsleu`/`vmsle` (bit i of vd via a vd read-modify-write
+       port, masked and unmasked); `software/tests/v_alu2.S` proves each
+       op against scalar-computed immediates incl. signed edges
+       (0x80/0x7F), saturation corners, arithmetic shift, and both
+       masked-compare undisturbed directions (it also caught the compare
+       vd byte needing `i>>3`, not `i`). OPMVV/OPMVX integer multiply/
+       divide (`vmul`/`mulh`/`mulhu`/`mulhsu`, `vdiv`/`divu`/`rem`/`remu`
+       with scalar div semantics, `.vv` and `.vx`) run on a wide-path
+       R+W sub-FSM in the VALU (R assembles the element bytes, W computes
+       and writes one byte per cycle; 128-bit products keep MULH exact at
+       SEW=64); `software/tests/v_muldiv.S` proves each op incl. div0/
+       overflow corners and masked `.vv`. Slides (`vslideup/down/1up/
+       1down`, `.vx` + `.vi`) and `vrgather.vv/.vx/.vi` (SEW-wide indices,
+       out-of-range -> 0 via a chained gather VRF port) ride the same
+       sub-FSM with the scalar (x[rs1]/uimm) in the MEM packet;
+       `software/tests/v_slide.S` proves all forms incl. undisturbed-low
+       and zero-fill. SEW=16/32/64 (LMUL=1, VLMAX=16/8/4, EEW==SEW
+       enforced at decode, e8 indices pair with any SEW) run the VLSU
+       byte-serially over (element, byte) with element-precise vstart, and
+       the VALU wide path end to end; `software/tests/v_sew.S` proves
+       config (incl. AVL-reg vsetvli), round trip, add/mul/div, compares
+       and masking per width, plus the EEW-mismatch illegal trap
+       (`v_basic` now asserts e16-valid + vill-via-LMUL2 instead of
+       e16-vill).
+       Vector DONE (v1) recap: `vsetvli`/`vsetivli` (SEW 8/16/32/64,
+       LMUL=1, AVL-reg form); unit/stride/e8-indexed ld/st with masking
+       and precise faults; full OPIVV integer ALU + merge + compares;
+       OPMVV/OPMVX mul/div; OPIVX/OPMVX `.vx` ALU/mul/div; slides and
+       gather (`.vv`/`.vx`/`.vi`); back-to-back sequencer restart.
+       Vector LEFT:
+       - LMUL = 2/4/8 (and fractional) register grouping: VLMAX scaling,
+         multi-register layout, EMUL for strided/indexed/segment forms.
+       - OPIVI integer `.vi` forms (`vadd.vi`, `vmv.v.i`, compares,
+         shifts, mul/div — the uimm scalar path already exists for
+         slides/gather).
+       - Mask-register ops: `vmand`/`vmor`/`vmxor`/`vmandn`/`vmornot`,
+         `vmsbf`/`vmsif`/`vmsof`, `vcpop`/`vfirst`, `viota`/`vid`.
+       - Reductions (`vredsum`/`and`/`or`/`xor`/`min`/`max`, needs a
+         vector->scalar writeback path), widening (`vwadd`/`vwsub`/
+         `vwmul`/`vwmacc`), narrowing (`vnsrl`/`vnsra`/`vnclip`),
+         extension (`vzext`/`vsext`), scaling shifts (`vssrl`/`vssra`).
+       - Segment, whole-register (`vl1r`/`vs1r`), mask (`vlm`/`vsm`),
+         and fault-only-first (`vleff`) load/stores; `vrgatherei16`;
+         `vcompress`.
+       - OPFVV single/double-precision vector floating point (shares
+         the scalar FPU).
+       - `vsetvl` (register AVL/vtype form; currently falls into the
+         `vsetvli`/vill path).
+       - IME 1.0 matrix extension (`munit/`, shared regfile).
     - **LLC (1 MiB, shared CPU+VPU)** — only needed once VPU traffic
       exists; until then the L2 feeds AXI4/DRAM directly.
     - **SoC stubs** — debug module (`rtl/soc/debug/`, RISC-V Debug Spec:
@@ -272,7 +334,7 @@ cd sim/verilator && make decomp   # 44/44 PASS
 ./sim/verilator/obj_dir/Vtb_rv64gch_core +hex=/tmp/h_basic.hex          # TEST PASSED
 ```
 
-Last full regression (H v0.1 in path): rv64ui 50/50, rv64um 13/13, rv64uf 11/11, rv64uc 1/1 (rvc), rv64ua 19/19, rv64ud 12/12, tb_fpu 80/80, tb_decompressor 44/44, dyn_rm PASS, l1i_conflict PASS, l1d_wb PASS, l2_wb PASS, sv39_basic/fault/sfence PASS, deleg_basic PASS, asid_test PASS, sv48_basic PASS, priv_ecall PASS, priv_csr PASS, bpred_ras PASS, clint_timer PASS, plic_basic PASS, h_basic PASS.
+Last full regression (H v0.1 in path): rv64ui 50/50, rv64um 13/13, rv64uf 11/11, rv64uc 1/1 (rvc), rv64ua 19/19, rv64ud 12/12, tb_fpu 80/80, tb_decompressor 44/44, dyn_rm PASS, l1i_conflict PASS, l1d_wb PASS, l2_wb PASS, sv39_basic/fault/sfence PASS, deleg_basic PASS, asid_test PASS, sv48_basic PASS, priv_ecall PASS, priv_csr PASS, bpred_ras PASS, clint_timer PASS, plic_basic PASS, h_basic PASS, v_basic/v_strided/v_indexed/v_masked/v_alu/v_alu2/v_muldiv/v_slide/v_sew PASS.
 
 ## RTL Directory Structure & Module Relationships
 
@@ -303,8 +365,11 @@ rtl/
 │   │   └── issue_unit.sv         # Dual-issue pairing predicate (ALU+ALU, ALU+MDU/FPU)
 │   ├── lsu/
 │   │   └── lsu.sv                # LSU MEM engine: LR/SC, AMO, AXI handshake, load latch
-├── vpu/                           # Vector/Matrix Unit (EMPTY, future)
-│   ├── ctrl/  regfile/  vlane/  munit/  vsew_lmul/  ldst/
+├── vpu/                           # Vector Unit (VLSU/VALU/VRF IMPLEMENTED, munit future)
+│   ├── ldst/vlsu.sv             # VLSU: unit/stride/indexed sequencer, SEW-aware (IMPLEMENTED)
+│   ├── vlane/valu.sv            # VALU: integer ALU + slides/gather, fast + wide paths (IMPLEMENTED)
+│   ├── regfile/vregfile.sv      # VRF: 32x32B, 5R+1W byte ports (IMPLEMENTED)
+│   ├── ctrl/ vsew_lmul/ munit/  # (EMPTY, future: LMUL grouping, IME)
 ├── mmu/mmu.sv                   # Sv39 MMU: TLB + walker (IMPLEMENTED)
 ├── cache/                         # l1i + l1d DONE, rest EMPTY (future)
 │   ├── l1i/l1i.sv               # L1I 32KiB 4-way blocking (IMPLEMENTED)
@@ -370,7 +435,7 @@ VPU (RVV 1.0 + IME 1.0) ──┘
 
 - **Base**: RV64I — **verified**
 - **Extensions**: M ✓, F ✓, D ✓, C ✓, A ✓ ("G" complete), Zicsr/Zifencei ✓ | H v0.1 ✓ (HS/VS/VU, 2-stage, hfence, VS-IRQ; HLV/HSV later)
-- **Vector**: RVV 1.0 (VLEN=256, ELEN=64) — planned, shared CPU AXI4 bus (no separate IF)
+- **Vector**: RVV 1.0 integer (VLEN=256, SEW 8/16/32/64, LMUL=1) — implemented, shared CPU AXI4 bus (no separate IF)
 - **Matrix**: IME 1.0 (shared VPU regfile) — planned, shared CPU AXI4 bus (no separate IF)
 
 ## Memory System (target)

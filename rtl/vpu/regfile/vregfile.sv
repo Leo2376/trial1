@@ -5,6 +5,11 @@
 // is already full-VLEN. Combinational read, synchronous write. v0 is
 // undisturbed on unwritten tail/prestart elements (writer only touches
 // active elements); agnostic tails simply leave stale bytes.
+//
+// Ports: r (VLSU store-data / VALU vs1 source), i (indexed address / VALU
+// vs2 source), m (v0 mask bits / VALU mask source), d (VALU compare
+// destination read-modify-write), g (VALU gather data: vs2 byte at a
+// computed address), w (load-data / ALU-result sink).
 module vregfile #(
   parameter int VLEN_B = 32, // VLEN in bytes (256b)
   parameter int NREG   = 32
@@ -25,6 +30,18 @@ module vregfile #(
   input  logic [4:0]       maddr_i,
   input  logic [4:0]       midx_i,
   output logic [7:0]       mdata_o,
+  // Dest port (VALU compare vd old-byte source): combinational. Only the
+  // VALU drives it (the VLSU never reads vd); the core connects it
+  // straight through, no mux.
+  input  logic [4:0]       daddr_i,
+  input  logic [4:0]       didx_i,
+  output logic [7:0]       ddata_o,
+  // Gather port (VALU gather data source: vs2 byte at a computed byte
+  // address): combinational. Only the VALU drives it; the core connects
+  // it straight through, no mux.
+  input  logic [4:0]       gaddr_i,
+  input  logic [4:0]       gidx_i,
+  output logic [7:0]       gdata_o,
   // Write port (VLSU load-data sink): synchronous.
   input  logic [4:0]       waddr_i,
   input  logic [4:0]       widx_i,
@@ -37,6 +54,8 @@ module vregfile #(
   assign rdata_o = vrf[raddr_i][ridx_i];
   assign idata_o = vrf[iaddr_i][iidx_i];
   assign mdata_o = vrf[maddr_i][midx_i];
+  assign ddata_o = vrf[daddr_i][didx_i];
+  assign gdata_o = vrf[gaddr_i][gidx_i];
 
   always_ff @(posedge clk) begin
     if (we_i)

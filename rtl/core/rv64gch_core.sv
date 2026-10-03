@@ -126,6 +126,7 @@ module rv64gch_core #(
     logic [63:0] rs2;
     logic [63:0] csr_wdata;
     logic [63:0] mem_addr;
+    logic [63:0] scalar;   // RVV .vx/.vi scalar (x[rs1] or 5-bit uimm)
     logic        is_store;
     logic        is_load;
     logic [63:0] store_data;
@@ -727,7 +728,14 @@ module rv64gch_core #(
     end
   end
 
-  function automatic ctrl_t decode(logic [31:0] i);
+  function automatic logic vec_vill(logic [10:0] vtypei);
+    // vill unless SEW=8/16/32/64, LMUL=1, ta=ma=1 and reserved==0.
+    // vtypei layout: [10:8] reserved, [7] ma, [6] ta, [5:3] sew, [2:0] lmul.
+    return (vtypei[10:8] != 3'd0) || !vtypei[7] || !vtypei[6] ||
+           (vtypei[5:3] > 3'd3) || (vtypei[2:0] != 3'd0);
+  endfunction
+
+  function automatic ctrl_t decode(logic [31:0] i, logic [1:0] sew);
     ctrl_t c;
     opcode_t op; logic [2:0] f3; logic [6:0] f7;
     c = '0;
@@ -874,32 +882,45 @@ module rv64gch_core #(
                     end
                   endcase end
       OP_FPLOAD: begin
-                  // RVV shares 0000111: funct3 e8/e16/e32/e64 (000/101/110/
-                  // 111) is vector (FP uses 010/011 only). Skeleton: e8
-                  // unit-stride, strided and indexed, masked (vm=0, v0)
-                  // and unmasked; wider EEW and segments reserved for later.
+                  // RVV shares 0000111: funct3 encodes EEW (000/101/110/111
+                  // = 8/16/32/64; FP uses 010/011 only). Unit-stride,
+                  // strided and e8-indexed, masked (vm=0, v0) and unmasked.
+                  // EEW must equal SEW (e8 indices pair with any SEW);
+                  // whole-register/segment/mask/fault-first reserved.
                   if ((f3 == 3'b000 || f3 == 3'b101 || f3 == 3'b110 ||
                        f3 == 3'b111)) begin
                     c.wb_sel = WB_NONE;
                     c.alu_op = ALU_NONE;
-                    if (f3 == 3'b000 && i[31:26] == 6'b000000 &&
+                    c.vec_eew = (f3 == 3'b000) ? 2'd0 :
+                                (f3 == 3'b101) ? 2'd1 :
+                                (f3 == 3'b110) ? 2'd2 : 2'd3;
+                    if (i[31:26] == 6'b000000 &&
                         i[24:20] == 5'd0) begin
-                      c.is_vec_mem = 1'b1;   // vle8.v vd,(rs1)[,v0.t]
+                      c.is_vec_mem = 1'b1;   // vle vd,(rs1)[,v0.t]
                       c.vec_is_load = 1'b1;
                       c.vec_masked = ~i[25];
-                    end else if (f3 == 3'b000 && i[31:28] == 4'b0000 &&
+                    end else if (i[31:28] == 4'b0000 &&
                                  i[27:26] == 2'b10) begin
-                      c.is_vec_mem = 1'b1;   // vlse8.v vd,(rs1),rs2[,v0.t]
+                      c.is_vec_mem = 1'b1;   // vlse vd,(rs1),rs2[,v0.t]
                       c.vec_is_load = 1'b1;  // stride = x[rs2]
                       c.vec_strided = 1'b1;
                       c.vec_masked = ~i[25];
-                    end else if (f3 == 3'b000 && i[31:28] == 4'b0000 &&
+                    end else if (i[31:28] == 4'b0000 &&
                                  (i[27:26] == 2'b01 || i[27:26] == 2'b11)) begin
                       c.is_vec_mem = 1'b1;   // vluxei8/vloxei8 vd,(rs1),vs2
                       c.vec_is_load = 1'b1;  // index = vs2[i] (e8, zero-ext)
                       c.vec_indexed = 1'b1;
                       c.vec_masked = ~i[25];
                     end else begin
+                      c.illegal = 1'b1;
+                    end
+                    // EEW must match SEW (indexed: e8 indices only, any SEW).
+                    if (!c.illegal &&
+                        (c.vec_indexed ? (c.vec_eew != 2'd0)
+                                       : (c.vec_eew != sew))) begin
+                      c.is_vec_mem = 1'b0;
+                      c.vec_strided = 1'b0;
+                      c.vec_indexed = 1'b0;
                       c.illegal = 1'b1;
                     end
                   end else begin
@@ -913,24 +934,36 @@ module rv64gch_core #(
                        f3 == 3'b111)) begin
                     c.wb_sel = WB_NONE;
                     c.alu_op = ALU_NONE;
-                    if (f3 == 3'b000 && i[31:26] == 6'b000000 &&
+                    c.vec_eew = (f3 == 3'b000) ? 2'd0 :
+                                (f3 == 3'b101) ? 2'd1 :
+                                (f3 == 3'b110) ? 2'd2 : 2'd3;
+                    if (i[31:26] == 6'b000000 &&
                         i[24:20] == 5'd0) begin
-                      c.is_vec_mem = 1'b1;   // vse8.v vs3,(rs1)[,v0.t]
+                      c.is_vec_mem = 1'b1;   // vse vs3,(rs1)[,v0.t]
                       c.vec_is_load = 1'b0;
                       c.vec_masked = ~i[25];
-                    end else if (f3 == 3'b000 && i[31:28] == 4'b0000 &&
+                    end else if (i[31:28] == 4'b0000 &&
                                  i[27:26] == 2'b10) begin
-                      c.is_vec_mem = 1'b1;   // vsse8.v vs3,(rs1),rs2[,v0.t]
+                      c.is_vec_mem = 1'b1;   // vsse vs3,(rs1),rs2[,v0.t]
                       c.vec_is_load = 1'b0;  // stride = x[rs2]
                       c.vec_strided = 1'b1;
                       c.vec_masked = ~i[25];
-                    end else if (f3 == 3'b000 && i[31:28] == 4'b0000 &&
+                    end else if (i[31:28] == 4'b0000 &&
                                  (i[27:26] == 2'b01 || i[27:26] == 2'b11)) begin
                       c.is_vec_mem = 1'b1;   // vsuxei8/vsoxei8 vs3,(rs1),vs2
                       c.vec_is_load = 1'b0;  // index = vs2[i] (e8, zero-ext)
                       c.vec_indexed = 1'b1;
                       c.vec_masked = ~i[25];
                     end else begin
+                      c.illegal = 1'b1;
+                    end
+                    // EEW must match SEW (indexed: e8 indices only, any SEW).
+                    if (!c.illegal &&
+                        (c.vec_indexed ? (c.vec_eew != 2'd0)
+                                       : (c.vec_eew != sew))) begin
+                      c.is_vec_mem = 1'b0;
+                      c.vec_strided = 1'b0;
+                      c.vec_indexed = 1'b0;
                       c.illegal = 1'b1;
                     end
                   end else begin
@@ -943,30 +976,110 @@ module rv64gch_core #(
                   // RVV OPCFG (funct3=111): vsetvli (bits[31:30]!=11, vtype in
                   // bits[31:20]) / vsetivli (bits[31:30]==11 marker, vtype in
                   // bits[29:20], AVL zimm in rs1 field). Supported vtype is
-                  // e8m1/ta,ma only; anything else sets vill (vl=0, no trap).
-                  // OPIVV (funct3=000): e8 add/sub/and/or/xor (vd=vs2[]vs1)
-                  // and vmv.v.v (funct6=010111: vd=vs1 copy). vm (bit 25)
-                  // masks via v0 on all of them. Remaining OP-V (OPMVV/
-                  // OPFVV/widening/mul/div/compare/slide/...) is illegal.
+                  // SEW=8/16/32/64, LMUL=1, ta=ma=1; anything else sets vill
+                  // (vl=0, no trap).
+                  // RVV integer ALU, decoded by (funct3, funct6):
+                  //   OPIVV (000): classic ALU (add/sub/min/max/and/or/xor/
+                  //     saturating/shift), vmv.v.v (010111, vm=1), vmerge.vvm
+                  //     (010111, vm=0: v0 selects, never skips), compares
+                  //     (011000..011101: bit i of vd), vrgather.vv (001100).
+                  //   OPMVV (010): vmul/mulh/mulhu/mulhsu, vdiv/divu/rem/remu.
+                  //   OPIVX (100): classic ALU .vx, vmv.v.x (010111, vm=1),
+                  //     vrgather.vx (001100), vslideup (001110), vslidedown
+                  //     (001111). Scalar x[rs1] rides the MEM scalar field.
+                  //   OPMVX (110): mul/div/rem .vx, vslide1up (001110),
+                  //     vslide1down (001111).
+                  //   OPIVI (011): vslideup/vslidedown/vrgather .vi (5-bit
+                  //     uimm offset/index in the rs1 field). ALU .vi
+                  //     reserved for later.
+                  // vm (bit 25) masks via v0 on all of them except MERGE.
+                  // Everything else (widening/float/compress/ei16/segments)
+                  // is illegal.
                   // NOTE: OP-V is 1010111, distinct from OP-FP 1010011.
                   c.wb_sel = WB_NONE;
                   c.alu_op = ALU_NONE;
                   if (f3 == 3'b000 &&
                       (i[31:26] == VALU_ADD || i[31:26] == VALU_SUB ||
+                       i[31:26] == VALU_MINU || i[31:26] == VALU_MIN ||
+                       i[31:26] == VALU_MAXU || i[31:26] == VALU_MAX ||
                        i[31:26] == VALU_AND || i[31:26] == VALU_OR ||
-                       i[31:26] == VALU_XOR || i[31:26] == VALU_COPY)) begin
-                    c.is_vec_alu = 1'b1;      // vd[i] = vs2[i] op vs1[i]
-                    c.vec_aluop = i[31:26];   // (COPY: vd[i] = vs1[i])
+                       i[31:26] == VALU_XOR || i[31:26] == VALU_COPY ||
+                       i[31:26] == VALU_SEQ || i[31:26] == VALU_SNE ||
+                       i[31:26] == VALU_SLTU || i[31:26] == VALU_SLT ||
+                       i[31:26] == VALU_SLEU || i[31:26] == VALU_SLE ||
+                       i[31:26] == VALU_SADDU || i[31:26] == VALU_SADD ||
+                       i[31:26] == VALU_SSUBU || i[31:26] == VALU_SSUB ||
+                       i[31:26] == VALU_SLL || i[31:26] == VALU_SRL ||
+                       i[31:26] == VALU_SRA || i[31:26] == VALU_GATHER)) begin
+                    c.is_vec_alu = 1'b1;
+                    if (i[31:26] == VALU_COPY && ~i[25]) begin
+                      c.vec_aluop = VALU_MERGE;  // vmerge.vvm (vm=0)
+                      c.vec_masked = 1'b0;       // v0 selects, never skips
+                    end else begin
+                      c.vec_aluop = i[31:26];
+                      c.vec_masked = ~i[25];
+                    end
+                  end else if (f3 == 3'b010 &&
+                      (i[31:26] == VALU_DIVU || i[31:26] == VALU_DIV ||
+                       i[31:26] == VALU_REMU || i[31:26] == VALU_REM ||
+                       i[31:26] == VALU_MULHU || i[31:26] == VALU_MUL ||
+                       i[31:26] == VALU_MULHSU || i[31:26] == VALU_MULH)) begin
+                    c.is_vec_alu = 1'b1;      // vmul/div/rem.vv
+                    c.vec_aluop = i[31:26];
+                    c.vec_masked = ~i[25];
+                  end else if (f3 == 3'b100 &&
+                      (i[31:26] == VALU_ADD || i[31:26] == VALU_SUB ||
+                       i[31:26] == VALU_MINU || i[31:26] == VALU_MIN ||
+                       i[31:26] == VALU_MAXU || i[31:26] == VALU_MAX ||
+                       i[31:26] == VALU_AND || i[31:26] == VALU_OR ||
+                       i[31:26] == VALU_XOR || i[31:26] == VALU_COPY ||
+                       i[31:26] == VALU_SEQ || i[31:26] == VALU_SNE ||
+                       i[31:26] == VALU_SLTU || i[31:26] == VALU_SLT ||
+                       i[31:26] == VALU_SLEU || i[31:26] == VALU_SLE ||
+                       i[31:26] == VALU_SADDU || i[31:26] == VALU_SADD ||
+                       i[31:26] == VALU_SSUBU || i[31:26] == VALU_SSUB ||
+                       i[31:26] == VALU_SLL || i[31:26] == VALU_SRL ||
+                       i[31:26] == VALU_SRA || i[31:26] == VALU_GATHER ||
+                       i[31:26] == VALU_SLIDEUP ||
+                       i[31:26] == VALU_SLIDEDN)) begin
+                    // .vx: classic ALU + vmv.v.x (COPY, vm=1; vm=0 illegal)
+                    // + gather + slides. Scalar x[rs1] rides MEM scalar.
+                    if (i[31:26] == VALU_COPY && ~i[25]) begin
+                      c.illegal = 1'b1;
+                    end else begin
+                      c.is_vec_alu = 1'b1;
+                      c.vec_aluop = i[31:26];
+                      c.vec_masked = ~i[25];
+                    end
+                  end else if (f3 == 3'b110 &&
+                      (i[31:26] == VALU_DIVU || i[31:26] == VALU_DIV ||
+                       i[31:26] == VALU_REMU || i[31:26] == VALU_REM ||
+                       i[31:26] == VALU_MULHU || i[31:26] == VALU_MUL ||
+                       i[31:26] == VALU_MULHSU || i[31:26] == VALU_MULH ||
+                       i[31:26] == VALU_SLIDEUP ||
+                       i[31:26] == VALU_SLIDEDN)) begin
+                    // .vx: mul/div/rem (same funct6 as .vv) + vslide1up/down
+                    // (same funct6 as slideup/down, funct3 selects the "1").
+                    c.is_vec_alu = 1'b1;
+                    c.vec_aluop = i[31:26];
+                    c.vec_masked = ~i[25];
+                  end else if (f3 == 3'b011 &&
+                      (i[31:26] == VALU_GATHER ||
+                       i[31:26] == VALU_SLIDEUP ||
+                       i[31:26] == VALU_SLIDEDN)) begin
+                    // .vi: slides + gather with a 5-bit uimm (rs1 field).
+                    c.is_vec_alu = 1'b1;
+                    c.vec_aluop = i[31:26];
                     c.vec_masked = ~i[25];
                   end else if (f3 == 3'b111 && i[31:30] == 2'b11) begin
                     c.is_vset = 1'b1; c.vset_ivli = 1'b1;
                     c.vtypei = {1'b0, i[29:20]};
-                    c.vset_vill = (i[29:20] != VTYPEI_E8M1[9:0]);
+                    c.vset_vill = vec_vill(c.vtypei);
                     c.wb_sel = WB_INT;
                   end else if (f3 == 3'b111) begin
                     c.is_vset = 1'b1; c.vset_ivli = 1'b0;
                     c.vtypei = i[31:20];
-                    c.vset_vill = (i[31:20] != VTYPEI_E8M1);
+                    c.vset_vill = vec_vill(c.vtypei[10:0]);
                     c.wb_sel = WB_INT;
                   end else begin
                     c.illegal = 1'b1;
@@ -1121,13 +1234,15 @@ module rv64gch_core #(
 
   always_comb begin
     if (valid_d) begin
-      dc = decode(instr_d);
+      // Vector decode takes current SEW for the EEW-vs-SEW legality check
+      // (unit/strided EEW must equal SEW; indexed needs e8 indices).
+      dc = decode(instr_d, csr_vtype[4:3]);
       imm = gen_imm(instr_d);
     end else begin
       dc = '0; imm = '0;
     end
     if (has_d1) begin
-      dc1 = decode(instr_d1);
+      dc1 = decode(instr_d1, csr_vtype[4:3]);
       imm1 = gen_imm(instr_d1);
     end else begin
       dc1 = '0; imm1 = '0;
@@ -1773,15 +1888,18 @@ module rv64gch_core #(
   logic [63:0] ex_result;
   // RVV vsetvli/vsetivli: AVL is x[rs1] (x0 = VLMAX) or the rs1-field
   // zimm for ivli; vl = min(AVL, VLMAX), vill (decode-flagged) forces 0.
+  // VLMAX = VLEN/SEW = 32/16/8/4 for SEW=8/16/32/64 (LMUL=1 only).
   // The rd writeback (vl) rides the normal WB_INT path; vl/vtype commit
   // to the CSR unit at WB retire (which also resets vstart, sets VS=11).
   logic [63:0] vset_avl;
   logic [7:0]  vset_vl;
+  logic [7:0]  vset_vlmax;
+  assign vset_vlmax = 8'd32 >> ex_pkt.ctrl.vtypei[5:3];
   assign vset_avl = ex_pkt.ctrl.vset_ivli ? {59'd0, ex_pkt.ctrl.rs1} :
-                    (ex_pkt.ctrl.rs1 == 5'd0 ? 64'(VLMAX) : rs1_fwd);
+                    (ex_pkt.ctrl.rs1 == 5'd0 ? {56'd0, vset_vlmax} : rs1_fwd);
   assign vset_vl = ex_pkt.ctrl.vset_vill ? 8'd0 :
-                   (vset_avl[63:8] != 56'd0 ? 8'(VLMAX) :
-                    (vset_avl[7:0] > 8'(VLMAX) ? 8'(VLMAX) : vset_avl[7:0]));
+                   (vset_avl[63:8] != 56'd0 ? vset_vlmax :
+                    (vset_avl[7:0] > vset_vlmax ? vset_vlmax : vset_avl[7:0]));
   always_comb begin
     ex_result = alu_y;
     if (is_mdu_op(ex_pkt.ctrl.alu_op))
@@ -1886,6 +2004,12 @@ module rv64gch_core #(
     mem_pkt_n.alu_res = (ex_pkt.ctrl.lsu_op == LSU_SC) ?
                         (ex_sc_success ? 64'd0 : 64'd1) : ex_result;
     mem_pkt_n.rs2   = rs2_fwd;
+    // RVV .vx/.vi scalar for the VALU: x[rs1] for .vx (funct3 100/110),
+    // the 5-bit uimm (rs1 field, zero-extended) for .vi (funct3 011).
+    // Only consumed by vector-ALU packets; the backend hold keeps EX
+    // (hence rs1_fwd) stable from issue to MEM entry.
+    mem_pkt_n.scalar = (ex_pkt.ctrl.funct3 == 3'b011) ?
+                       {59'd0, ex_pkt.ctrl.rs1} : rs1_fwd;
     // CSR write operand is rs1 (forwarded), NOT the ALU result. The prior
     // path set wb_pkt.data = csr_rdata (old value) and fed that back as the
     // write data, making every CSR write a no-op.
@@ -1945,6 +2069,27 @@ module rv64gch_core #(
         mem_pkt <= mem_pkt_n;
       else
         mem_pkt <= '0;
+    end
+  end
+
+  // Vector sequencer (re)start pulse: set for the cycle after the backend
+  // advances a vector op into MEM, so the VLSU/VALU (re)sample vl/vstart
+  // even on a seamless back-to-back handoff (no active gap). Mid-sequence
+  // the backend is frozen by the vector hold, so no pulse can fire then;
+  // a trap clears both the packet and the pulse. The pulse coincides with
+  // the packet in mem_pkt; the units hold the pipe through the sample
+  // cycle, so the backend cannot advance past the unsampled op.
+  logic vec_start_q;
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      vec_start_q <= 1'b0;
+    end else if (trap) begin
+      vec_start_q <= 1'b0;
+    end else if (!backend_stall) begin
+      vec_start_q <= mem_pkt_n.valid &
+                     (mem_pkt_n.ctrl.is_vec_mem | mem_pkt_n.ctrl.is_vec_alu);
+    end else begin
+      vec_start_q <= 1'b0;
     end
   end
 
@@ -2019,6 +2164,11 @@ module rv64gch_core #(
   logic [4:0]  vrf_maddr;
   logic [4:0]  vrf_midx;
   logic [7:0]  vrf_mdata;
+  // VALU compare destination old-value port (VALU-only; the VLSU never
+  // reads vd, so no mux: straight through to the VRF dest port).
+  logic [4:0]  valu_vrf_daddr;
+  logic [4:0]  valu_vrf_didx;
+  logic [7:0]  valu_vrf_ddata;
   // Unit-side VRF drives (muxed onto the single physical ports above).
   logic [4:0]  vlsu_vrf_raddr, vlsu_vrf_waddr, vlsu_vrf_iaddr, vlsu_vrf_maddr;
   logic [4:0]  vlsu_vrf_ridx, vlsu_vrf_widx, vlsu_vrf_iidx, vlsu_vrf_midx;
@@ -2030,6 +2180,14 @@ module rv64gch_core #(
   logic        valu_vrf_we;
   logic [7:0]  csr_vl, csr_vstart;
   logic [63:0] csr_vtype;
+  // Current SEW code for the vector units (vtype[5:3]; vill forces the
+  // all-ones vtype whose SEW reads 0, and vl=0 then anyway).
+  logic [1:0]  csr_sew;
+  assign csr_sew = csr_vtype[4:3];
+  // VALU gather-port signals (VALU-only like the dest port).
+  logic [4:0]  valu_vrf_gaddr;
+  logic [4:0]  valu_vrf_gidx;
+  logic [7:0]  valu_vrf_gdata;
   assign vec_mem_active = mem_pkt.valid & mem_pkt.ctrl.is_vec_mem;
   assign vec_alu_active = mem_pkt.valid & mem_pkt.ctrl.is_vec_alu;
   // VRF port mux (combinational; idle side is don't-care, gated by each
@@ -2049,18 +2207,24 @@ module rv64gch_core #(
     .raddr_i(vrf_raddr), .ridx_i(vrf_ridx), .rdata_o(vrf_rdata),
     .iaddr_i(vrf_iaddr), .iidx_i(vrf_iidx), .idata_o(vrf_idata),
     .maddr_i(vrf_maddr), .midx_i(vrf_midx), .mdata_o(vrf_mdata),
+    .daddr_i(valu_vrf_daddr), .didx_i(valu_vrf_didx),
+    .ddata_o(valu_vrf_ddata),
+    .gaddr_i(valu_vrf_gaddr), .gidx_i(valu_vrf_gidx),
+    .gdata_o(valu_vrf_gdata),
     .waddr_i(vrf_waddr), .widx_i(vrf_widx), .wdata_i(vrf_wdata),
     .we_i(vrf_we)
   );
   vlsu u_vlsu (
     .clk(clk), .rst_n(rst_n),
     .active_i(vec_mem_active), .trap_i(trap),
+    .start_i(vec_start_q),
     .is_load_i(mem_pkt.ctrl.vec_is_load),
     .is_stride_i(mem_pkt.ctrl.vec_strided),
     .stride_i(mem_pkt.rs2),   // x[rs2] latched at EX->MEM (backend holds)
     .is_indexed_i(mem_pkt.ctrl.vec_indexed),
     .vs2_i(mem_pkt.ctrl.rs2), // index vector reg number (rs2 field)
     .masked_i(mem_pkt.ctrl.vec_masked),
+    .sew_i(csr_sew),
     .base_va_i(mem_pkt.mem_addr), .vd_i(mem_pkt.ctrl.rd),
     .vl_i(csr_vl), .vstart_i(csr_vstart),
     .vrf_raddr_o(vlsu_vrf_raddr), .vrf_ridx_o(vlsu_vrf_ridx),
@@ -2087,7 +2251,11 @@ module rv64gch_core #(
   valu u_valu (
     .clk(clk), .rst_n(rst_n),
     .active_i(vec_alu_active), .trap_i(trap),
+    .start_i(vec_start_q),
     .aluop_i(mem_pkt.ctrl.vec_aluop),
+    .funct3_i(mem_pkt.ctrl.funct3),
+    .sew_i(csr_sew),
+    .scalar_i(mem_pkt.scalar),
     .vd_i(mem_pkt.ctrl.rd),
     .vs1_i(mem_pkt.ctrl.rs1), // vector reg numbers (rs1/rs2 fields)
     .vs2_i(mem_pkt.ctrl.rs2),
@@ -2099,6 +2267,10 @@ module rv64gch_core #(
     .vrf_idata_i(vrf_idata),
     .vrf_maddr_o(valu_vrf_maddr), .vrf_midx_o(valu_vrf_midx),
     .vrf_mdata_i(vrf_mdata),
+    .vrf_daddr_o(valu_vrf_daddr), .vrf_didx_o(valu_vrf_didx),
+    .vrf_ddata_i(valu_vrf_ddata),
+    .vrf_gaddr_o(valu_vrf_gaddr), .vrf_gidx_o(valu_vrf_gidx),
+    .vrf_gdata_i(valu_vrf_gdata),
     .vrf_waddr_o(valu_vrf_waddr), .vrf_widx_o(valu_vrf_widx),
     .vrf_wdata_o(valu_vrf_wdata), .vrf_we_o(valu_vrf_we),
     .busy_o(valu_busy), .done_o(valu_done)

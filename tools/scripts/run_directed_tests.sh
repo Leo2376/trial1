@@ -11,7 +11,7 @@ MABI="lp64d"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-DEFAULT_TESTS="dyn_rm l1i_conflict l1d_wb l2_wb sv39_basic sv39_fault sv39_sfence deleg_basic asid_test sv48_basic priv_ecall priv_csr bpred_ras clint_timer plic_basic h_basic"
+DEFAULT_TESTS="dyn_rm l1i_conflict l1d_wb l2_wb sv39_basic sv39_fault sv39_sfence deleg_basic asid_test sv48_basic priv_ecall priv_csr bpred_ras clint_timer plic_basic h_basic v_basic v_strided v_indexed v_masked v_alu v_alu2 v_muldiv v_slide v_sew"
 TESTS="${*:-$DEFAULT_TESTS}"
 
 pass=0; fail=0; failed_list=""
@@ -22,6 +22,7 @@ for t in $TESTS; do
   tmarch="$MARCH"
   case "$t" in
     h_basic) tmarch="rv64imafdc_h_zicsr_zifencei" ;;
+    v_*) tmarch="rv64imafdcv_zicsr_zifencei" ;;
   esac
   if ! riscv64-unknown-elf-gcc -march=$tmarch -mabi=$MABI -nostdlib -nostartfiles -static \
         -T "$ENVDIR/link.ld" "$src" -o "$elf" 2>"$WORK/$t.cc_err"; then
